@@ -163,6 +163,39 @@ class UtfConverter:
         return ";".join(parts)
 
     @classmethod
+    def build_media_token(
+        cls,
+        user_id: int,
+        items: list[dict],
+        no_forward: bool,
+        flash_seconds: int,
+        valid_until: str,
+        nonce: str | None = None,
+    ) -> str:
+        """建立最多包含 10 个媒体的 v2 token。"""
+        if nonce is None:
+            nonce = cls.generate_nonce()
+        if not 1 <= len(items) <= 10:
+            raise ValueError("items must contain between 1 and 10 media")
+        if not valid_until or not str(valid_until).isdigit() or len(str(valid_until)) != 14:
+            raise ValueError("valid_until must be a 14-digit string in YYYYMMDDHHMMSS format")
+
+        parts = ["2", str(nonce), str(user_id), str(len(items))]
+        for item in items:
+            file_id = str(item.get("file_id", ""))
+            file_type = str(item.get("file_type", ""))
+            if not file_id or not file_type:
+                raise ValueError("each media item must have file_id and file_type")
+            parts.extend([file_id, file_type])
+
+        parts.extend([
+            "1" if no_forward else "0",
+            str(flash_seconds),
+            str(valid_until),
+        ])
+        return ";".join(parts)
+
+    @classmethod
     def parse_file_token(cls, token: str) -> dict:
         """
         將 build_file_token 產生的字符串解析回各個欄位。
@@ -170,6 +203,36 @@ class UtfConverter:
         格式: nonce;user_id;file_id;file_type;no_forward;flash_seconds;valid_until
         """
         parts = token.split(";")
+
+        if len(parts) >= 9 and parts[0] == "2":
+            _, nonce, user_id, count_text, *payload = parts
+            if not count_text.isdigit():
+                raise ValueError("Invalid media count")
+            count = int(count_text)
+            if not 1 <= count <= 10:
+                raise ValueError("Invalid media count, expected 1 to 10")
+            if len(parts) != 7 + count * 2:
+                raise ValueError("Invalid v2 token format")
+
+            media_parts = payload[:count * 2]
+            no_forward, flash_seconds, valid_until = payload[count * 2:]
+            if not valid_until.isdigit() or len(valid_until) != 14:
+                raise ValueError("Invalid valid_until format, expected YYYYMMDDHHMMSS")
+
+            items = [
+                {"file_id": media_parts[index], "file_type": media_parts[index + 1]}
+                for index in range(0, len(media_parts), 2)
+            ]
+            return {
+                "user_id": int(user_id),
+                "file_id": items[0]["file_id"],
+                "file_type": items[0]["file_type"],
+                "items": items,
+                "no_forward": no_forward == "1",
+                "flash_seconds": int(flash_seconds),
+                "valid_until": valid_until,
+                "nonce": nonce,
+            }
 
         if len(parts) != 7:
             raise ValueError(f"Invalid token format, expected 7 parts, got {len(parts)}")
@@ -179,10 +242,12 @@ class UtfConverter:
         if not valid_until.isdigit() or len(valid_until) != 14:
             raise ValueError("Invalid valid_until format, expected YYYYMMDDHHMMSS")
 
+        item = {"file_id": file_id, "file_type": file_type}
         return {
             "user_id": int(user_id),
             "file_id": file_id,
             "file_type": file_type,
+            "items": [item],
             "no_forward": no_forward == "1",
             "flash_seconds": int(flash_seconds),
             "valid_until": valid_until,

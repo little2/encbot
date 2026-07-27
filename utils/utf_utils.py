@@ -1,3 +1,6 @@
+import base64
+
+
 class UtfConverter:
     TG64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-;"
 
@@ -170,9 +173,10 @@ class UtfConverter:
         no_forward: bool,
         flash_seconds: int,
         valid_until: str,
+        if_spoiler: bool = False,
         nonce: str | None = None,
     ) -> str:
-        """建立最多包含 10 个媒体的 v2 token。"""
+        """建立最多包含 10 个媒体的 v4 token。"""
         if nonce is None:
             nonce = cls.generate_nonce()
         if not 1 <= len(items) <= 10:
@@ -180,18 +184,31 @@ class UtfConverter:
         if not valid_until or not str(valid_until).isdigit() or len(str(valid_until)) != 14:
             raise ValueError("valid_until must be a 14-digit string in YYYYMMDDHHMMSS format")
 
-        parts = ["2", str(nonce), str(user_id), str(len(items))]
+        parts = ["4", str(nonce), str(user_id), str(len(items))]
         for item in items:
             file_id = str(item.get("file_id", ""))
             file_type = str(item.get("file_type", ""))
             if not file_id or not file_type:
                 raise ValueError("each media item must have file_id and file_type")
-            parts.extend([file_id, file_type])
+            file_size = max(0, int(item.get("file_size", 0) or 0))
+            duration = max(0, int(item.get("duration", 0) or 0))
+            file_name = str(item.get("file_name", "") or "")
+            encoded_file_name = base64.urlsafe_b64encode(
+                file_name.encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            parts.extend([
+                file_id,
+                file_type,
+                str(file_size),
+                str(duration),
+                encoded_file_name,
+            ])
 
         parts.extend([
             "1" if no_forward else "0",
             str(flash_seconds),
             str(valid_until),
+            "1" if if_spoiler else "0",
         ])
         return ";".join(parts)
 
@@ -204,25 +221,45 @@ class UtfConverter:
         """
         parts = token.split(";")
 
-        if len(parts) >= 9 and parts[0] == "2":
-            _, nonce, user_id, count_text, *payload = parts
+        if len(parts) >= 9 and parts[0] in {"2", "3", "4"}:
+            version, nonce, user_id, count_text, *payload = parts
             if not count_text.isdigit():
                 raise ValueError("Invalid media count")
             count = int(count_text)
             if not 1 <= count <= 10:
                 raise ValueError("Invalid media count, expected 1 to 10")
-            if len(parts) != 7 + count * 2:
-                raise ValueError("Invalid v2 token format")
+            trailing_count = 4 if version in {"3", "4"} else 3
+            fields_per_item = 5 if version == "4" else 2
+            if len(parts) != 4 + count * fields_per_item + trailing_count:
+                raise ValueError(f"Invalid v{version} token format")
 
-            media_parts = payload[:count * 2]
-            no_forward, flash_seconds, valid_until = payload[count * 2:]
+            media_parts = payload[:count * fields_per_item]
+            trailing_parts = payload[count * fields_per_item:]
+            no_forward, flash_seconds, valid_until = trailing_parts[:3]
+            if_spoiler = trailing_parts[3] == "1" if version in {"3", "4"} else False
             if not valid_until.isdigit() or len(valid_until) != 14:
                 raise ValueError("Invalid valid_until format, expected YYYYMMDDHHMMSS")
 
-            items = [
-                {"file_id": media_parts[index], "file_type": media_parts[index + 1]}
-                for index in range(0, len(media_parts), 2)
-            ]
+            if version == "4":
+                items = []
+                for index in range(0, len(media_parts), fields_per_item):
+                    encoded_file_name = media_parts[index + 4]
+                    padding = "=" * (-len(encoded_file_name) % 4)
+                    file_name = base64.urlsafe_b64decode(
+                        encoded_file_name + padding
+                    ).decode("utf-8") if encoded_file_name else ""
+                    items.append({
+                        "file_id": media_parts[index],
+                        "file_type": media_parts[index + 1],
+                        "file_size": int(media_parts[index + 2] or 0),
+                        "duration": int(media_parts[index + 3] or 0),
+                        "file_name": file_name,
+                    })
+            else:
+                items = [
+                    {"file_id": media_parts[index], "file_type": media_parts[index + 1]}
+                    for index in range(0, len(media_parts), fields_per_item)
+                ]
             return {
                 "user_id": int(user_id),
                 "file_id": items[0]["file_id"],
@@ -230,6 +267,7 @@ class UtfConverter:
                 "items": items,
                 "no_forward": no_forward == "1",
                 "flash_seconds": int(flash_seconds),
+                "if_spoiler": if_spoiler,
                 "valid_until": valid_until,
                 "nonce": nonce,
             }
@@ -250,6 +288,7 @@ class UtfConverter:
             "items": [item],
             "no_forward": no_forward == "1",
             "flash_seconds": int(flash_seconds),
+            "if_spoiler": False,
             "valid_until": valid_until,
             "nonce": nonce,
         }

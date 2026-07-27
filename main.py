@@ -13,20 +13,27 @@ import re
 import asyncio
 import os
 from collections import OrderedDict
+from functools import lru_cache
 from io import BytesIO
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageOps
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import User, BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, ChatJoinRequest, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.types import (
     InputMediaAudio,
     InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
 )
+
+
+from html import escape
+from typing import Union
 
 from utils.utf_utils import UtfConverter
 from utils.user_utils import UserExpireCache, UserExpire
@@ -36,8 +43,25 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MEDIA_FORWARD_USER_ID = int(os.getenv("MEDIA_FORWARD_USER_ID", "0") or 0)
 ENCODED_FORWARD_CHAT_ID = int(os.getenv("ENCODED_FORWARD_CHAT_ID", "0") or 0)
 ENCODED_FORWARD_THREAD_ID = int(os.getenv("ENCODED_FORWARD_THREAD_ID", "0") or 0)
+MESSAGE_REWARD_CHAT_ID = int(
+	os.getenv("MESSAGE_REWARD_CHAT_ID", str(ENCODED_FORWARD_CHAT_ID)) or 0
+)
+DEFAULT_COVER_FILE_ID: str | None = None
 
-user_expire_cache = UserExpireCache()
+volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+default_user_expire_db_path = (
+	Path(volume_mount_path) / "user_expire.sqlite3"
+	if volume_mount_path
+	else Path(__file__).resolve().parent / "data" / "user_expire.sqlite3"
+)
+user_expire_db_path = Path(
+	os.getenv("USER_EXPIRE_DB_PATH", str(default_user_expire_db_path))
+)
+user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
+
+from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_COST_MINUTES, MESSAGE_EXTEND_MINUTES, MAX_VALID_DURATION_MINUTES
+
+from textwrap import dedent
 
 def _parse_whitelist_ids(raw: str) -> set[int]:
 	ids: set[int] = set()
@@ -56,13 +80,23 @@ if not BOT_TOKEN:
 	raise RuntimeError("Missing bot token. Please set ENCBOT_TOKEN or BOT_TOKEN.")
 
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(
+	token=BOT_TOKEN,
+	default=DefaultBotProperties(link_preview_is_disabled=True),
+)
 dp = Dispatcher()
 ENCODER_UI_STATE: dict[tuple[int, int], dict[str, Any]] = {}
 UPLOAD_SESSIONS: dict[tuple[int, int], dict[str, Any]] = {}
 USER_MEDIA_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 USER_MEDIA_PENDING: dict[tuple[int, int], int] = {}
 OVERFLOW_NOTICE_TIME: dict[tuple[int, int], float] = {}
+TAKEOFF_COUNTER_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+TAKEOFF_COUNTS: dict[tuple[int, int], int] = {}
+TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
+AIRPORT_QUIZ_PROGRESS: dict[int, int] = {}
+AIRPORT_QUIZ_RETRY_AT: dict[int, int] = {}
+AIRPORT_QUIZ_PASSED_UNTIL: dict[int, int] = {}
+AIRPORT_QUIZ_LOCKS: dict[int, asyncio.Lock] = {}
 MEDIA_QUEUE: asyncio.Queue[Message] = asyncio.Queue(maxsize=100)
 MEDIA_WORKER_COUNT = 3
 MAX_BATCH_MEDIA = 10
@@ -74,8 +108,57 @@ PREVIEW_STYLE_VIDEO = "video-play-v1"
 PLAY_ICON_SIZES = (48, 64, 80, 96, 128)
 PREVIEW_CACHE: OrderedDict[tuple[str, str], bytes] = OrderedDict()
 bot_name = ""
-USED_FLASH_NONCES: dict[str, datetime] = {}
+USED_FLASH_NONCES: dict[tuple[str, int], datetime] = {}
 PERM_FLASH_NONCE_RETENTION_DAYS = 30
+AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
+AIRPORT_QUIZ_PASS_SECONDS = 10 * 60
+AIRPORT_QUIZ_QUESTIONS = (
+	(
+		"按照机场的“三个禁止”，下列哪一项完整正确？",
+		(
+			"可以营利，但不能转发，也不能评判",
+			"不能营利，但可以私下转发给熟人",
+			"不能外传，但应该公开评判不喜欢的内容",
+			"不谈营利、不向外转发，也不评判他人",
+			"只有小众内容不能外传，其他资源可以分享出去",
+		),
+		3,
+	),
+	(
+		"按照机场的“三个原则”，下列哪一项最符合群内精神？",
+		(
+			"塔台是唯一主人，所有成员都必须听从塔台安排",
+			"大家通过发言或分享真诚参与",
+			"塔台必须随时监督每一则消息，并立即处理所有争议",
+			"成员只需要领取资源，不需要发言或分享",
+			"分享与参与应以付费交易作为主要方式",
+		),
+		1,
+	),
+	(
+		"按照机场的“三个任性”，塔台与成员应如何看待群内事务？",
+		(
+			"塔台必须判断原创归属，并裁决成员之间的所有恩怨",
+			"机器人发生故障时，塔台有责任立即修复并补偿成员",
+			"任何成员被移出群组后，塔台都必须提供完整解释",
+			"群内完全不需要塔台，也不需要处理任何违规内容",
+			"塔台是判官或裁决者",
+			"违反核心价值观可能被移出且不另作解释"
+		),
+		5,
+	),
+)
+SELINE_IMAGE_PATHS = (
+	Path(__file__).resolve().parent / "sepline.jpeg",
+)
+
+
+@lru_cache(maxsize=1)
+def _get_seline_image_bytes() -> bytes:
+	for image_path in SELINE_IMAGE_PATHS:
+		if image_path.is_file():
+			return image_path.read_bytes()
+	raise FileNotFoundError("Missing seline image: sepline.jpeg")
 
 
 def _create_play_icon(size: int) -> Image.Image:
@@ -127,12 +210,103 @@ def _cleanup_used_flash_nonces(now: datetime) -> None:
 		USED_FLASH_NONCES.pop(key, None)
 
 
+
+
+
+async def get_user_hyperlink(
+    bot: Bot,
+    user_info: Union[dict, User],
+    show_uid: bool = False
+) -> str:
+    """
+    取得 Telegram User hyperlink
+
+    支援:
+    - aiogram.types.User
+    - dict user_info
+
+    如果沒有 first_name，會自動透過 Telegram API 查詢
+    """
+
+    print(f"[get_user_hyperlink] user_info: {user_info}, show_uid: {show_uid}", flush=True)
+
+    # --------------------
+    # 先解析 user_id
+    # --------------------
+    if isinstance(user_info, User):
+        user_id = user_info.id
+        first_name = user_info.first_name or ""
+        last_name = user_info.last_name or ""
+        username = user_info.username
+
+    else:
+        user_id = user_info.get("id") or user_info.get("user_id")
+
+        first_name = user_info.get("first_name") or ""
+        last_name = user_info.get("last_name") or ""
+        username = user_info.get("username")
+
+
+    # --------------------
+    # 沒有姓名資料，呼叫 API
+    # --------------------
+    if not first_name.strip():
+
+        if user_id:
+            user = await bot.get_chat(user_id)
+
+            first_name = user.first_name or ""
+            last_name = user.last_name or ""
+            username = user.username
+
+            user_id = user.id
+
+
+    # --------------------
+    # 組合名稱
+    # --------------------
+    user_title = first_name
+
+    if last_name:
+        user_title += f" {last_name}"
+
+    if not user_title.strip():
+        user_title = str(user_id)
+
+
+    user_title = escape(user_title)
+
+
+    # --------------------
+    # 建立 hyperlink
+    # --------------------
+    if username:
+        text = (
+            f"<a href='https://t.me/{username}'>"
+            f"{user_title}</a>"
+        )
+    else:
+        text = (
+            f"<a href='tg://user?id={user_id}'>"
+            f"{user_title}</a>"
+        )
+
+
+    if show_uid:
+        text += f"#U{user_id}"
+
+
+    return text
+
 def _extract_media_info(message: Message) -> tuple[str, str]:
 	"""
 	从消息中提取 (file_type, file_id)。
 	若不是支持的媒体类型，抛出 ValueError。
 	"""
 	if message.document:
+		mime_type = str(message.document.mime_type or "").lower()
+		if mime_type == "video/mp4":
+			return "video", message.document.file_id
 		return "document", message.document.file_id
 	if message.photo:
 		# photo 为多个尺寸，取最大尺寸通常在最后一个
@@ -153,6 +327,9 @@ def _extract_media_info(message: Message) -> tuple[str, str]:
 
 def _extract_preview_info(message: Message, file_type: str, file_id: str) -> dict[str, str]:
 	"""提取转发预览所需的缩略图标识，不把它写入取件码。"""
+	if file_type == "document":
+		return {}
+
 	preview = None
 
 	if file_type == "photo" and message.photo:
@@ -164,16 +341,17 @@ def _extract_preview_info(message: Message, file_type: str, file_id: str) -> dic
 			candidates or list(message.photo),
 			key=lambda photo: max(int(photo.width or 0), int(photo.height or 0)),
 		)
-	elif file_type == "video" and message.video:
-		cover = getattr(message.video, "cover", None)
-		if isinstance(cover, list) and cover:
-			preview = cover[0]
-		elif cover:
-			preview = cover
-		if not preview:
-			preview = message.video.thumbnail
-	elif file_type == "document" and message.document:
-		preview = message.document.thumbnail
+	elif file_type == "video":
+		if message.video:
+			cover = getattr(message.video, "cover", None)
+			if isinstance(cover, list) and cover:
+				preview = cover[0]
+			elif cover:
+				preview = cover
+			if not preview:
+				preview = message.video.thumbnail
+		elif message.document:
+			preview = message.document.thumbnail
 	elif file_type == "animation" and message.animation:
 		preview = message.animation.thumbnail
 	elif file_type == "audio" and message.audio:
@@ -187,7 +365,64 @@ def _extract_preview_info(message: Message, file_type: str, file_id: str) -> dic
 	}
 
 
-def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
+def _extract_media_metadata(message: Message, file_type: str) -> dict[str, Any]:
+	media = {
+		"document": message.document,
+		"photo": message.photo[-1] if message.photo else None,
+		"video": message.video or message.document,
+		"audio": message.audio,
+		"voice": message.voice,
+		"animation": message.animation,
+		"sticker": message.sticker,
+	}.get(file_type)
+
+	return {
+		"file_size": max(0, int(getattr(media, "file_size", 0) or 0)),
+		"duration": max(0, int(getattr(media, "duration", 0) or 0)),
+		"file_name": str(getattr(media, "file_name", "") or ""),
+	}
+
+
+def _short_media_type(file_type: str) -> str:
+	return {
+		"document": "📄",
+		"photo": "🖼️",
+		"video": "🎬",
+		"audio": "🎵",
+		"voice": "🎙️",
+		"animation": "🎞️",
+		"sticker": "🏷️",
+	}.get(file_type, "📎")
+
+
+def _format_file_size(size: int) -> str:
+	value = max(0, int(size or 0))
+	if value == 0:
+		return "未知大小"
+
+	units = ("B", "KB", "MB", "GB", "TB")
+	amount = float(value)
+	unit = units[0]
+	for unit in units:
+		if amount < 1024 or unit == units[-1]:
+			break
+		amount /= 1024
+
+	if unit == "B":
+		return f"{int(amount)} {unit}"
+	return f"{amount:.1f} {unit}"
+
+
+def _format_media_duration(seconds: int) -> str:
+	total_seconds = max(0, int(seconds or 0))
+	hours, remainder = divmod(total_seconds, 3600)
+	minutes, seconds = divmod(remainder, 60)
+	if hours == 0:
+		return f"{minutes:02d}:{seconds:02d}"
+	return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 	valid_until = str(data.get("valid_until", ""))
 	if valid_until == "99991231235959":
 		valid_until_display = "永久有效"
@@ -204,27 +439,46 @@ def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 	start_char = "⟦["
 	end_char = "]⟧"
 
-	return_text = ""
+	user_url = await get_user_hyperlink(bot, {"id":data.get("user_id", 0)}, show_uid=False)
+
+	return_text = f"<a href=\"https://b.oy/{encoded}\">👤</a> 机长: {user_url}\n"
 	media_count = len(data.get("items", []))
 	if media_count > 1:
 		return_text += f"📦 媒体数量: {media_count}\n"
+
+	for item in data.get("items", []):
+		parts = [
+			_short_media_type(str(item.get("file_type", ""))),
+			_format_file_size(int(item.get("file_size", 0) or 0)),
+		]
+		duration = int(item.get("duration", 0) or 0)
+		if duration > 0:
+			parts.append(_format_media_duration(duration))
+
+		file_name = re.sub(r"\s+", " ", str(item.get("file_name", "") or "")).strip()
+		if len(file_name) > 12:
+			file_name = f"{file_name[:12]}..."
+		parts.append(escape(file_name) if file_name else "未命名")
+		return_text += f"{parts[0]} {' | '.join(parts[1:])}\n"
 
 	if(data['no_forward']==True):
 		return_text += f"🚫 禁止转发: 是\n"
 	
 	if(data['flash_seconds']>0):
 		return_text += f"⚡ 闪照时间: {data['flash_seconds']} 秒\n"
+	if bool(data.get("if_spoiler", False)):
+		return_text += "🙈 防剧透模式: 是\n"
 
 	if(data['valid_until']!="99991231235959"):
 		return_text += f"⏳ 有效时间: {valid_until_display}\n\n"
 
 	
 
-	return_text += (	
-		f"\n将取件码👇传给 🤖 <a href=\"https://b.oy/{encoded}\">🤖</a><code>{bot_name_lack}</code><code> t</code> (去空格) \n\n{start_char}<code>{encoded}</code>{end_char}"
-	)
-	if len(encoded) > 256:
-		return_text += "\n\nℹ️ 批量取件码较长，请长按上方密文复制。"
+	# return_text += (
+	# 	f"\n将取件码👇传给 🤖 <a href=\"https://b.oy/{encoded}\">🤖</a><code>{bot_name_lack}</code><code> t</code> (去空格) \n\n{start_char}<code>{encoded}</code>{end_char}"
+	# )
+	# if len(encoded) > 256:
+	# 	return_text += "\n\nℹ️ 批量取件码较长，请长按上方密文复制。"
 
 	return return_text
 
@@ -232,11 +486,55 @@ def _build_keyboard(data: dict[str, Any], token: str, encoded: str) -> InlineKey
 	return InlineKeyboardMarkup(
 		inline_keyboard=[[
 			InlineKeyboardButton(
+				text="🈲 立即停飞",
+				callback_data=f"takeoff:ban",
+			),
+			InlineKeyboardButton(
 				text="🛫 请求起飞",
 				callback_data=f"takeoff:fly",
 			)
 		]]
 	)
+
+
+def _takeoff_count_from_keyboard(markup: InlineKeyboardMarkup) -> int:
+	for row in markup.inline_keyboard:
+		for button in row:
+			if str(button.callback_data or "").startswith("takeoff:fly"):
+				match = re.search(r"\(\s*(\d+)\s*\)\s*$", button.text)
+				return int(match.group(1)) if match else 0
+	return 0
+
+
+async def _increment_takeoff_count(message: Message) -> int:
+	markup = message.reply_markup
+	if not markup:
+		return 0
+
+	key = (message.chat.id, message.message_id)
+	lock = TAKEOFF_COUNTER_LOCKS.setdefault(key, asyncio.Lock())
+	async with lock:
+		current_count = TAKEOFF_COUNTS.get(key)
+		if current_count is None:
+			current_count = _takeoff_count_from_keyboard(markup)
+		new_count = current_count + 1
+		TAKEOFF_COUNTS[key] = new_count
+
+		new_rows = []
+		for row in markup.inline_keyboard:
+			new_row = []
+			for button in row:
+				if str(button.callback_data or "").startswith("takeoff:fly"):
+					button = button.model_copy(
+						update={"text": f"🛫 请求起飞 ( {new_count} )"}
+					)
+				new_row.append(button)
+			new_rows.append(new_row)
+
+		await message.edit_reply_markup(
+			reply_markup=InlineKeyboardMarkup(inline_keyboard=new_rows)
+		)
+		return new_count
 
 
 def _resolve_valid_until(mode: str) -> str:
@@ -267,8 +565,15 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 				InlineKeyboardButton(
 					text="🚫 目前限制转发" if no_forward else "🆗 目前可以转发",
 					callback_data=f"enc:fw:{0 if no_forward else 1}",
-				),
+				)
 			],
+			[
+				InlineKeyboardButton(
+					text="🙈 目前已启用防剧透模式" if state.get("if_spoiler", False) else "🐵 目前未启用防剧透模式",
+					callback_data=f"enc:sp:{0 if state.get('if_spoiler', False) else 1}",
+				)
+			],
+
 			[
 				InlineKeyboardButton(
 					text=_choice("不闪", flash_seconds == 0),
@@ -298,13 +603,32 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 				)
 			],
 		]
-	if len(encoded) <= 256:
-		rows.append([
-			InlineKeyboardButton(
-				text="📋 复制密文",
-				copy_text=CopyTextButton(text=encoded),
-			)
-		])
+	# if len(encoded) <= 256:
+	# 	rows.append([
+	# 		InlineKeyboardButton(
+	# 			text="📋 复制密文",
+	# 			copy_text=CopyTextButton(text=encoded),
+	# 		)
+	# 	])
+	# owner_user_id = int(state.get("owner_user_id", 0))
+	# if owner_user_id in ENCODED_FORWARD_WHITELIST_USER_IDS:
+	send_status = str(state.get("send_status", "idle"))
+	revision = int(state.get("revision", 1))
+	sent_revision = int(state.get("sent_revision", 0))
+	if send_status == "sending":
+		send_text = "⏳ 送出中"
+	elif sent_revision == revision:
+		send_text = "✅ 已送出"
+	elif send_status == "failed":
+		send_text = "⚠️ 送出失败，重试"
+	else:
+		send_text = "📤 送出"
+	rows.append([
+		InlineKeyboardButton(
+			text=send_text,
+			callback_data="enc:send:now",
+		)
+	])
 	return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -319,6 +643,7 @@ def _build_token_and_encoded(state: dict[str, Any]) -> tuple[str, str, dict[str,
 		no_forward=bool(state.get("no_forward", False)),
 		flash_seconds=int(state.get("flash_seconds", 0)),
 		valid_until=valid_until,
+		if_spoiler=bool(state.get("if_spoiler", False)),
 	)
 	encoded = UtfConverter.telegram_to_unicode_cjk(token)
 	parsed = UtfConverter.parse_file_token(token)
@@ -348,20 +673,36 @@ async def _send_media_by_type(message: Message, data: dict[str, Any], receiver_i
 	file_type = str(data["file_type"])
 	file_id = str(data["file_id"])
 	no_forward = bool(data.get("no_forward", False))
+	if_spoiler = bool(data.get("if_spoiler", False))
 	chat_id = receiver_id or message.from_user.id
 
 	if file_type == "document":
 		return await bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward)
 	if file_type == "photo":
-		return await bot.send_photo(chat_id=chat_id, photo=file_id, protect_content=no_forward)
+		return await bot.send_photo(
+			chat_id=chat_id,
+			photo=file_id,
+			protect_content=no_forward,
+			has_spoiler=if_spoiler,
+		)
 	if file_type == "video":
-		return await bot.send_video(chat_id=chat_id, video=file_id, protect_content=no_forward)
+		return await bot.send_video(
+			chat_id=chat_id,
+			video=file_id,
+			protect_content=no_forward,
+			has_spoiler=if_spoiler,
+		)
 	if file_type == "audio":
 		return await bot.send_audio(chat_id=chat_id, audio=file_id, protect_content=no_forward)
 	if file_type == "voice":
 		return await bot.send_voice(chat_id=chat_id, voice=file_id, protect_content=no_forward)
 	if file_type == "animation":
-		return await bot.send_animation(chat_id=chat_id, animation=file_id, protect_content=no_forward)
+		return await bot.send_animation(
+			chat_id=chat_id,
+			animation=file_id,
+			protect_content=no_forward,
+			has_spoiler=if_spoiler,
+		)
 	if file_type == "sticker":
 		return await bot.send_sticker(chat_id=chat_id, sticker=file_id, protect_content=no_forward)
 
@@ -377,14 +718,14 @@ def _album_kind(file_type: str) -> str | None:
         return "audio"
     return None
 
-def _build_input_media(item: dict[str, Any]):
+def _build_input_media(item: dict[str, Any], if_spoiler: bool = False):
     file_id = str(item["file_id"])
     file_type = str(item["file_type"])
 
     if file_type == "photo":
-        return InputMediaPhoto(media=file_id)
+        return InputMediaPhoto(media=file_id, has_spoiler=if_spoiler)
     if file_type == "video":
-        return InputMediaVideo(media=file_id)
+        return InputMediaVideo(media=file_id, has_spoiler=if_spoiler)
     if file_type == "document":
         return InputMediaDocument(media=file_id)
     if file_type == "audio":
@@ -403,6 +744,7 @@ async def _send_all_media(
     }]
 
     no_forward = bool(data.get("no_forward", False))
+    if_spoiler = bool(data.get("if_spoiler", False))
     sent_messages: list[Message] = []
     pending_group: list[dict[str, Any]] = []
     pending_kind: str | None = None
@@ -416,7 +758,7 @@ async def _send_all_media(
 
         if len(pending_group) >= 2:
             media = [
-                _build_input_media(item)
+                _build_input_media(item, if_spoiler=if_spoiler)
                 for item in pending_group
             ]
 
@@ -453,6 +795,7 @@ async def _send_all_media(
             sent = await _send_media_by_type(
                 message,
                 item_data,
+                receiver_id=receiver_id,
             )
             sent_messages.append(sent)
             continue
@@ -582,19 +925,20 @@ async def _download_preview(cache_key: tuple[str, str], file_id: str) -> tuple[t
 
 
 async def _forward_encoded_if_whitelisted(
-	message: Message,
+	owner_user_id: int,
 	encoded: str,
 	items: list[dict[str, Any]],
-) -> None:
+) -> bool:
+	global DEFAULT_COVER_FILE_ID
 	if ENCODED_FORWARD_CHAT_ID == 0:
-		return
+		return False
 
-	from_user_id = int(message.from_user.id) if message.from_user else 0
-	if from_user_id <= 0 or from_user_id not in ENCODED_FORWARD_WHITELIST_USER_IDS:
-		# print(f"[ENCODED_FORWARD] user {from_user_id} not in whitelist, skip forwarding", flush=True)
-		return
+	# if owner_user_id <= 0 or owner_user_id not in ENCODED_FORWARD_WHITELIST_USER_IDS:
+	# 	return False
 
-	display_keyboard = FileNotFoundError
+	preview_show = True
+
+	display_keyboard = None
 	display_text = encoded
 	try:
 		token = UtfConverter.unicode_cjk_to_telegram(encoded)
@@ -602,96 +946,185 @@ async def _forward_encoded_if_whitelisted(
 		parsed_items = list(parsed.get("items", []))
 		if not parsed_items:
 			raise ValueError("encoded 中没有媒体")
-		display_text = _build_display(parsed, token, encoded)
+		display_text = await _build_display(parsed, token, encoded)
 		display_keyboard = _build_keyboard(parsed, token, encoded)
+		if_spoiler = bool(parsed.get("if_spoiler", False))
 
-		preview_entries: list[tuple[tuple[str, str], str]] = []
-		download_requests: dict[tuple[str, str], str] = {}
-		job_video_types: dict[tuple[str, str], bool] = {}
-		for index, parsed_item in enumerate(parsed_items):
-			preview_file_id = ""
-			preview_unique_id = str(parsed_item.get("file_id", index))
-			file_type = str(parsed_item.get("file_type", ""))
-			if index < len(items):
-				source_item = items[index]
-				if str(source_item.get("file_id", "")) == str(parsed_item.get("file_id", "")):
+		flash_seconds = parsed.get("flash_seconds", 0)
+		if flash_seconds >0:
+			preview_show = False
+
+
+		preview_payloads: list[tuple[bytes, str]] = []
+		if preview_show:
+			preview_entries: list[tuple[tuple[str, str], str]] = []
+			download_requests: dict[tuple[str, str], str] = {}
+			job_video_types: dict[tuple[str, str], bool] = {}
+			source_items_by_file_id = {
+				str(item.get("file_id", "")): item
+				for item in items
+				if item.get("file_id")
+			}
+
+			for index, parsed_item in enumerate(parsed_items):
+				file_type = str(parsed_item.get("file_type", ""))
+				if file_type == "document":
+					continue
+
+				preview_file_id = ""
+				preview_unique_id = str(parsed_item.get("file_id", index))
+				source_item = source_items_by_file_id.get(
+					str(parsed_item.get("file_id", "")),
+				)
+				if source_item:
 					preview_file_id = str(source_item.get("preview_file_id", ""))
 					preview_unique_id = str(source_item.get("preview_unique_id", "") or preview_unique_id)
 
-			style = PREVIEW_STYLE_VIDEO if file_type == "video" else PREVIEW_STYLE_ORIGINAL
-			cache_key = (preview_unique_id, style)
-			preview_entries.append((cache_key, f"preview_{index + 1}.jpg"))
-			job_video_types.setdefault(cache_key, file_type == "video")
-			if _preview_cache_get(cache_key) is None and preview_file_id:
-				download_requests.setdefault(cache_key, preview_file_id)
+				style = PREVIEW_STYLE_VIDEO if file_type == "video" else PREVIEW_STYLE_ORIGINAL
+				cache_key = (preview_unique_id, style)
+				preview_entries.append((cache_key, f"preview_{index + 1}.jpg"))
+				job_video_types.setdefault(cache_key, file_type == "video")
+				if _preview_cache_get(cache_key) is None and preview_file_id:
+					download_requests.setdefault(cache_key, preview_file_id)
 
-		downloaded = dict(await asyncio.gather(*[
-			_download_preview(cache_key, file_id)
-			for cache_key, file_id in download_requests.items()
-		])) if download_requests else {}
+			downloaded = dict(await asyncio.gather(*[
+				_download_preview(cache_key, file_id)
+				for cache_key, file_id in download_requests.items()
+			])) if download_requests else {}
 
-		jobs = [
-			(cache_key, downloaded.get(cache_key), is_video)
-			for cache_key, is_video in job_video_types.items()
-			if _preview_cache_get(cache_key) is None
-		]
+			jobs = [
+				(cache_key, downloaded.get(cache_key), is_video)
+				for cache_key, is_video in job_video_types.items()
+				if _preview_cache_get(cache_key) is None
+			]
 
-		processed = await asyncio.to_thread(_process_preview_batch, jobs) if jobs else {}
-		for cache_key, (content, cacheable) in processed.items():
-			if cacheable:
-				_preview_cache_set(cache_key, content)
+			processed = await asyncio.to_thread(_process_preview_batch, jobs) if jobs else {}
+			for cache_key, (content, cacheable) in processed.items():
+				if cacheable:
+					_preview_cache_set(cache_key, content)
 
-		preview_payloads: list[tuple[bytes, str]] = []
-		for cache_key, filename in preview_entries:
-			content = _preview_cache_get(cache_key)
-			if content is None:
-				content = processed[cache_key][0]
-			preview_payloads.append((content, filename))
+			for cache_key, filename in preview_entries:
+				content = _preview_cache_get(cache_key)
+				if content is None:
+					content = processed[cache_key][0]
+				preview_payloads.append((content, filename))
 
 		thread_id = ENCODED_FORWARD_THREAD_ID if ENCODED_FORWARD_THREAD_ID > 0 else None
 		caption = display_text if len(display_text) <= 1024 else None
-		media = [
-			InputMediaPhoto(
-				media=BufferedInputFile(content, filename=filename),
-				caption=caption if index == 0 else None,
-				parse_mode="HTML" if index == 0 and caption else None,
-			)
-			for index, (content, filename) in enumerate(preview_payloads)
-		]
 
-		if len(media) == 1:
-			content, filename = preview_payloads[0]
-			await bot.send_photo(
+		if preview_show and preview_payloads:
+			media = [
+				InputMediaPhoto(
+					media=BufferedInputFile(content, filename=filename),
+					has_spoiler=if_spoiler,
+					# caption=caption if index == 0 else None,
+					# parse_mode="HTML" if index == 0 and caption else None,
+				)
+				for index, (content, filename) in enumerate(preview_payloads)
+			]
+
+			if len(media) == 1:
+				content, filename = preview_payloads[0]
+				await bot.send_photo(
+					chat_id=ENCODED_FORWARD_CHAT_ID,
+					message_thread_id=thread_id,
+					photo=BufferedInputFile(content, filename=filename),
+					caption=caption,
+					reply_markup=display_keyboard,
+					parse_mode="HTML" if caption else None,
+					has_spoiler=if_spoiler,
+				)
+				if caption is None:
+					await bot.send_message(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						text=display_text,
+						parse_mode="HTML",
+					)
+
+			else:
+				album = await bot.send_media_group(
+					chat_id=ENCODED_FORWARD_CHAT_ID,
+					message_thread_id=thread_id,
+					media=media
+				)
+
+				if DEFAULT_COVER_FILE_ID is None:
+					send_result = await bot.send_photo(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						photo=BufferedInputFile(
+							_get_seline_image_bytes(),
+							filename="seline.jpeg",
+						),
+						caption=caption,
+						reply_markup=display_keyboard,
+						parse_mode="HTML" if caption else None,
+						reply_to_message_id=album[-1].message_id
+					)
+					DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
+				else:
+					await bot.send_photo(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						photo=DEFAULT_COVER_FILE_ID,
+						caption=caption,
+						reply_markup=display_keyboard,
+						parse_mode="HTML" if caption else None,
+						reply_to_message_id=album[-1].message_id
+					)
+
+				if caption is None:
+					await bot.send_message(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						text=display_text,
+						parse_mode="HTML",
+					)
+
+		elif preview_show:
+			await bot.send_message(
 				chat_id=ENCODED_FORWARD_CHAT_ID,
 				message_thread_id=thread_id,
-				photo=BufferedInputFile(content, filename=filename),
-				caption=caption,
+				text=display_text,
 				reply_markup=display_keyboard,
-				parse_mode="HTML" if caption else None,
+				parse_mode="HTML",
 			)
+
 		else:
-			await bot.send_media_group(
-				chat_id=ENCODED_FORWARD_CHAT_ID,
-				message_thread_id=thread_id,
-				media=media
-			)
+			# print(f"DEFAULT_COVER_FILE_ID = {DEFAULT_COVER_FILE_ID}")
+			if DEFAULT_COVER_FILE_ID is None:
+				send_result = await bot.send_photo(
+					chat_id=ENCODED_FORWARD_CHAT_ID,
+					message_thread_id=thread_id,
+					photo=BufferedInputFile(
+						_get_seline_image_bytes(),
+						filename="seline.jpeg",
+					),
+					caption=caption,
+					reply_markup=display_keyboard,
+					parse_mode="HTML" if caption else None,
+				)
+				DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
+			else:
+				await bot.send_photo(
+					chat_id=ENCODED_FORWARD_CHAT_ID,
+					message_thread_id=thread_id,
+					photo=DEFAULT_COVER_FILE_ID,
+					caption=caption,
+					reply_markup=display_keyboard,
+					parse_mode="HTML" if caption else None,
+				)
 
-			await bot.send_message(
-				chat_id=ENCODED_FORWARD_CHAT_ID,
-				message_thread_id=thread_id,
-				text=display_text,
-				reply_markup=display_keyboard,
-				parse_mode="HTML",
-			)
 
-		if caption is None:
-			await bot.send_message(
-				chat_id=ENCODED_FORWARD_CHAT_ID,
-				message_thread_id=thread_id,
-				text=display_text,
-				reply_markup=display_keyboard,
-				parse_mode="HTML",
-			)
+			if caption is None:
+				await bot.send_message(
+					chat_id=ENCODED_FORWARD_CHAT_ID,
+					message_thread_id=thread_id,
+					text=display_text,
+					parse_mode="HTML",
+				)
+		return True
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] send failed: {exc}", flush=True)
 		try:
@@ -703,12 +1136,174 @@ async def _forward_encoded_if_whitelisted(
 			)
 		except Exception as fallback_exc:
 			print(f"[ENCODED_FORWARD] text fallback failed: {fallback_exc}", flush=True)
+		return False
+
+
+def minutes_to_day_hour(minutes: int):
+	minutes = max(0, int(minutes))
+	total_hours = minutes // 60
+	days = total_hours // 24
+	hours = total_hours % 24
+	remaining_minutes = minutes % 60
+	view_count = minutes // MEDIA_VIEW_COST_MINUTES
+
+	parts = []
+	if days:
+		parts.append(f"{days} 天")
+	if hours:
+		parts.append(f"{hours} 小时")
+	if remaining_minutes or not parts:
+		parts.append(f"{remaining_minutes} 分钟")
+	text = " ".join(parts)
+
+	return text, view_count
+
+
+async def _send_encoded_snapshot(
+	state_key: tuple[int, int],
+	revision: int,
+	owner_user_id: int,
+	encoded: str,
+	items: list[dict[str, Any]],
+	is_first_send: bool,
+) -> None:
+	try:
+		success = await _forward_encoded_if_whitelisted(owner_user_id, encoded, items)
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] background send failed: {exc}", flush=True)
+		success = False
+	state = ENCODER_UI_STATE.get(state_key)
+	if not state:
+		return
+
+	current_revision = int(state.get("revision", 1))
+	if success:
+		# 先记录成功版本，奖励或通知异常时也不会让按钮卡在“送出中”。
+		state["sent_revision"] = revision
+		if is_first_send:
+			try:
+				now_timestamp = int(datetime.now().timestamp())
+				previous_user_expire = user_expire_cache.get(owner_user_id)
+				previous_expire_timestamp = (
+					previous_user_expire.expire_timestamp
+					if previous_user_expire
+					else 0
+				)
+				base_timestamp = max(now_timestamp, previous_expire_timestamp)
+				requested_minutes = len(items) * MEDIA_UPLOAD_EXTEND_MINUTES
+				user_expire = user_expire_cache.extend_minutes(
+					owner_user_id,
+					requested_minutes,
+				)
+
+				actual_added_minutes = max(
+					0,
+					(user_expire.expire_timestamp - base_timestamp) // 60,
+				)
+				remaining_minutes = max(
+					0,
+					(user_expire.expire_timestamp - now_timestamp) // 60,
+				)
+				actual_added_text = minutes_to_day_hour(actual_added_minutes)[0]
+				remaining_text, remaining_view_count = minutes_to_day_hour(remaining_minutes)
+				expire_text = datetime.fromtimestamp(
+					user_expire.expire_timestamp
+				).strftime("%Y-%m-%d %H:%M:%S")
+
+				notify_text = (
+					f"✅ 分享 {len(items)} 个资源成功，已为你延长 {actual_added_text} 的有效时间。\n"
+					f"🎫 飞行通行证到期时间为：{expire_text}。（相当于 {remaining_view_count} 个资源）\n\n"
+					f"🎈 请注意，通行证有效时间上限为 {minutes_to_day_hour(MAX_VALID_DURATION_MINUTES)[0]}，超过上限的部分将不会延长。"
+				)
+
+				await bot.send_message(
+					chat_id=owner_user_id,
+					text=notify_text,
+				)
+
+				print(
+					f"[ENCODED_FORWARD] granted {actual_added_minutes}/{requested_minutes} "
+					f"minutes to user {owner_user_id}",
+					flush=True,
+				)
+			except Exception as exc:
+				print(f"[ENCODED_FORWARD] membership reward failed: {exc}", flush=True)
+
+	state["send_status"] = "idle" if success or current_revision != revision else "failed"
+
+	current_encoded = str(state.get("encoded", ""))
+	if not current_encoded:
+		return
+	try:
+		await bot.edit_message_reply_markup(
+			chat_id=state_key[0],
+			message_id=state_key[1],
+			reply_markup=_build_controls_keyboard(state, current_encoded),
+		)
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] status keyboard update failed: {exc}", flush=True)
+
+
+async def _handle_send_encoded(
+	callback: CallbackQuery,
+	state_key: tuple[int, int],
+	state: dict[str, Any],
+) -> None:
+	owner_user_id = int(state.get("owner_user_id", 0))
+	is_first_send = int(state.get("sent_revision", 0)) == 0
+	# if owner_user_id not in ENCODED_FORWARD_WHITELIST_USER_IDS:
+	# 	await callback.answer("你没有送出权限", show_alert=True)
+	# 	return
+
+	revision = int(state.get("revision", 1))
+	if str(state.get("send_status", "idle")) == "sending":
+		await callback.answer("正在送出，请勿重复点击")
+		return
+	if int(state.get("sent_revision", 0)) == revision:
+		await callback.answer("当前版本已经送出")
+		return
+
+	encoded_snapshot = str(state.get("encoded", ""))
+	if not encoded_snapshot:
+		await callback.answer("当前密文无效，请重新上传", show_alert=True)
+		return
+	items_snapshot = [dict(item) for item in state.get("items", [])]
+	if not items_snapshot:
+		await callback.answer("当前媒体列表为空", show_alert=True)
+		return
+
+	state["send_status"] = "sending"
+	await callback.answer("正在送出")
+	try:
+		await callback.message.edit_reply_markup(
+			reply_markup=_build_controls_keyboard(state, encoded_snapshot),
+		)
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] sending keyboard update failed: {exc}", flush=True)
+
+	task = asyncio.create_task(
+		_send_encoded_snapshot(
+			state_key=state_key,
+			revision=revision,
+			owner_user_id=owner_user_id,
+			encoded=encoded_snapshot,
+			items=items_snapshot,
+			is_first_send=is_first_send,
+		)
+	)
+	state["send_task"] = task
+
+	def _clear_send_task(completed_task: asyncio.Task) -> None:
+		if state.get("send_task") is completed_task:
+			state.pop("send_task", None)
+
+	task.add_done_callback(_clear_send_task)
 
 
 def _upload_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(
 		inline_keyboard=[[
-			InlineKeyboardButton(text="✅ 上传完成", callback_data="enc:upload:done"),
+			InlineKeyboardButton(text="⚙️ 上传已完成，进入配置", callback_data="enc:upload:done"),
 		]]
 	)
 
@@ -727,7 +1322,7 @@ async def _notify_media_limit(message: Message, text: str) -> None:
 async def _update_upload_panel(message: Message, session: dict[str, Any]) -> None:
 	count = len(session["items"])
 	text = (
-		f"📥 已收到 {count} / {MAX_BATCH_MEDIA} 个媒体\n\n"
+		f"📥 已收到 {count} 个媒体 ( 每次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
 		"继续发送媒体，或点击“上传完成”进入编辑菜单。"
 	)
 	panel_message_id = session.get("panel_message_id")
@@ -765,13 +1360,19 @@ async def _finish_upload(
 		"file_type": items[0]["file_type"],
 		"items": items,
 		"no_forward": False,
+		"if_spoiler": False,
 		"flash_seconds": 0,
 		"has_video": bool(video_durations),
 		"video_flash_seconds": (max(video_durations) + 15) if video_durations else 60,
 		"valid_mode": "perm",
+		"revision": 1,
+		"sent_revision": 0,
+		"send_status": "idle",
 	}
 	token, encoded, parsed = _build_token_and_encoded(state)
-	display_text = _build_display(parsed, token, encoded)
+	state["token"] = token
+	state["encoded"] = encoded
+	display_text = await _build_display(parsed, token, encoded)
 	markup = _build_controls_keyboard(state, encoded)
 	panel_message_id = session.get("panel_message_id")
 
@@ -790,8 +1391,6 @@ async def _finish_upload(
 	ENCODER_UI_STATE[(key[0], int(panel_message_id))] = state
 	if UPLOAD_SESSIONS.get(key) is session:
 		UPLOAD_SESSIONS.pop(key, None)
-	source_message = session.get("source_message", message)
-	asyncio.create_task(_forward_encoded_if_whitelisted(source_message, encoded, items))
 
 
 async def _process_queued_media(message: Message) -> None:
@@ -806,13 +1405,13 @@ async def _process_queued_media(message: Message) -> None:
 			return
 		file_type, file_id = _extract_media_info(message)
 		preview_info = _extract_preview_info(message, file_type, file_id)
+		media_metadata = _extract_media_metadata(message, file_type)
 		session["items"].append({
 			"file_id": file_id,
 			"file_type": file_type,
-			"duration": int(getattr(message.video, "duration", 0) or 0) if file_type == "video" else 0,
+			**media_metadata,
 			**preview_info,
 		})
-		session["source_message"] = message
 		session["processed_count"] = int(session.get("processed_count", 0)) + 1
 
 		if len(session["items"]) >= MAX_BATCH_MEDIA:
@@ -847,29 +1446,400 @@ async def _media_worker(worker_id: int) -> None:
 			MEDIA_QUEUE.task_done()
 
 
-@dp.message(F.chat.type == "private", Command("start"))
-async def cmd_start(message: Message, command: CommandObject) -> None:
-	print(f"[CMD_START]{command}", flush=True)
-	print(f"{message}", flush=True)
-	if "/start fly_" in message.text:
-		await message.delete()
+@dp.message(F.chat.type == "private", Command("me"))
+async def cmd_me(message: Message) -> None:
+	if not message.from_user:
 		return
 
-	args = command.args or ""
-	if not args.startswith("fly_"):
+	now_timestamp = int(datetime.now().timestamp())
+	user_expire = user_expire_cache.get(int(message.from_user.id))
+	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
+		await message.reply(
+			"🎫 飞行通行证\n\n"
+			"状态：目前没有有效的通行证\n"
+			"你可以在指定群组发言或分享资源来增加有效时间。\n\n"
+			"🎈 如果你发现你的通行证归零，那就是机器人重开机了，灯台是不备份数据的。"
+		)
 		return
-	
+
+	remaining_seconds = user_expire.expire_timestamp - now_timestamp
+	remaining_minutes = remaining_seconds // 60
+	available_view_count = remaining_minutes // MEDIA_VIEW_COST_MINUTES
+	expire_text = datetime.fromtimestamp(
+		user_expire.expire_timestamp
+	).strftime("%Y-%m-%d %H:%M:%S")
+
 	await message.reply(
-		"👋 你好！\n\n"
-		"发送文件 （ 图片/文件/视频/音频/语音...）给我，我会回复取件码(加密后字符串)。\n"
-		"每批最多发送 10 个媒体，发送完成后点击“上传完成”。\n"
-		"你也可以直接粘贴取件码，我会解码返回媒体。\n\n"
+		"🎫 飞行通行证\n\n"
+		"状态：✅ 有效\n"
+		f"剩余时间：{_format_duration(remaining_seconds)}\n"
+		f"到期时间：{expire_text}\n"
+		f"目前可请求：{available_view_count} 个资源"
 	)
 
 
-@dp.message(Command("about"))
-async def cmd_about(message: Message) -> None:
-	await message.reply("你好\n欢迎")
+def _airport_access_text() -> str:
+	return dedent("""
+		现实世界已经足够喧嚣，我们都需要一个安静的角落，卸下疲惫与伪装，做回最真实的自己。
+
+		这里没有KPI，没有社交面具，只有放松的闲聊与纯粹的光影陪伴。为了守护这份难得的清净，我们定下了这些小小的约定。如果你愿意遵守，欢迎入座：
+
+		<blockquote>三个禁止</blockquote>
+		1️⃣ 禁谈营利：这里不是名利场，不谈钱，不欢迎任何需要付费的灰色资源。
+		2️⃣ 严禁外传：群内资源仅限内部参考与放松，请勿转发。我们只在自己的小圈子里分享快乐。
+		3️⃣ 禁止评判：大家都是来放松的，不是来被说教的。遇到不喜欢的言论或资源，轻轻划过就好。若涉及小众内容，请体贴地使用防剧透模式。
+
+		<blockquote>三个原则</blockquote>
+		1️⃣ 没有主人：认同理念的都是主人，小圈圈里大家都是主人。但会有一个“塔台”来维护系统正常跟清理违规内容。
+		2️⃣ 顺其自然：默认没有人时刻盯着。违规的内容“塔台”看到了就删，没看到便随风而去，一切随缘。
+		3️⃣ 分享与参与：想进群，请先分享资源作为敲门砖；想看别人的资源，请多发言或继续分享。用真诚换真诚，用资源换资源。
+
+		<blockquote>三个任性</blockquote>
+		1️⃣ 不想管：谁偷了谁的原创，谁又骗了谁，“塔台”没时间去当判官。只关注当下的放松，不纠结过去的恩怨。
+		2️⃣ 不打工：请不要把责任无限上纲，“塔台”不是帮你打工的人。机器人卡了、坏了，或是群炸了，没有责任马上修好。
+		3️⃣ 不解释：群风自由，没有群规限制，但一旦违反核心价值观，塔台踢了就踢了，不解释了。
+
+		如果你能接受这些约定，那么，欢迎加入<u>镇泰飞机场</u>。
+
+	""").strip()
+
+
+def _airport_access_keyboard() -> InlineKeyboardMarkup:
+	return InlineKeyboardMarkup(
+		inline_keyboard=[[
+			InlineKeyboardButton(
+				text="✈️ 申请进入机场",
+				callback_data="airport:access:request",
+			)
+		]],
+	)
+
+
+def _airport_quiz_text(question_index: int) -> str:
+	question, _, _ = AIRPORT_QUIZ_QUESTIONS[question_index]
+	return (
+		f"📝 机场入场考试（{question_index + 1}/{len(AIRPORT_QUIZ_QUESTIONS)}）\n\n"
+		f"{question}\n\n"
+		"请选择一个答案。"
+	)
+
+
+def _airport_quiz_keyboard(question_index: int) -> InlineKeyboardMarkup:
+	_, options, _ = AIRPORT_QUIZ_QUESTIONS[question_index]
+	return InlineKeyboardMarkup(
+		inline_keyboard=[
+			[
+				InlineKeyboardButton(
+					text=option,
+					callback_data=f"airport:quiz:{question_index}:{option_index}",
+				)
+			]
+			for option_index, option in enumerate(options)
+		],
+	)
+
+
+async def _send_airport_join_request_invite(user_id: int) -> None:
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		raise RuntimeError("机场群组尚未配置")
+
+	invite = await bot.create_chat_invite_link(
+		chat_id=MESSAGE_REWARD_CHAT_ID,
+		name=f"airport-access-{user_id}",
+		expire_date=datetime.now() + timedelta(minutes=3),
+		creates_join_request=True,
+	)
+	await bot.send_message(
+		chat_id=user_id,
+		text="✅ 你的专属邀请链接已产生，请在 3 分钟内送出入场审核申请。",
+		reply_markup=InlineKeyboardMarkup(
+			inline_keyboard=[[
+				InlineKeyboardButton(
+					text="✈️ 申请加入镇泰飞机场 🔗",
+					url=invite.invite_link,
+				)
+			]],
+		),
+	)
+
+
+@dp.message(F.chat.type == "private", Command("rule"))
+async def cmd_rule(message: Message) -> None:
+	upload_extend_text = minutes_to_day_hour(MEDIA_UPLOAD_EXTEND_MINUTES)[0]
+	view_cost_text = minutes_to_day_hour(MEDIA_VIEW_COST_MINUTES)[0]
+	message_extend_text = minutes_to_day_hour(MESSAGE_EXTEND_MINUTES)[0]
+	max_duration_text = minutes_to_day_hour(MAX_VALID_DURATION_MINUTES)[0]
+
+	await message.reply(
+		"📋 镇泰塔台当前规则\n\n"
+		"<i>飞行通行证期限是镇泰飞机场查看媒体的有效时间，通行证有效时间可以通过分享媒体、群组发言来延长；请求媒体会消耗通行证有效时间。</i>\n\n"
+		"1️⃣ 分享媒体奖励\n"
+		f"每成功分享一个媒体，增加 {upload_extend_text}。\n\n"
+		"2️⃣ 请求媒体消耗\n"
+		f"每请求一个媒体，消耗 {view_cost_text}。\n\n"
+		"3️⃣ 群组发言奖励\n"
+		f"符合条件的一次群组发言，增加 {message_extend_text}，一分钟只采计一次。\n\n"
+		"4️⃣ 通行证期限上限\n"
+		f"飞行通行证最多保留 {max_duration_text}，可重覆扩展效期；效期超过上限就不会继续累加，低于效期即可再扩展。\n",
+		parse_mode="HTML",
+	)
+
+
+@dp.message(F.chat.type == "private", Command("about"))
+@dp.message(F.chat.type == "private", Command("airport_access_request"))
+async def cmd_airport_access_request(message: Message) -> None:
+	await message.reply(
+		_airport_access_text(),
+		parse_mode="HTML",
+		reply_markup=_airport_access_keyboard(),
+	)
+
+
+@dp.message(F.chat.type == "private", Command("start"))
+async def cmd_start(message: Message, command: CommandObject) -> None:
+	if (command.args or "").strip():
+		try:
+			await message.delete()
+		except Exception as exc:
+			print(f"[START] failed to delete parameterized command: {exc}", flush=True)
+		return
+
+	await cmd_airport_access_request(message)
+
+
+@dp.callback_query(F.data == "airport:access:request")
+async def on_airport_access_request(callback: CallbackQuery) -> None:
+	user_id = int(callback.from_user.id)
+	now_timestamp = int(datetime.now().timestamp())
+	user_expire = user_expire_cache.get(user_id)
+	remaining_seconds = max(
+		0,
+		(user_expire.expire_timestamp if user_expire else 0) - now_timestamp,
+	)
+
+	if remaining_seconds <= 2 * 24 * 60 * 60:
+		text = (
+			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过二天。\n"
+			"请先上传 10 个媒体资源，再重新申请。"
+		)
+
+		await callback.answer(
+			text,
+			show_alert=True,
+			cache_time=5,
+		)
+		return
+
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		await callback.answer("机场群组尚未配置，请联系塔台", show_alert=True, cache_time=0)
+		return
+
+	lock = AIRPORT_QUIZ_LOCKS.setdefault(user_id, asyncio.Lock())
+	async with lock:
+		now_timestamp = int(datetime.now().timestamp())
+		retry_at = AIRPORT_QUIZ_RETRY_AT.get(user_id, 0)
+		if retry_at > now_timestamp:
+			await callback.answer(
+				f"答题锁定中，请在 {_format_duration(retry_at - now_timestamp)} 后重新申请。",
+				show_alert=True,
+				cache_time=0,
+			)
+			return
+		AIRPORT_QUIZ_RETRY_AT.pop(user_id, None)
+
+		if AIRPORT_QUIZ_PASSED_UNTIL.get(user_id, 0) > now_timestamp:
+			try:
+				await _send_airport_join_request_invite(user_id)
+			except Exception as exc:
+				print(f"[AIRPORT_ACCESS] invite creation failed: {exc}", flush=True)
+				await callback.answer(
+					"考试已通过，但暂时无法建立机场邀请，请稍后重试。",
+					show_alert=True,
+					cache_time=0,
+				)
+				return
+			await callback.answer("审核邀请已重新发送", cache_time=0)
+			return
+
+		if user_id in AIRPORT_QUIZ_PROGRESS:
+			await callback.answer("考试正在进行，请完成目前的题目。", show_alert=True, cache_time=0)
+			return
+
+		AIRPORT_QUIZ_PROGRESS[user_id] = 0
+		try:
+			await bot.send_message(
+				chat_id=user_id,
+				text=_airport_quiz_text(0),
+				reply_markup=_airport_quiz_keyboard(0),
+			)
+		except Exception as exc:
+			AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
+			print(f"[AIRPORT_ACCESS] quiz delivery failed: {exc}", flush=True)
+			await callback.answer(
+				"暂时无法发送考试题目，请稍后重试。",
+				show_alert=True,
+				cache_time=0,
+			)
+			return
+
+	await callback.answer("机场入场考试已发送，请完成三道单选题。", cache_time=0)
+
+
+@dp.callback_query(F.data.startswith("airport:quiz:"))
+async def on_airport_quiz_answer(callback: CallbackQuery) -> None:
+	if not callback.message or callback.message.chat.type != "private":
+		await callback.answer("考试仅能在机器人私信中进行", show_alert=True, cache_time=0)
+		return
+
+	user_id = int(callback.from_user.id)
+	try:
+		_, _, question_text, option_text = str(callback.data).split(":", 3)
+		question_index = int(question_text)
+		option_index = int(option_text)
+	except (TypeError, ValueError):
+		await callback.answer("无效的考试选项", show_alert=True, cache_time=0)
+		return
+
+	lock = AIRPORT_QUIZ_LOCKS.setdefault(user_id, asyncio.Lock())
+	async with lock:
+		current_question = AIRPORT_QUIZ_PROGRESS.get(user_id)
+		if current_question is None:
+			await callback.answer("本次考试已结束，请重新申请。", show_alert=True, cache_time=0)
+			return
+		if question_index != current_question or not 0 <= question_index < len(AIRPORT_QUIZ_QUESTIONS):
+			await callback.answer("题目已经更新，请回答目前显示的题目。", show_alert=True, cache_time=0)
+			return
+
+		_, options, correct_option = AIRPORT_QUIZ_QUESTIONS[question_index]
+		if not 0 <= option_index < len(options):
+			await callback.answer("无效的考试选项", show_alert=True, cache_time=0)
+			return
+
+		if option_index != correct_option:
+			AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
+			AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
+			AIRPORT_QUIZ_RETRY_AT[user_id] = (
+				int(datetime.now().timestamp()) + AIRPORT_QUIZ_RETRY_SECONDS
+			)
+			await callback.message.edit_text(
+				"❌ 回答错误，本次考试未通过。\n\n"
+				"请重新阅读机场核心精神，30 分钟后再申请答题。"
+			)
+			await callback.answer("回答错误，30 分钟后才能重新申请。", show_alert=True, cache_time=0)
+			return
+
+		next_question = question_index + 1
+		if next_question < len(AIRPORT_QUIZ_QUESTIONS):
+			AIRPORT_QUIZ_PROGRESS[user_id] = next_question
+			await callback.message.edit_text(
+				_airport_quiz_text(next_question),
+				reply_markup=_airport_quiz_keyboard(next_question),
+			)
+			await callback.answer("回答正确，进入下一题。", cache_time=0)
+			return
+
+		AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
+		AIRPORT_QUIZ_PASSED_UNTIL[user_id] = (
+			int(datetime.now().timestamp()) + AIRPORT_QUIZ_PASS_SECONDS
+		)
+		await callback.message.edit_text("✅ 三道题目全部答对，机场核心精神考试通过。")
+		await callback.answer("考试通过，正在建立审核邀请。", cache_time=0)
+		try:
+			await _send_airport_join_request_invite(user_id)
+		except Exception as exc:
+			print(f"[AIRPORT_ACCESS] invite creation failed after quiz: {exc}", flush=True)
+			await bot.send_message(
+				chat_id=user_id,
+				text="考试已经通过，但暂时无法建立邀请；请稍后再次点击申请进入机场。",
+				reply_markup=_airport_access_keyboard(),
+			)
+
+
+@dp.chat_join_request(F.chat.id == MESSAGE_REWARD_CHAT_ID)
+async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
+	user_id = int(join_request.from_user.id)
+	now_timestamp = int(datetime.now().timestamp())
+	user_expire = user_expire_cache.get(user_id)
+	remaining_seconds = max(
+		0,
+		(user_expire.expire_timestamp if user_expire else 0) - now_timestamp,
+	)
+
+	quiz_passed = AIRPORT_QUIZ_PASSED_UNTIL.get(user_id, 0) > now_timestamp
+	if remaining_seconds > 2 * 24 * 60 * 60 and quiz_passed:
+		try:
+			await bot.approve_chat_join_request(
+				chat_id=join_request.chat.id,
+				user_id=user_id,
+			)
+		except Exception as exc:
+			print(f"[AIRPORT_ACCESS] join approval failed: {exc}", flush=True)
+		else:
+			AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
+		return
+
+	if remaining_seconds <= 2 * 24 * 60 * 60:
+		rejection_reason = (
+			"飞行通行证有效时间需要超过二天。\n"
+			"请先上传 10 个媒体资源，再重新申请。"
+		)
+	else:
+		rejection_reason = "尚未完成三道机场核心精神单选题，请从申请按钮重新开始考试。"
+
+	try:
+		await bot.send_message(
+			chat_id=join_request.user_chat_id,
+			text=(
+				f"❌ 入场审核未通过：{rejection_reason}\n\n"
+				f"{_airport_access_text()}"
+			),
+			parse_mode="HTML",
+			reply_markup=_airport_access_keyboard(),
+		)
+	except Exception as exc:
+		print(f"[AIRPORT_ACCESS] rejection notice failed: {exc}", flush=True)
+
+	try:
+		await bot.decline_chat_join_request(
+			chat_id=join_request.chat.id,
+			user_id=user_id,
+		)
+	except Exception as exc:
+		print(f"[AIRPORT_ACCESS] join rejection failed: {exc}", flush=True)
+
+
+@dp.message(F.chat.id == MESSAGE_REWARD_CHAT_ID, F.text)
+async def on_reward_group_message(message: Message) -> None:
+	if not message.from_user or message.from_user.is_bot:
+		return
+	text = (message.text or "").strip()
+	if not text or text.startswith("/"):
+		return
+
+	user_id = int(message.from_user.id)
+	now_timestamp = int(datetime.now().timestamp())
+	previous_user_expire = user_expire_cache.get(user_id)
+	if (
+		previous_user_expire
+		and now_timestamp - previous_user_expire.update_timestamp < 60
+	):
+		# print(f"[MESSAGE_REWARD] user {user_id} message too frequent, skip reward -{now_timestamp - previous_user_expire.update_timestamp}", flush=True)
+		return
+
+	base_timestamp = max(
+		now_timestamp,
+		previous_user_expire.expire_timestamp if previous_user_expire else 0,
+	)
+	user_expire = user_expire_cache.extend_minutes(user_id, MESSAGE_EXTEND_MINUTES)
+	actual_added_minutes = max(
+		0,
+		(user_expire.expire_timestamp - base_timestamp) // 60,
+	)
+	print(
+		f"[MESSAGE_REWARD] user {user_id} granted "
+		f"{actual_added_minutes}/{MESSAGE_EXTEND_MINUTES} minutes",
+		flush=True,
+	)
 
 
 @dp.message(
@@ -910,31 +1880,221 @@ async def on_media(message: Message) -> None:
 	session["accepted_count"] = int(session["accepted_count"]) + 1
 	USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
 
-@dp.callback_query(F.data.startswith("takeoff:"))
+@dp.callback_query(F.data.startswith("takeoff:ban"))
+async def on_takeoff_ban(callback: CallbackQuery) -> None:
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	entities = [
+		*(getattr(callback.message, "entities", None) or []),
+		*(getattr(callback.message, "caption_entities", None) or []),
+	]
+	for entity in entities:
+		entity_type = getattr(entity.type, "value", entity.type)
+		entity_url = str(entity.url or "")
+		if entity_type != "text_link" or not entity_url.startswith("https://b.oy/"):
+			continue
+
+		try:
+			parse_text = entity_url.removeprefix("https://b.oy/")
+			token = UtfConverter.unicode_cjk_to_telegram(parse_text)
+			parsed = UtfConverter.parse_file_token(token)
+			owner_user_id = int(parsed["user_id"])
+			requester_user_id = int(callback.from_user.id)
+		except Exception as exc:
+			await callback.answer(f"解析 Owner 失败: {exc}", show_alert=True)
+			return
+
+		if requester_user_id != owner_user_id:
+			await callback.answer("❌ 你不是机长，无法停飞此班机", show_alert=True)
+			return
+
+		try:
+			await callback.message.delete()
+		except Exception as delete_exc:
+			print(f"[TAKEOFF_BAN] delete failed: {delete_exc}", flush=True)
+			try:
+				await callback.message.edit_reply_markup(
+					reply_markup=InlineKeyboardMarkup(
+						inline_keyboard=[[
+							InlineKeyboardButton(
+								text="已停飞",
+								callback_data="takeoff:grounded",
+							)
+						]]
+					)
+				)
+			except Exception as edit_exc:
+				await callback.answer(f"停飞失败: {edit_exc}", show_alert=True)
+				return
+
+		await callback.answer("机长已停飞此班机", show_alert=True)
+		return
+
+	await callback.answer("消息中找不到有效的取件码链接", show_alert=True)
+
+
+@dp.callback_query(F.data == "takeoff:grounded")
+async def on_takeoff_grounded(callback: CallbackQuery) -> None:
+	await callback.answer("机长已停飞此班机", show_alert=True)
+
+
+def _extract_takeoff_code(message: Message) -> str | None:
+	entities = [
+		*(getattr(message, "entities", None) or []),
+		*(getattr(message, "caption_entities", None) or []),
+	]
+	for entity in entities:
+		entity_type = getattr(entity.type, "value", entity.type)
+		entity_url = str(getattr(entity, "url", "") or "")
+		if entity_type == "text_link" and entity_url.startswith("https://b.oy/"):
+			parse_text = entity_url.removeprefix("https://b.oy/")
+			if parse_text:
+				return parse_text
+	return None
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+	if value <= 0:
+		return 0
+	return (value + divisor - 1) // divisor
+
+
+@dp.callback_query(F.data.startswith("takeoff:fly"))
 async def on_takeoff(callback: CallbackQuery) -> None:
 	if not callback.message:
 		await callback.answer("无法获取消息", show_alert=True)
 		return
-	else:
-		for entity in callback.message.entities or []:
-			entity_type = getattr(entity.type, "value", entity.type)
-			if entity_type == "text_link" and entity.url and "https://b.oy/" in entity.url:
-				parse_text = entity.url.replace("https://b.oy/", "")
-				await extract_encode(parse_text, callback.message, callback.from_user.id)
 
-		# await callback.answer(
-		# 	text=f"查询完成{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-		# 	cache_time=10
-		# )
-		chat_id = callback.message.chat.id
-		message_id = callback.message.message_id
+	parse_text = _extract_takeoff_code(callback.message)
+	if not parse_text:
+		await callback.answer("消息中找不到有效的取件码链接", show_alert=True)
+		return
 
+	try:
+		token = UtfConverter.unicode_cjk_to_telegram(parse_text)
+		parsed = UtfConverter.parse_file_token(token)
+		parsed_items = list(parsed.get("items", []))
+		requested_qty = len(parsed_items) if parsed_items else 1
+		valid_until_dt = datetime.strptime(str(parsed["valid_until"]), "%Y%m%d%H%M%S")
+	except Exception as exc:
+		print(f"[TAKEOFF] token parse failed: {exc}", flush=True)
+		await callback.answer("❌ 无法解析此航班", show_alert=True, cache_time=0)
+		return
+
+	now = datetime.now()
+	if now > valid_until_dt:
+		# overdue_text = _format_duration(int((now - valid_until_dt).total_seconds()))
 		await callback.answer(
-			url=f"https://t.me/autodecoder666bot?start=fly_{chat_id}_{message_id}",
-			cache_time=10
+			text=f"❌ 此航班已过期 ( 超过有效时间 )",
+			show_alert=True,
+			cache_time=100000,
 		)
-		print(f"{callback}")
-	pass
+		return
+
+	reader_user_id = int(callback.from_user.id)
+	requested_minutes = requested_qty * MEDIA_VIEW_COST_MINUTES
+	user_lock = TAKEOFF_USER_LOCKS.setdefault(reader_user_id, asyncio.Lock())
+
+	async with user_lock:
+		now_timestamp = int(datetime.now().timestamp())
+		user_expire = user_expire_cache.get(reader_user_id)
+		available_minutes = max(
+			0,
+			((user_expire.expire_timestamp if user_expire else 0) - now_timestamp) // 60,
+		)
+
+		if available_minutes < requested_minutes:
+			missing_minutes = requested_minutes - available_minutes
+			word_qty = _ceil_div(missing_minutes, MESSAGE_EXTEND_MINUTES)
+			upload_qty = _ceil_div(missing_minutes, MEDIA_UPLOAD_EXTEND_MINUTES)
+			required_until_text = datetime.fromtimestamp(
+				now_timestamp + requested_minutes * 60
+			).strftime("%Y-%m-%d %H:%M:%S")
+			await callback.answer(
+				text=(
+					f"飞行通行证期限需要超过 {required_until_text}。\n"
+					f"你还差 {minutes_to_day_hour(missing_minutes)[0]}，"
+					f"你可以选择发言 {word_qty} 句 ( 1 分钟只计 1 句 )，或再分享 {upload_qty} 个资源。"
+				),
+				show_alert=True,
+				cache_time=0,
+			)
+			return
+
+		original_expire_timestamp = user_expire.expire_timestamp
+		if user_expire_cache.consume_minutes(reader_user_id, requested_minutes) is None:
+			await callback.answer("飞行通行证余额不足，请重新尝试", show_alert=True, cache_time=0)
+			return
+
+		try:
+			send_result = await extract_encode(
+				parse_text,
+				callback.message,
+				reader_user_id,
+			)
+
+
+
+			requested_human_time = minutes_to_day_hour(requested_minutes)[0]
+
+
+			new_user_expire = user_expire_cache.get(reader_user_id)
+
+			expire_text = datetime.fromtimestamp(
+				new_user_expire.expire_timestamp
+			).strftime("%Y-%m-%d %H:%M:%S")
+
+			remaining_minutes = max(
+				0,
+				(new_user_expire.expire_timestamp - now_timestamp) // 60,
+			)
+
+			remaining_text, remaining_view_count = minutes_to_day_hour(remaining_minutes)
+
+			notify_text = (
+				f"✅ 获取 {requested_qty} 个资源成功，本次消耗 {requested_human_time} 的有效时间。\n"
+				f"🎫 当前飞行通行证到期时间为：{expire_text}。（ 相当于 {remaining_view_count} 个资源 ） \n\n"
+				f"🎈 每获取一个媒体需要消耗  {MEDIA_VIEW_COST_MINUTES} 分钟的飞行通行证有效期。"
+			)
+
+			await bot.send_message(
+				chat_id=reader_user_id,
+				text=notify_text,
+			)
+
+
+		except Exception as exc:
+			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
+			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
+			return
+
+		if not send_result.get("ok", False):
+			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			reason = send_result.get("reason", "unknown")
+			if reason == "expired":
+				overdue_text = _format_duration(int(send_result.get("overdue_seconds", 0)))
+				answer_text = f"❌ 此 token 已过期\n已过期: {overdue_text}"
+			elif reason == "flash_used":
+				answer_text = "❌ 此闪读密文仅可读取一次"
+			else:
+				answer_text = "❌ 无法解析此 token"
+			await callback.answer(answer_text, show_alert=True, cache_time=0)
+			return
+
+	chat_id = callback.message.chat.id
+	message_id = callback.message.message_id
+	try:
+		await _increment_takeoff_count(callback.message)
+	except Exception as exc:
+		print(f"[TAKEOFF] counter update failed: {exc}", flush=True)
+
+	await callback.answer(
+		url=f"https://t.me/autodecoder666bot?start=fly_{chat_id}_{message_id}",
+		cache_time=0,
+	)
 
 
 @dp.callback_query(F.data.startswith("enc:"))
@@ -977,8 +2137,13 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 
 	try:
 		_, group, value = str(callback.data).split(":", 2)
+		if group == "send":
+			await _handle_send_encoded(callback, state_key, state)
+			return
 		if group == "fw":
 			state["no_forward"] = value == "1"
+		elif group == "sp":
+			state["if_spoiler"] = value == "1"
 		elif group == "fl":
 			state["flash_seconds"] = int(value)
 		elif group == "vu":
@@ -997,16 +2162,22 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			state["no_forward"] = True
 
 		token, encoded, parsed = _build_token_and_encoded(state)
+		state["revision"] = int(state.get("revision", 1)) + 1
+		state["token"] = token
+		state["encoded"] = encoded
+		if str(state.get("send_status", "idle")) != "sending":
+			state["send_status"] = "idle"
 		markup = _build_controls_keyboard(state, encoded)
-		await callback.message.edit_text(_build_display(parsed, token, encoded), reply_markup=markup, parse_mode="HTML")
+		await callback.message.edit_text(await _build_display(parsed, token, encoded), reply_markup=markup, parse_mode="HTML")
 		await callback.answer("已更新密文")
 	except Exception as exc:
 		await callback.answer(f"更新失败: {exc}", show_alert=True)
 
 
-async def extract_encode(parse_text: str, message: Message, receiver_id: int = None) -> str:
+async def extract_encode(parse_text: str, message: Message, receiver_id: int = None) -> dict[str, Any]:
 	token = UtfConverter.unicode_cjk_to_telegram(parse_text)
 	data = UtfConverter.parse_file_token(token)
+	marked_flash_key: tuple[str, int] | None = None
 
 	valid_until_dt = datetime.strptime(str(data["valid_until"]), "%Y%m%d%H%M%S")
 	now = datetime.now()
@@ -1020,27 +2191,50 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 			f"过期时间: {valid_until_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
 			f"已过期: {overdue_text}"
 		)
-		return
+
+		return {"ok": False, "reason": "expired", "overdue_seconds": overdue_seconds}
 
 	flash_seconds = int(data.get("flash_seconds", 0))
 	nonce_key = str(data.get("nonce", ""))
 	if flash_seconds > 0:
-		expires_at = USED_FLASH_NONCES.get(nonce_key)
+		if receiver_id is not None:
+			reader_user_id = int(receiver_id)
+		elif message.from_user:
+			reader_user_id = int(message.from_user.id)
+		else:
+			raise ValueError("无法确认闪读用户")
+		if reader_user_id <= 0:
+			raise ValueError("闪读用户 ID 无效")
+
+		flash_key = (nonce_key, reader_user_id)
+		expires_at = USED_FLASH_NONCES.get(flash_key)
 		if expires_at and now < expires_at:
-			await message.reply("❌ 此闪读密文仅可读取一次")
-			return
+			# await message.reply("❌ 此闪读密文仅可读取一次")
+			return {"ok": False, "reason": "flash_used"}
 		if str(data.get("valid_until", "")) == "99991231235959":
 			expires_at = now + timedelta(days=PERM_FLASH_NONCE_RETENTION_DAYS)
 		else:
 			expires_at = valid_until_dt
-		USED_FLASH_NONCES[nonce_key] = expires_at
-		marked_nonce = nonce_key
+		USED_FLASH_NONCES[flash_key] = expires_at
+		marked_flash_key = flash_key
 
-	sent_media_messages = await _send_all_media(message, data, receiver_id=receiver_id)
+	print(f"extract_encode: token={token}, data={data}, receiver_id={receiver_id}, flash_seconds={flash_seconds}, marked_flash_key={marked_flash_key}", flush=True)
+	try:
+		sent_media_messages = await _send_all_media(message, data, receiver_id=receiver_id)
+	except Exception:
+		if marked_flash_key:
+			USED_FLASH_NONCES.pop(marked_flash_key, None)
+		raise
 
 	if flash_seconds > 0:
 		for sent_media_message in sent_media_messages:
 			asyncio.create_task(_delete_message_later(sent_media_message, flash_seconds))
+
+	return {
+		"ok": True,
+		"sent_media_messages": sent_media_messages,
+		"marked_flash_key": marked_flash_key,
+	}
 
 	'''
 	await message.reply(
@@ -1063,7 +2257,6 @@ async def on_text(message: Message) -> None:
 	if not text or len(text) < 15:
 		return
 
-	marked_nonce = ""
 	try:
 		parse_text = text
 		START = "⟦["
@@ -1078,8 +2271,6 @@ async def on_text(message: Message) -> None:
 		await extract_encode(parse_text, message)
 
 	except Exception as exc:
-		if marked_nonce:
-			USED_FLASH_NONCES.pop(marked_nonce, None)
 		await message.reply(f"❌ 解码或解析失败: {exc}")
 
 
@@ -1089,7 +2280,13 @@ async def main() -> None:
 	bot_name = str(getattr(me, "username", "") or "")
 	print(f"Bot started as @{bot_name}", flush=True)
 	await bot.set_my_commands(
-		[BotCommand(command="start", description="开始")],
+		[
+			BotCommand(command="start", description="开始"),
+			BotCommand(command="about", description="关于我"),
+			BotCommand(command="me", description="查询飞行通行证"),
+			BotCommand(command="rule", description="查看飞行通行证规则"),
+			BotCommand(command="airport_access_request", description="请求进入机场"),
+		],
 		scope=BotCommandScopeAllPrivateChats(),
 	)
 	workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
@@ -1099,6 +2296,7 @@ async def main() -> None:
 		for worker in workers:
 			worker.cancel()
 		await asyncio.gather(*workers, return_exceptions=True)
+		user_expire_cache.close()
 
 
 if __name__ == "__main__":

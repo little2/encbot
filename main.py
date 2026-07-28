@@ -41,11 +41,11 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path='.env')
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MEDIA_FORWARD_USER_ID = int(os.getenv("MEDIA_FORWARD_USER_ID", "0") or 0)
+#取件码及预览发送群组
 ENCODED_FORWARD_CHAT_ID = int(os.getenv("ENCODED_FORWARD_CHAT_ID", "0") or 0)
 ENCODED_FORWARD_THREAD_ID = int(os.getenv("ENCODED_FORWARD_THREAD_ID", "0") or 0)
-MESSAGE_REWARD_CHAT_ID = int(
-	os.getenv("MESSAGE_REWARD_CHAT_ID", str(ENCODED_FORWARD_CHAT_ID)) or 0
-)
+#发言可以增加通行证时间的群组
+MESSAGE_REWARD_CHAT_ID = int(os.getenv("MESSAGE_REWARD_CHAT_ID", str(ENCODED_FORWARD_CHAT_ID)) or 0)
 DEFAULT_COVER_FILE_ID: str | None = None
 
 volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
@@ -74,7 +74,7 @@ def _parse_whitelist_ids(raw: str) -> set[int]:
 	return ids
 
 
-ENCODED_FORWARD_WHITELIST_USER_IDS = _parse_whitelist_ids(os.getenv("ENCODED_FORWARD_WHITELIST", ""))
+
 
 if not BOT_TOKEN:
 	raise RuntimeError("Missing bot token. Please set ENCBOT_TOKEN or BOT_TOKEN.")

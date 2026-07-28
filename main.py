@@ -447,6 +447,11 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 		return_text += f"📦 媒体数量: {media_count}\n"
 
 	for item in data.get("items", []):
+		
+		_file_type = str(item.get("file_type", ""))
+		if _file_type not in {"document", "audio", "voice"}:
+			continue
+		
 		parts = [
 			_short_media_type(str(item.get("file_type", ""))),
 			_format_file_size(int(item.get("file_size", 0) or 0)),
@@ -1509,6 +1514,59 @@ async def cmd_me(message: Message) -> None:
 	)
 
 
+@dp.message(F.chat.type == "private", Command("bonus"))
+async def cmd_bonus(message: Message, command: CommandObject) -> None:
+	if not message.from_user:
+		return
+
+	# if int(message.from_user.id) != MEDIA_FORWARD_USER_ID:
+	# 	await message.reply("❌ 你没有权限使用此指令")
+	# 	return
+
+	args = str(command.args or "").strip()
+	if not args or not args.lstrip("-").isdigit():
+		await message.reply("用法：/bonus [用户id]")
+		return
+
+	target_user_id = int(args)
+	if target_user_id <= 0:
+		await message.reply("❌ 用户id 无效")
+		return
+
+	bonus_minutes = 10 * 24 * 60
+	now_timestamp = int(datetime.now().timestamp())
+	previous_user_expire = user_expire_cache.get(target_user_id)
+	previous_expire_timestamp = (
+		previous_user_expire.expire_timestamp
+		if previous_user_expire
+		else 0
+	)
+	base_timestamp = max(now_timestamp, previous_expire_timestamp)
+
+	user_expire = user_expire_cache.extend_minutes(target_user_id, bonus_minutes)
+	actual_added_minutes = max(
+		0,
+		(user_expire.expire_timestamp - base_timestamp) // 60,
+	)
+	actual_added_text = minutes_to_day_hour(actual_added_minutes)[0]
+	remaining_minutes = max(
+		0,
+		(user_expire.expire_timestamp - now_timestamp) // 60,
+	)
+	remaining_text, remaining_view_count = minutes_to_day_hour(remaining_minutes)
+	expire_text = datetime.fromtimestamp(
+		user_expire.expire_timestamp
+	).strftime("%Y-%m-%d %H:%M:%S")
+
+	await message.reply(
+		"✅ 已发放飞行时限奖励\n"
+		f"目标用户：{target_user_id}\n"
+		f"本次增加：{actual_added_text}\n"
+		f"到期时间：{expire_text}\n"
+		f"目前可请求：{remaining_view_count} 个资源（约 {remaining_text}）"
+	)
+
+
 def _airport_access_text() -> str:
 	return dedent("""
 		现实世界已经足够喧嚣，我们都需要一个安静的角落，卸下疲惫与伪装，做回最真实的自己。
@@ -2317,6 +2375,7 @@ async def main() -> None:
 			BotCommand(command="start", description="开始"),
 			BotCommand(command="about", description="关于我"),
 			BotCommand(command="me", description="查询飞行通行证"),
+			# BotCommand(command="bonus", description="塔台发放 10 天时限"),
 			BotCommand(command="rule", description="查看飞行通行证规则"),
 			BotCommand(command="airport_access_request", description="请求进入机场"),
 		],

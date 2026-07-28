@@ -174,9 +174,10 @@ class UtfConverter:
         flash_seconds: int,
         valid_until: str,
         if_spoiler: bool = False,
+        anonymous: bool = False,
         nonce: str | None = None,
     ) -> str:
-        """建立最多包含 10 个媒体的 v4 token。"""
+        """建立最多包含 10 个媒体的 v5 token。"""
         if nonce is None:
             nonce = cls.generate_nonce()
         if not 1 <= len(items) <= 10:
@@ -184,7 +185,7 @@ class UtfConverter:
         if not valid_until or not str(valid_until).isdigit() or len(str(valid_until)) != 14:
             raise ValueError("valid_until must be a 14-digit string in YYYYMMDDHHMMSS format")
 
-        parts = ["4", str(nonce), str(user_id), str(len(items))]
+        parts = ["5", str(nonce), str(user_id), str(len(items))]
         for item in items:
             file_id = str(item.get("file_id", ""))
             file_type = str(item.get("file_type", ""))
@@ -209,6 +210,7 @@ class UtfConverter:
             str(flash_seconds),
             str(valid_until),
             "1" if if_spoiler else "0",
+            "1" if anonymous else "0",
         ])
         return ";".join(parts)
 
@@ -221,26 +223,27 @@ class UtfConverter:
         """
         parts = token.split(";")
 
-        if len(parts) >= 9 and parts[0] in {"2", "3", "4"}:
+        if len(parts) >= 9 and parts[0] in {"2", "3", "4", "5"}:
             version, nonce, user_id, count_text, *payload = parts
             if not count_text.isdigit():
                 raise ValueError("Invalid media count")
             count = int(count_text)
             if not 1 <= count <= 10:
                 raise ValueError("Invalid media count, expected 1 to 10")
-            trailing_count = 4 if version in {"3", "4"} else 3
-            fields_per_item = 5 if version == "4" else 2
+            trailing_count = 5 if version == "5" else (4 if version in {"3", "4"} else 3)
+            fields_per_item = 5 if version in {"4", "5"} else 2
             if len(parts) != 4 + count * fields_per_item + trailing_count:
                 raise ValueError(f"Invalid v{version} token format")
 
             media_parts = payload[:count * fields_per_item]
             trailing_parts = payload[count * fields_per_item:]
             no_forward, flash_seconds, valid_until = trailing_parts[:3]
-            if_spoiler = trailing_parts[3] == "1" if version in {"3", "4"} else False
+            if_spoiler = trailing_parts[3] == "1" if version in {"3", "4", "5"} else False
+            anonymous = trailing_parts[4] == "1" if version == "5" else False
             if not valid_until.isdigit() or len(valid_until) != 14:
                 raise ValueError("Invalid valid_until format, expected YYYYMMDDHHMMSS")
 
-            if version == "4":
+            if version in {"4", "5"}:
                 items = []
                 for index in range(0, len(media_parts), fields_per_item):
                     encoded_file_name = media_parts[index + 4]
@@ -268,6 +271,7 @@ class UtfConverter:
                 "no_forward": no_forward == "1",
                 "flash_seconds": int(flash_seconds),
                 "if_spoiler": if_spoiler,
+                "anonymous": anonymous,
                 "valid_until": valid_until,
                 "nonce": nonce,
             }
@@ -289,6 +293,7 @@ class UtfConverter:
             "no_forward": no_forward == "1",
             "flash_seconds": int(flash_seconds),
             "if_spoiler": False,
+            "anonymous": False,
             "valid_until": valid_until,
             "nonce": nonce,
         }

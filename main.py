@@ -60,7 +60,6 @@ user_expire_db_path = Path(
 user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
 
 from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_COST_MINUTES, MESSAGE_EXTEND_MINUTES, MAX_VALID_DURATION_MINUTES
-
 from textwrap import dedent
 
 def _parse_whitelist_ids(raw: str) -> set[int]:
@@ -72,9 +71,6 @@ def _parse_whitelist_ids(raw: str) -> set[int]:
 		if text.lstrip("-").isdigit():
 			ids.add(int(text))
 	return ids
-
-
-
 
 if not BOT_TOKEN:
 	raise RuntimeError("Missing bot token. Please set ENCBOT_TOKEN or BOT_TOKEN.")
@@ -98,6 +94,7 @@ AIRPORT_QUIZ_RETRY_AT: dict[int, int] = {}
 AIRPORT_QUIZ_PASSED_UNTIL: dict[int, int] = {}
 AIRPORT_QUIZ_LOCKS: dict[int, asyncio.Lock] = {}
 MEDIA_QUEUE: asyncio.Queue[Message] = asyncio.Queue(maxsize=100)
+MEDIA_FORWARD_QUEUE: asyncio.Queue[tuple[int, int]] = asyncio.Queue(maxsize=200)
 MEDIA_WORKER_COUNT = 3
 MAX_BATCH_MEDIA = 10
 MAX_USER_PENDING = 15
@@ -439,7 +436,10 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 	start_char = "⟦["
 	end_char = "]⟧"
 
-	user_url = await get_user_hyperlink(bot, {"id":data.get("user_id", 0)}, show_uid=False)
+	if bool(data.get("anonymous", False)):
+		user_url = "[匿名]"
+	else:
+		user_url = await get_user_hyperlink(bot, {"id":data.get("user_id", 0)}, show_uid=False)
 
 	return_text = f"<a href=\"https://b.oy/{encoded}\">👤</a> 机长: {user_url}\n"
 	media_count = len(data.get("items", []))
@@ -555,6 +555,7 @@ def _choice(label: str, selected: bool) -> str:
 
 def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeyboardMarkup:
 	no_forward = bool(state.get("no_forward", False))
+	anonymous = bool(state.get("anonymous", True))
 	flash_seconds = int(state.get("flash_seconds", 0))
 	valid_mode = str(state.get("valid_mode", "perm"))
 	long_flash_seconds = int(state.get("video_flash_seconds", 60))
@@ -571,10 +572,16 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 				InlineKeyboardButton(
 					text="🙈 目前已启用防剧透模式" if state.get("if_spoiler", False) else "🐵 目前未启用防剧透模式",
 					callback_data=f"enc:sp:{0 if state.get('if_spoiler', False) else 1}",
-				)
-			],
+					)
+				],
+				[
+					InlineKeyboardButton(
+						text="🕶️ 目前不显示上传者" if anonymous else "👤 目前显示上传者",
+						callback_data=f"enc:an:{0 if anonymous else 1}",
+					)
+				],
 
-			[
+				[
 				InlineKeyboardButton(
 					text=_choice("不闪", flash_seconds == 0),
 					callback_data="enc:fl:0",
@@ -644,6 +651,7 @@ def _build_token_and_encoded(state: dict[str, Any]) -> tuple[str, str, dict[str,
 		flash_seconds=int(state.get("flash_seconds", 0)),
 		valid_until=valid_until,
 		if_spoiler=bool(state.get("if_spoiler", False)),
+		anonymous=bool(state.get("anonymous", True)),
 	)
 	encoded = UtfConverter.telegram_to_unicode_cjk(token)
 	parsed = UtfConverter.parse_file_token(token)
@@ -831,20 +839,42 @@ async def _delete_message_later(sent_message: Message, delay_seconds: int) -> No
 		pass
 
 
-async def _forward_media_in_background(message: Message) -> None:
+def _enqueue_media_forward(message: Message) -> None:
 	if MEDIA_FORWARD_USER_ID <= 0:
-		print("[MEDIA_FORWARD] MEDIA_FORWARD_USER_ID not set, skip forwarding", flush=True)
 		return
 
 	try:
-		result = await bot.copy_message(
-			chat_id=MEDIA_FORWARD_USER_ID,
-			from_chat_id=message.chat.id,
-			message_id=message.message_id,
+		MEDIA_FORWARD_QUEUE.put_nowait((message.chat.id, message.message_id))
+	except asyncio.QueueFull:
+		print("[MEDIA_FORWARD] queue full, skipped", flush=True)
+
+
+async def _forward_media_in_background(from_chat_id: int, message_id: int) -> None:
+	if MEDIA_FORWARD_USER_ID <= 0:
+		return
+
+	try:
+		await asyncio.wait_for(
+			bot.copy_message(
+				chat_id=MEDIA_FORWARD_USER_ID,
+				from_chat_id=from_chat_id,
+				message_id=message_id,
+			),
+			timeout=30,
 		)
-		print(f"[MEDIA_FORWARD] forward result: {result}", flush=True)
 	except Exception as exc:
 		print(f"[MEDIA_FORWARD] forward failed: {exc}", flush=True)
+
+
+async def _media_forward_worker() -> None:
+	while True:
+		from_chat_id, message_id = await MEDIA_FORWARD_QUEUE.get()
+		try:
+			await _forward_media_in_background(from_chat_id, message_id)
+		except asyncio.CancelledError:
+			raise
+		finally:
+			MEDIA_FORWARD_QUEUE.task_done()
 
 
 def _preview_cache_get(key: tuple[str, str]) -> bytes | None:
@@ -1360,6 +1390,7 @@ async def _finish_upload(
 		"file_type": items[0]["file_type"],
 		"items": items,
 		"no_forward": False,
+		"anonymous": True,
 		"if_spoiler": False,
 		"flash_seconds": 0,
 		"has_video": bool(video_durations),
@@ -1430,7 +1461,7 @@ async def _media_worker(worker_id: int) -> None:
 		)
 		try:
 			await _process_queued_media(message)
-			# await _forward_media_in_background(message)
+			_enqueue_media_forward(message)
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:
@@ -2092,7 +2123,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		print(f"[TAKEOFF] counter update failed: {exc}", flush=True)
 
 	await callback.answer(
-		url=f"https://t.me/autodecoder666bot?start=fly_{chat_id}_{message_id}",
+		url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
 		cache_time=0,
 	)
 
@@ -2142,6 +2173,8 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			return
 		if group == "fw":
 			state["no_forward"] = value == "1"
+		elif group == "an":
+			state["anonymous"] = value == "1"
 		elif group == "sp":
 			state["if_spoiler"] = value == "1"
 		elif group == "fl":
@@ -2290,12 +2323,14 @@ async def main() -> None:
 		scope=BotCommandScopeAllPrivateChats(),
 	)
 	workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
+	forward_worker = asyncio.create_task(_media_forward_worker())
 	try:
 		await dp.start_polling(bot)
 	finally:
 		for worker in workers:
 			worker.cancel()
-		await asyncio.gather(*workers, return_exceptions=True)
+		forward_worker.cancel()
+		await asyncio.gather(*workers, forward_worker, return_exceptions=True)
 		user_expire_cache.close()
 
 

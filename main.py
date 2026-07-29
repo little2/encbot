@@ -15,7 +15,7 @@ import os
 from collections import OrderedDict
 from functools import lru_cache
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -424,10 +424,11 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 	if valid_until == "99991231235959":
 		valid_until_display = "永久有效"
 	elif len(valid_until) == 14 and valid_until.isdigit():
-		valid_until_display = (
-			f"{valid_until[0:4]}-{valid_until[4:6]}-{valid_until[6:8]} "
-			f"{valid_until[8:10]}:{valid_until[10:12]}:{valid_until[12:14]}"
+		valid_until_utc = datetime.strptime(valid_until, "%Y%m%d%H%M%S").replace(
+			tzinfo=timezone.utc
 		)
+		valid_until_utc8 = valid_until_utc.astimezone(timezone(timedelta(hours=8)))
+		valid_until_display = valid_until_utc8.strftime("%Y-%m-%d %H:%M:%S (UTC+08)")
 	else:
 		valid_until_display = valid_until
 

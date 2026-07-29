@@ -145,7 +145,7 @@ class UtfConverter:
 
         格式: nonce;user_id;file_id;file_type;no_forward;flash_seconds;valid_until
 
-        valid_until 建議格式: YYYYMMDDHHMMSS
+        valid_until 格式: YYYYMMDDHHMMSS，时区固定为 UTC+08:00
         """
         if nonce is None:
             nonce = cls.generate_nonce()

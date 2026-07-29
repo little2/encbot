@@ -8,6 +8,8 @@
 	先用 unicode_cjk_to_telegram 还原 token，再用 parse_file_token 解析字段。
 """
 
+
+
 from __future__ import annotations
 import re
 import asyncio
@@ -36,11 +38,25 @@ from html import escape
 from typing import Union
 
 from utils.utf_utils import UtfConverter
+from utils.blacklist_utils import BlacklistEntry, BlacklistStore
 from utils.user_utils import UserExpireCache, UserExpire
 from dotenv import load_dotenv
+
+def _parse_whitelist_ids(raw: str) -> set[int]:
+	ids: set[int] = set()
+	for item in str(raw or "").split(","):
+		text = item.strip()
+		if not text:
+			continue
+		if text.lstrip("-").isdigit():
+			ids.add(int(text))
+	return ids
+
+
 load_dotenv(dotenv_path='.env')
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MEDIA_FORWARD_USER_ID = int(os.getenv("MEDIA_FORWARD_USER_ID", "0") or 0)
+ADMIN_USER_IDS = _parse_whitelist_ids(os.getenv("ADMIN_USER_IDS", ""))
 #取件码及预览发送群组
 ENCODED_FORWARD_CHAT_ID = int(os.getenv("ENCODED_FORWARD_CHAT_ID", "0") or 0)
 ENCODED_FORWARD_THREAD_ID = int(os.getenv("ENCODED_FORWARD_THREAD_ID", "0") or 0)
@@ -58,19 +74,14 @@ user_expire_db_path = Path(
 	os.getenv("USER_EXPIRE_DB_PATH", str(default_user_expire_db_path))
 )
 user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
+blacklist_store = BlacklistStore(db_path=user_expire_db_path)
 
 from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_COST_MINUTES, MESSAGE_EXTEND_MINUTES, MAX_VALID_DURATION_MINUTES
 from textwrap import dedent
 
-def _parse_whitelist_ids(raw: str) -> set[int]:
-	ids: set[int] = set()
-	for item in str(raw or "").split(","):
-		text = item.strip()
-		if not text:
-			continue
-		if text.lstrip("-").isdigit():
-			ids.add(int(text))
-	return ids
+UTC8 = timezone(timedelta(hours=8))
+
+
 
 if not BOT_TOKEN:
 	raise RuntimeError("Missing bot token. Please set ENCBOT_TOKEN or BOT_TOKEN.")
@@ -207,6 +218,16 @@ def _cleanup_used_flash_nonces(now: datetime) -> None:
 		USED_FLASH_NONCES.pop(key, None)
 
 
+def _format_datetime_utc8(value: datetime) -> str:
+	if value.tzinfo is None:
+		value = value.replace(tzinfo=UTC8)
+	return value.astimezone(UTC8).strftime("%m-%d %H:%M")
+
+
+def _format_timestamp_utc8(timestamp: int) -> str:
+	return _format_datetime_utc8(datetime.fromtimestamp(timestamp, tz=timezone.utc))
+
+
 
 
 
@@ -290,7 +311,7 @@ async def get_user_hyperlink(
 
 
     if show_uid:
-        text += f"#U{user_id}"
+        text += f" <code>{user_id}</code>"
 
 
     return text
@@ -424,11 +445,9 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 	if valid_until == "99991231235959":
 		valid_until_display = "永久有效"
 	elif len(valid_until) == 14 and valid_until.isdigit():
-		valid_until_utc = datetime.strptime(valid_until, "%Y%m%d%H%M%S").replace(
-			tzinfo=timezone.utc
+		valid_until_display = _format_datetime_utc8(
+			datetime.strptime(valid_until, "%Y%m%d%H%M%S").replace(tzinfo=UTC8)
 		)
-		valid_until_utc8 = valid_until_utc.astimezone(timezone(timedelta(hours=8)))
-		valid_until_display = valid_until_utc8.strftime("%Y-%m-%d %H:%M:%S (UTC+08)")
 	else:
 		valid_until_display = valid_until
 
@@ -437,15 +456,31 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 	start_char = "⟦["
 	end_char = "]⟧"
 
+	return_text=""
+
 	if bool(data.get("anonymous", False)):
 		user_url = "[匿名]"
 	else:
 		user_url = await get_user_hyperlink(bot, {"id":data.get("user_id", 0)}, show_uid=False)
 
-	return_text = f"<a href=\"https://b.oy/{encoded}\">👤</a> 机长: {user_url}\n"
+	return_text += f"<a href=\"https://b.oy/{encoded}\">👤</a> {user_url} | "
+
+
+	if(data['no_forward']==True):
+		return_text += f"🚫 | "
+
+	if(data['flash_seconds']>0):
+		return_text += f"⚡ {data['flash_seconds']} 秒 | "
+	# if bool(data.get("if_spoiler", False)):
+	# 	return_text += "🙈 防剧透模式: 是\n"
+
+	if(data['valid_until']!="99991231235959"):
+		return_text += f"⏳ {valid_until_display} | "
+
+
 	media_count = len(data.get("items", []))
 	if media_count > 1:
-		return_text += f"📦 媒体数量: {media_count}\n"
+		return_text += f"📦 {media_count} \n"
 
 	for item in data.get("items", []):
 		
@@ -467,19 +502,7 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 		parts.append(escape(file_name) if file_name else "未命名")
 		return_text += f"{parts[0]} {' | '.join(parts[1:])}\n"
 
-	if(data['no_forward']==True):
-		return_text += f"🚫 禁止转发: 是\n"
-	
-	if(data['flash_seconds']>0):
-		return_text += f"⚡ 闪照时间: {data['flash_seconds']} 秒\n"
-	if bool(data.get("if_spoiler", False)):
-		return_text += "🙈 防剧透模式: 是\n"
-
-	if(data['valid_until']!="99991231235959"):
-		return_text += f"⏳ 有效时间: {valid_until_display}\n\n"
-
-	
-
+	return_text += f"<code>{"ㅤ"*25}</code>"
 	# return_text += (
 	# 	f"\n将取件码👇传给 🤖 <a href=\"https://b.oy/{encoded}\">🤖</a><code>{bot_name_lack}</code><code> t</code> (去空格) \n\n{start_char}<code>{encoded}</code>{end_char}"
 	# )
@@ -547,11 +570,11 @@ def _resolve_valid_until(mode: str) -> str:
 	if mode == "perm":
 		return "99991231235959"
 	if mode == "10m":
-		return (datetime.now() + timedelta(minutes=10)).strftime("%Y%m%d%H%M%S")
+		return (datetime.now(UTC8) + timedelta(minutes=10)).strftime("%Y%m%d%H%M%S")
 	if mode == "30m":
-		return (datetime.now() + timedelta(minutes=30)).strftime("%Y%m%d%H%M%S")
+		return (datetime.now(UTC8) + timedelta(minutes=30)).strftime("%Y%m%d%H%M%S")
 	if mode == "1h":
-		return (datetime.now() + timedelta(hours=1)).strftime("%Y%m%d%H%M%S")
+		return (datetime.now(UTC8) + timedelta(hours=1)).strftime("%Y%m%d%H%M%S")
 	raise ValueError(f"Unsupported valid mode: {mode}")
 
 
@@ -611,8 +634,8 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 					callback_data="enc:vu:10m",
 				),
 				InlineKeyboardButton(
-					text=_choice("60分钟", valid_mode == "30m"),
-					callback_data="enc:vu:30m",
+					text=_choice("60分钟", valid_mode == "1h"),
+					callback_data="enc:vu:1h",
 				)
 			],
 		]
@@ -1085,30 +1108,40 @@ async def _forward_encoded_if_whitelisted(
 					media=media
 				)
 
-				if DEFAULT_COVER_FILE_ID is None:
-					send_result = await bot.send_photo(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
-						message_thread_id=thread_id,
-						photo=BufferedInputFile(
-							_get_seline_image_bytes(),
-							filename="seline.jpeg",
-						),
-						caption=caption,
-						reply_markup=display_keyboard,
-						parse_mode="HTML" if caption else None,
-						reply_to_message_id=album[-1].message_id
-					)
-					DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
-				else:
-					await bot.send_photo(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
-						message_thread_id=thread_id,
-						photo=DEFAULT_COVER_FILE_ID,
-						caption=caption,
-						reply_markup=display_keyboard,
-						parse_mode="HTML" if caption else None,
-						reply_to_message_id=album[-1].message_id
-					)
+
+				await bot.send_message(
+					chat_id=ENCODED_FORWARD_CHAT_ID,
+					message_thread_id=thread_id,
+					text=display_text,
+					reply_markup=display_keyboard,
+					parse_mode="HTML" if caption else None,
+					reply_to_message_id=album[-1].message_id
+				)
+
+				# if DEFAULT_COVER_FILE_ID is None:
+				# 	send_result = await bot.send_photo(
+				# 		chat_id=ENCODED_FORWARD_CHAT_ID,
+				# 		message_thread_id=thread_id,
+				# 		photo=BufferedInputFile(
+				# 			_get_seline_image_bytes(),
+				# 			filename="seline.jpeg",
+				# 		),
+				# 		caption=caption,
+				# 		reply_markup=display_keyboard,
+				# 		parse_mode="HTML" if caption else None,
+				# 		reply_to_message_id=album[-1].message_id
+				# 	)
+				# 	DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
+				# else:
+				# 	await bot.send_photo(
+				# 		chat_id=ENCODED_FORWARD_CHAT_ID,
+				# 		message_thread_id=thread_id,
+				# 		photo=DEFAULT_COVER_FILE_ID,
+				# 		caption=caption,
+				# 		reply_markup=display_keyboard,
+				# 		parse_mode="HTML" if caption else None,
+				# 		reply_to_message_id=album[-1].message_id
+				# 	)
 
 				if caption is None:
 					await bot.send_message(
@@ -1242,9 +1275,7 @@ async def _send_encoded_snapshot(
 				)
 				actual_added_text = minutes_to_day_hour(actual_added_minutes)[0]
 				remaining_text, remaining_view_count = minutes_to_day_hour(remaining_minutes)
-				expire_text = datetime.fromtimestamp(
-					user_expire.expire_timestamp
-				).strftime("%Y-%m-%d %H:%M:%S")
+				expire_text = _format_timestamp_utc8(user_expire.expire_timestamp)
 
 				notify_text = (
 					f"✅ 分享 {len(items)} 个资源成功，已为你延长 {actual_added_text} 的有效时间。\n"
@@ -1502,9 +1533,7 @@ async def cmd_me(message: Message) -> None:
 	remaining_seconds = user_expire.expire_timestamp - now_timestamp
 	remaining_minutes = remaining_seconds // 60
 	available_view_count = remaining_minutes // MEDIA_VIEW_COST_MINUTES
-	expire_text = datetime.fromtimestamp(
-		user_expire.expire_timestamp
-	).strftime("%Y-%m-%d %H:%M:%S")
+	expire_text = _format_timestamp_utc8(user_expire.expire_timestamp)
 
 	await message.reply(
 		"🎫 飞行通行证\n\n"
@@ -1555,9 +1584,7 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 		(user_expire.expire_timestamp - now_timestamp) // 60,
 	)
 	remaining_text, remaining_view_count = minutes_to_day_hour(remaining_minutes)
-	expire_text = datetime.fromtimestamp(
-		user_expire.expire_timestamp
-	).strftime("%Y-%m-%d %H:%M:%S")
+	expire_text = _format_timestamp_utc8(user_expire.expire_timestamp)
 
 	await message.reply(
 		"✅ 已发放飞行时限奖励\n"
@@ -1566,6 +1593,190 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 		f"到期时间：{expire_text}\n"
 		f"目前可请求：{remaining_view_count} 个资源（约 {remaining_text}）"
 	)
+
+
+def _is_admin_message(message: Message) -> bool:
+	return bool(
+		message.from_user
+		and int(message.from_user.id) in ADMIN_USER_IDS
+	)
+
+
+def _parse_positive_user_id(raw: str) -> int | None:
+	text = str(raw or "").strip()
+	if not text.isdigit():
+		return None
+	user_id = int(text)
+	return user_id if user_id > 0 else None
+
+
+def _format_blacklist_entry(entry: BlacklistEntry) -> str:
+	return (
+		f"用户 ID：{entry.user_id}\n"
+		f"封禁原因：{entry.reason}\n"
+		f"操作管理员：{entry.created_by}\n"
+		f"封禁时间：{_format_timestamp_utc8(entry.created_at)}"
+	)
+
+
+async def _ban_user(
+	user_id: int,
+	reason: str,
+	created_by: int,
+) -> tuple[BlacklistEntry, str]:
+	entry = blacklist_store.ban(user_id, reason, created_by)
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		return entry, "MESSAGE_REWARD_CHAT_ID 尚未配置"
+
+	try:
+		await bot.ban_chat_member(
+			chat_id=MESSAGE_REWARD_CHAT_ID,
+			user_id=user_id,
+		)
+	except Exception as exc:
+		print(
+			f"[BLACKLIST] failed to ban user {user_id} "
+			f"from chat {MESSAGE_REWARD_CHAT_ID}: {exc}",
+			flush=True,
+		)
+		return entry, str(exc)
+	return entry, ""
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		return
+
+	args = str(command.args or "").strip()
+	parts = args.split(maxsplit=1)
+	explicit_user_id = _parse_positive_user_id(parts[0]) if parts else None
+
+	if explicit_user_id is not None:
+		target_user_id = explicit_user_id
+		reason = parts[1].strip() if len(parts) > 1 else ""
+	else:
+		replied_user = (
+			message.reply_to_message.from_user
+			if message.reply_to_message
+			else None
+		)
+		target_user_id = int(replied_user.id) if replied_user else 0
+		reason = args
+
+	if target_user_id <= 0 or not reason:
+		await message.reply(
+			"用法：/ban [用户id] [原因]\n"
+			"或回复用户消息：/ban [原因]"
+		)
+		return
+	if target_user_id in ADMIN_USER_IDS:
+		await message.reply("❌ 不能封禁管理员")
+		return
+	if len(reason) > 200:
+		await message.reply("❌ 封禁原因不能超过 200 个字符")
+		return
+
+	entry, group_ban_error = await _ban_user(
+		target_user_id,
+		reason,
+		int(message.from_user.id),
+	)
+
+	reply_text = f"✅ 已加入黑名单\n{_format_blacklist_entry(entry)}"
+	if group_ban_error:
+		reply_text += f"\n\n⚠️ 群组移除失败：{group_ban_error}"
+	else:
+		reply_text += "\n\n✅ 已从群组移除并禁止重新加入"
+	await message.reply(reply_text)
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		return
+
+	target_user_id = _parse_positive_user_id(str(command.args or ""))
+	if target_user_id is None:
+		await message.reply("用法：/unban [用户id]")
+		return
+
+	if not blacklist_store.is_blocked(target_user_id):
+		await message.reply(f"ℹ️ 用户不在黑名单中：{target_user_id}")
+		return
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		await message.reply(
+			"❌ 无法解除封禁：MESSAGE_REWARD_CHAT_ID 尚未配置"
+		)
+		return
+
+	try:
+		await bot.unban_chat_member(
+			chat_id=MESSAGE_REWARD_CHAT_ID,
+			user_id=target_user_id,
+			only_if_banned=True,
+		)
+	except Exception as exc:
+		print(
+			f"[BLACKLIST] failed to unban user {target_user_id} "
+			f"from chat {MESSAGE_REWARD_CHAT_ID}: {exc}",
+			flush=True,
+		)
+		await message.reply(f"❌ 群组解除封禁失败：{exc}")
+		return
+
+	blacklist_store.unban(target_user_id)
+	await message.reply(
+		f"✅ 已从黑名单移除并解除群组封禁：{target_user_id}"
+	)
+
+
+@dp.message(Command("baninfo"))
+async def cmd_baninfo(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		return
+
+	target_user_id = _parse_positive_user_id(str(command.args or ""))
+	if target_user_id is None:
+		await message.reply("用法：/baninfo [用户id]")
+		return
+
+	entry = blacklist_store.get(target_user_id)
+	if not entry:
+		await message.reply(f"ℹ️ 用户不在黑名单中：{target_user_id}")
+		return
+	await message.reply(f"🚫 黑名单资料\n{_format_blacklist_entry(entry)}")
+
+
+@dp.message(Command("banlist"))
+async def cmd_banlist(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		return
+
+	page_text = str(command.args or "").strip()
+	page = _parse_positive_user_id(page_text) if page_text else 1
+	if page is None:
+		await message.reply("用法：/banlist [页码]")
+		return
+
+	page_size = 10
+	entries, total = blacklist_store.list_page(page, page_size)
+	if total == 0:
+		await message.reply("黑名单目前为空")
+		return
+
+	total_pages = (total + page_size - 1) // page_size
+	if page > total_pages:
+		await message.reply(f"❌ 页码超出范围，共 {total_pages} 页")
+		return
+
+	lines = [f"🚫 黑名单（第 {page}/{total_pages} 页，共 {total} 人）"]
+	for entry in entries:
+		lines.append(
+			f"{entry.user_id}｜{entry.reason}｜"
+			f"{_format_timestamp_utc8(entry.created_at)}"
+		)
+	await message.reply("\n".join(lines))
 
 
 def _airport_access_text() -> str:
@@ -1636,7 +1847,7 @@ async def _send_airport_join_request_invite(user_id: int) -> None:
 	invite = await bot.create_chat_invite_link(
 		chat_id=MESSAGE_REWARD_CHAT_ID,
 		name=f"airport-access-{user_id}",
-		expire_date=datetime.now() + timedelta(minutes=3),
+		expire_date=datetime.now(timezone.utc) + timedelta(minutes=3),
 		creates_join_request=True,
 	)
 	await bot.send_message(
@@ -1710,7 +1921,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过二天。\n"
-			"请先上传 10 个媒体资源，再重新申请。"
+			"请先上传 10 个媒体资源 (给塔台机器人)，再重新申请。"
 		)
 
 		await callback.answer(
@@ -1871,7 +2082,7 @@ async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		rejection_reason = (
 			"飞行通行证有效时间需要超过二天。\n"
-			"请先上传 10 个媒体资源，再重新申请。"
+			"请先上传 10 个媒体资源 (给塔台机器人)，再重新申请。"
 		)
 	else:
 		rejection_reason = "尚未完成三道机场核心精神单选题，请从申请按钮重新开始考试。"
@@ -1939,6 +2150,8 @@ async def on_reward_group_message(message: Message) -> None:
 async def on_media(message: Message) -> None:
 	if not message.from_user:
 		return
+	if blacklist_store.is_blocked(int(message.from_user.id)):
+		return
 
 	key = (message.chat.id, message.from_user.id)
 	if USER_MEDIA_PENDING.get(key, 0) >= MAX_USER_PENDING:
@@ -1969,6 +2182,124 @@ async def on_media(message: Message) -> None:
 
 	session["accepted_count"] = int(session["accepted_count"]) + 1
 	USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
+
+
+@dp.callback_query(F.data.startswith("ta:b:"))
+async def on_takeoff_admin_blacklist(callback: CallbackQuery) -> None:
+	if int(callback.from_user.id) not in ADMIN_USER_IDS:
+		await callback.answer("❌ 你没有权限执行此操作", show_alert=True)
+		return
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	payload = str(callback.data or "").removeprefix("ta:b:")
+	parts = payload.split(":")
+	if len(parts) != 3:
+		await callback.answer("消息位置参数无效", show_alert=True)
+		return
+	target_user_id = _parse_positive_user_id(parts[0])
+	source_chat_text = parts[1]
+	source_message_id = _parse_positive_user_id(parts[2])
+	if (
+		target_user_id is None
+		or not source_chat_text.lstrip("-").isdigit()
+		or int(source_chat_text) == 0
+		or source_message_id is None
+	):
+		await callback.answer("上传者或消息位置参数无效", show_alert=True)
+		return
+	source_chat_id = int(source_chat_text)
+	if target_user_id in ADMIN_USER_IDS:
+		await callback.answer("❌ 不能封禁管理员", show_alert=True)
+		return
+
+	_, group_ban_error = await _ban_user(
+		target_user_id,
+		"管理员取件审核后拉黑",
+		int(callback.from_user.id),
+	)
+	delete_error = ""
+	try:
+		await bot.delete_message(
+			chat_id=source_chat_id,
+			message_id=source_message_id,
+		)
+	except Exception as exc:
+		delete_error = str(exc)
+		print(
+			f"[TAKEOFF_ADMIN] source message delete failed for "
+			f"{source_chat_id}/{source_message_id}: {exc}",
+			flush=True,
+		)
+
+	if not group_ban_error and not delete_error:
+		try:
+			await callback.message.edit_reply_markup(reply_markup=None)
+		except Exception as exc:
+			print(f"[TAKEOFF_ADMIN] keyboard cleanup failed: {exc}", flush=True)
+		await callback.answer("已删除群消息并拉黑上传者", show_alert=True)
+	elif group_ban_error and delete_error:
+		await callback.answer(
+			"已写入黑名单，但删除群消息和移出群组均失败，请查看日志",
+			show_alert=True,
+		)
+	elif group_ban_error:
+		await callback.answer(
+			"已删除群消息并写入黑名单，但移出群组失败，请查看日志",
+			show_alert=True,
+		)
+	else:
+		await callback.answer(
+			"已拉黑并移出上传者，但删除群消息失败，请查看日志",
+			show_alert=True,
+		)
+
+
+@dp.callback_query(F.data.startswith("ta:d:"))
+async def on_takeoff_admin_delete(callback: CallbackQuery) -> None:
+	if int(callback.from_user.id) not in ADMIN_USER_IDS:
+		await callback.answer("❌ 你没有权限执行此操作", show_alert=True)
+		return
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	payload = str(callback.data or "").removeprefix("ta:d:")
+	parts = payload.split(":")
+	if len(parts) != 2:
+		await callback.answer("消息位置参数无效", show_alert=True)
+		return
+	source_chat_text = parts[0]
+	source_message_id = _parse_positive_user_id(parts[1])
+	if (
+		not source_chat_text.lstrip("-").isdigit()
+		or int(source_chat_text) == 0
+		or source_message_id is None
+	):
+		await callback.answer("消息位置参数无效", show_alert=True)
+		return
+	source_chat_id = int(source_chat_text)
+
+	try:
+		await bot.delete_message(
+			chat_id=source_chat_id,
+			message_id=source_message_id,
+		)
+	except Exception as exc:
+		print(
+			f"[TAKEOFF_ADMIN] source message delete failed for "
+			f"{source_chat_id}/{source_message_id}: {exc}",
+			flush=True,
+		)
+		await callback.answer("删除群消息失败，请查看日志", show_alert=True)
+		return
+	try:
+		await callback.message.edit_reply_markup(reply_markup=None)
+	except Exception as exc:
+		print(f"[TAKEOFF_ADMIN] keyboard cleanup failed: {exc}", flush=True)
+	await callback.answer("群消息已删除")
+
 
 @dp.callback_query(F.data.startswith("takeoff:ban"))
 async def on_takeoff_ban(callback: CallbackQuery) -> None:
@@ -2067,13 +2398,16 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		parsed = UtfConverter.parse_file_token(token)
 		parsed_items = list(parsed.get("items", []))
 		requested_qty = len(parsed_items) if parsed_items else 1
-		valid_until_dt = datetime.strptime(str(parsed["valid_until"]), "%Y%m%d%H%M%S")
+		valid_until_dt = datetime.strptime(
+			str(parsed["valid_until"]),
+			"%Y%m%d%H%M%S",
+		).replace(tzinfo=UTC8)
 	except Exception as exc:
 		print(f"[TAKEOFF] token parse failed: {exc}", flush=True)
 		await callback.answer("❌ 无法解析此航班", show_alert=True, cache_time=0)
 		return
 
-	now = datetime.now()
+	now = datetime.now(UTC8)
 	if now > valid_until_dt:
 		# overdue_text = _format_duration(int((now - valid_until_dt).total_seconds()))
 		await callback.answer(
@@ -2099,9 +2433,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			missing_minutes = requested_minutes - available_minutes
 			word_qty = _ceil_div(missing_minutes, MESSAGE_EXTEND_MINUTES)
 			upload_qty = _ceil_div(missing_minutes, MEDIA_UPLOAD_EXTEND_MINUTES)
-			required_until_text = datetime.fromtimestamp(
-				now_timestamp + requested_minutes * 60
-			).strftime("%Y-%m-%d %H:%M:%S")
+			required_until_text = _format_timestamp_utc8(now_timestamp + requested_minutes * 60)
 			await callback.answer(
 				text=(
 					f"飞行通行证期限需要超过 {required_until_text}。\n"
@@ -2132,9 +2464,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 
 			new_user_expire = user_expire_cache.get(reader_user_id)
 
-			expire_text = datetime.fromtimestamp(
-				new_user_expire.expire_timestamp
-			).strftime("%Y-%m-%d %H:%M:%S")
+			expire_text = _format_timestamp_utc8(new_user_expire.expire_timestamp)
 
 			remaining_minutes = max(
 				0,
@@ -2149,9 +2479,48 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				f"🎈 每获取一个媒体需要消耗  {MEDIA_VIEW_COST_MINUTES} 分钟的飞行通行证有效期。"
 			)
 
+			if reader_user_id in ADMIN_USER_IDS:
+				uploader_id = int(parsed.get("user_id", 0) or 0)
+				source_chat_id = int(callback.message.chat.id)
+				source_message_id = int(callback.message.message_id)
+				uploader_text = await get_user_hyperlink(
+					bot,
+					{"id": uploader_id},
+					show_uid=True,
+				)
+				notify_text += f"\n👤 上传者：{uploader_text}"
+				admin_markup = InlineKeyboardMarkup(
+					inline_keyboard=[
+						[
+							InlineKeyboardButton(
+								text="🚫 删除消息并拉黑上传者",
+								callback_data=(
+									"ta:b:"
+									f"{uploader_id}:{source_chat_id}:"
+									f"{source_message_id}"
+								),
+							),
+						],
+						[
+							InlineKeyboardButton(
+								text="🗑 删除消息",
+								callback_data=(
+									"ta:d:"
+									f"{source_chat_id}:{source_message_id}"
+								),
+							),
+						],
+					],
+				)
+			else:
+				admin_markup = None
+
 			await bot.send_message(
 				chat_id=reader_user_id,
 				text=notify_text,
+				parse_mode="HTML",
+				disable_web_page_preview=True,
+				reply_markup=admin_markup,
 			)
 
 
@@ -2271,8 +2640,11 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	data = UtfConverter.parse_file_token(token)
 	marked_flash_key: tuple[str, int] | None = None
 
-	valid_until_dt = datetime.strptime(str(data["valid_until"]), "%Y%m%d%H%M%S")
-	now = datetime.now()
+	valid_until_dt = datetime.strptime(
+		str(data["valid_until"]),
+		"%Y%m%d%H%M%S",
+	).replace(tzinfo=UTC8)
+	now = datetime.now(UTC8)
 	_cleanup_used_flash_nonces(now)
 
 	if now > valid_until_dt:
@@ -2280,7 +2652,7 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 		overdue_text = _format_duration(overdue_seconds)
 		await message.reply(
 			"❌ 此 token 已过期\n"
-			f"过期时间: {valid_until_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+			f"过期时间: {_format_datetime_utc8(valid_until_dt)}\n"
 			f"已过期: {overdue_text}"
 		)
 
@@ -2391,6 +2763,7 @@ async def main() -> None:
 			worker.cancel()
 		forward_worker.cancel()
 		await asyncio.gather(*workers, forward_worker, return_exceptions=True)
+		blacklist_store.close()
 		user_expire_cache.close()
 
 

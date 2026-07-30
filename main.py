@@ -2098,7 +2098,7 @@ async def on_airport_quiz_answer(callback: CallbackQuery) -> None:
 			)
 
 
-@dp.chat_join_request(F.chat.id == MESSAGE_REWARD_CHAT_ID)
+@dp.chat_join_request(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
 async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 	user_id = int(join_request.from_user.id)
 	now_timestamp = int(datetime.now().timestamp())
@@ -2151,7 +2151,7 @@ async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 		print(f"[AIRPORT_ACCESS] join rejection failed: {exc}", flush=True)
 
 
-@dp.message(F.chat.id == MESSAGE_REWARD_CHAT_ID, F.text)
+@dp.message(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}), F.text)
 async def on_reward_group_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
 		return

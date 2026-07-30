@@ -1389,7 +1389,7 @@ async def _notify_media_limit(message: Message, text: str) -> None:
 async def _update_upload_panel(message: Message, session: dict[str, Any]) -> None:
 	count = len(session["items"])
 	text = (
-		f"📥 已收到 {count} 个媒体 ( 每次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
+		f"📥 已收到 {count} 个媒体 ( 不同系列请分开传，每批次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
 		"继续发送媒体，或点击“上传完成”进入编辑菜单。"
 	)
 	panel_message_id = session.get("panel_message_id")

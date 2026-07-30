@@ -1640,6 +1640,20 @@ async def _ban_user(
 			flush=True,
 		)
 		return entry, str(exc)
+	
+	try:
+		await bot.ban_chat_member(
+			chat_id=ENCODED_FORWARD_CHAT_ID,
+			user_id=user_id,
+		)
+	except Exception as exc:
+		print(
+			f"[BLACKLIST] failed to ban user {user_id} "
+			f"from chat {ENCODED_FORWARD_CHAT_ID}: {exc}",
+			flush=True,
+		)
+		return entry, str(exc)	
+
 	return entry, ""
 
 
@@ -1724,6 +1738,22 @@ async def cmd_unban(message: Message, command: CommandObject) -> None:
 		)
 		await message.reply(f"❌ 群组解除封禁失败：{exc}")
 		return
+
+	try:
+		await bot.unban_chat_member(
+			chat_id=ENCODED_FORWARD_CHAT_ID,
+			user_id=target_user_id,
+			only_if_banned=True,
+		)
+	except Exception as exc:
+		print(
+			f"[BLACKLIST] failed to unban user {target_user_id} "
+			f"from chat {ENCODED_FORWARD_CHAT_ID}: {exc}",
+			flush=True,
+		)
+		await message.reply(f"❌ 群组解除封禁失败：{exc}")
+		return
+
 
 	blacklist_store.unban(target_user_id)
 	await message.reply(
@@ -1842,7 +1872,7 @@ def _airport_quiz_keyboard(question_index: int) -> InlineKeyboardMarkup:
 
 async def _send_airport_join_request_invite(user_id: int) -> None:
 	if MESSAGE_REWARD_CHAT_ID == 0:
-		raise RuntimeError("机场群组尚未配置")
+		raise RuntimeError("机场大厅尚未配置")
 
 	invite = await bot.create_chat_invite_link(
 		chat_id=MESSAGE_REWARD_CHAT_ID,
@@ -1850,16 +1880,28 @@ async def _send_airport_join_request_invite(user_id: int) -> None:
 		expire_date=datetime.now(timezone.utc) + timedelta(minutes=3),
 		creates_join_request=True,
 	)
+
+	invite2 = await bot.create_chat_invite_link(
+		chat_id=ENCODED_FORWARD_CHAT_ID,
+		name=f"airport-access-{user_id}",
+		expire_date=datetime.now(timezone.utc) + timedelta(minutes=3),
+		creates_join_request=True,
+	)
+
 	await bot.send_message(
 		chat_id=user_id,
-		text="✅ 你的专属邀请链接已产生，请在 3 分钟内送出入场审核申请。",
+		text="✅ 你的专属邀请链接已产生，请在 3 分钟内送出入场审核申请。(两个都要加)",
 		reply_markup=InlineKeyboardMarkup(
 			inline_keyboard=[[
 				InlineKeyboardButton(
-					text="✈️ 申请加入镇泰飞机场 🔗",
+					text="✈️ 飞机场 🔗",
+					url=invite2.invite_link,
+				),
+				InlineKeyboardButton(
+					text="✈️ 旅客大厅 🔗",
 					url=invite.invite_link,
 				)
-			]],
+			]]
 		),
 	)
 

@@ -2435,6 +2435,12 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		await callback.answer("消息中找不到有效的取件码链接", show_alert=True)
 		return
 
+	reader_user_id = int(callback.from_user.id)
+
+	is_admin  = False
+	if reader_user_id in ADMIN_USER_IDS:
+		is_admin = True
+
 	try:
 		token = UtfConverter.unicode_cjk_to_telegram(parse_text)
 		parsed = UtfConverter.parse_file_token(token)
@@ -2450,7 +2456,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		return
 
 	now = datetime.now(UTC8)
-	if now > valid_until_dt:
+	if now > valid_until_dt and not is_admin:
 		# overdue_text = _format_duration(int((now - valid_until_dt).total_seconds()))
 		await callback.answer(
 			text=f"❌ 此航班已过期 ( 超过有效时间 )",
@@ -2459,7 +2465,6 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		)
 		return
 
-	reader_user_id = int(callback.from_user.id)
 	requested_minutes = requested_qty * MEDIA_VIEW_COST_MINUTES
 	user_lock = TAKEOFF_USER_LOCKS.setdefault(reader_user_id, asyncio.Lock())
 
@@ -2499,6 +2504,20 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				reader_user_id,
 			)
 
+			if not send_result.get("ok", False):
+				user_expire_cache.update(reader_user_id, original_expire_timestamp)
+				reason = send_result.get("reason", "unknown")
+				if reason == "expired":
+					overdue_text = _format_duration(int(send_result.get("overdue_seconds", 0)))
+					answer_text = f"❌ 此 token 已过期\n已过期: {overdue_text}"
+				elif reason == "flash_used":
+					answer_text = "❌ 此闪读密文仅可读取一次"
+				else:
+					answer_text = "❌ 无法解析此 token"
+				await callback.answer(answer_text, show_alert=True, cache_time=0)
+				return
+
+
 
 
 			requested_human_time = minutes_to_day_hour(requested_minutes)[0]
@@ -2521,7 +2540,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				f"🎈 每获取一个媒体需要消耗  {MEDIA_VIEW_COST_MINUTES} 分钟的飞行通行证有效期。"
 			)
 
-			if reader_user_id in ADMIN_USER_IDS:
+			if is_admin:
 				uploader_id = int(parsed.get("user_id", 0) or 0)
 				source_chat_id = int(callback.message.chat.id)
 				source_message_id = int(callback.message.message_id)
@@ -2572,18 +2591,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
 			return
 
-		if not send_result.get("ok", False):
-			user_expire_cache.update(reader_user_id, original_expire_timestamp)
-			reason = send_result.get("reason", "unknown")
-			if reason == "expired":
-				overdue_text = _format_duration(int(send_result.get("overdue_seconds", 0)))
-				answer_text = f"❌ 此 token 已过期\n已过期: {overdue_text}"
-			elif reason == "flash_used":
-				answer_text = "❌ 此闪读密文仅可读取一次"
-			else:
-				answer_text = "❌ 无法解析此 token"
-			await callback.answer(answer_text, show_alert=True, cache_time=0)
-			return
+
 
 	chat_id = callback.message.chat.id
 	message_id = callback.message.message_id
@@ -2682,6 +2690,10 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	data = UtfConverter.parse_file_token(token)
 	marked_flash_key: tuple[str, int] | None = None
 
+	is_admin  = False
+	if receiver_id in ADMIN_USER_IDS:
+		is_admin = True
+
 	valid_until_dt = datetime.strptime(
 		str(data["valid_until"]),
 		"%Y%m%d%H%M%S",
@@ -2689,7 +2701,7 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	now = datetime.now(UTC8)
 	_cleanup_used_flash_nonces(now)
 
-	if now > valid_until_dt:
+	if now > valid_until_dt and not is_admin:
 		overdue_seconds = int((now - valid_until_dt).total_seconds())
 		overdue_text = _format_duration(overdue_seconds)
 		await message.reply(

@@ -2436,6 +2436,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		return
 
 	reader_user_id = int(callback.from_user.id)
+	print("2439 reader_user_id = {reader_user_id}")
 
 	is_admin  = False
 	if reader_user_id in ADMIN_USER_IDS:
@@ -2690,6 +2691,7 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	data = UtfConverter.parse_file_token(token)
 	marked_flash_key: tuple[str, int] | None = None
 
+	print(f"2693 receiver_id={receiver_id}")
 	is_admin  = False
 	if receiver_id in ADMIN_USER_IDS:
 		is_admin = True

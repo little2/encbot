@@ -39,6 +39,7 @@ from typing import Union
 
 from utils.utf_utils import UtfConverter
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
+from utils.received_media_utils import ReceivedMediaStore
 from utils.user_utils import UserExpireCache, UserExpire
 from dotenv import load_dotenv
 
@@ -75,6 +76,7 @@ user_expire_db_path = Path(
 )
 user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
 blacklist_store = BlacklistStore(db_path=user_expire_db_path)
+received_media_store = ReceivedMediaStore(db_path=user_expire_db_path)
 
 from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_COST_MINUTES, MESSAGE_EXTEND_MINUTES, MAX_VALID_DURATION_MINUTES
 from textwrap import dedent
@@ -341,6 +343,22 @@ def _extract_media_info(message: Message) -> tuple[str, str]:
 		return "sticker", message.sticker.file_id
 
 	raise ValueError("Unsupported media type")
+
+
+def _extract_media_unique_id(message: Message) -> str:
+	media = (
+		message.document
+		or (message.photo[-1] if message.photo else None)
+		or message.video
+		or message.audio
+		or message.voice
+		or message.animation
+		or message.sticker
+	)
+	file_unique_id = str(getattr(media, "file_unique_id", "") or "").strip()
+	if not file_unique_id:
+		raise ValueError("媒体缺少 file_unique_id")
+	return file_unique_id
 
 
 def _extract_preview_info(message: Message, file_type: str, file_id: str) -> dict[str, str]:
@@ -1263,6 +1281,13 @@ async def _send_encoded_snapshot(
 	if success:
 		# 先记录成功版本，奖励或通知异常时也不会让按钮卡在“送出中”。
 		state["sent_revision"] = revision
+		try:
+			received_media_store.mark_accepted_many([
+				str(item.get("file_unique_id", ""))
+				for item in items
+			])
+		except Exception as exc:
+			print(f"[RECEIVED_MEDIA] accept failed: {exc}", flush=True)
 		if is_first_send:
 			try:
 				now_timestamp = int(datetime.now().timestamp())
@@ -1486,10 +1511,12 @@ async def _process_queued_media(message: Message) -> None:
 		if not session:
 			return
 		file_type, file_id = _extract_media_info(message)
+		file_unique_id = _extract_media_unique_id(message)
 		preview_info = _extract_preview_info(message, file_type, file_id)
 		media_metadata = _extract_media_metadata(message, file_type)
 		session["items"].append({
 			"file_id": file_id,
+			"file_unique_id": file_unique_id,
 			"file_type": file_type,
 			**media_metadata,
 			**preview_info,
@@ -1517,6 +1544,28 @@ async def _media_worker(worker_id: int) -> None:
 			raise
 		except Exception as exc:
 			print(f"[MEDIA_WORKER {worker_id}] failed: {exc}", flush=True)
+			if key:
+				file_unique_id = ""
+				try:
+					file_unique_id = _extract_media_unique_id(message)
+				except Exception:
+					pass
+				session = UPLOAD_SESSIONS.get(key)
+				was_added = bool(session and any(
+					str(item.get("file_unique_id", "")) == file_unique_id
+					for item in session.get("items", [])
+				))
+				if file_unique_id and not was_added:
+					received_media_store.release_pending(
+						file_unique_id,
+						message.chat.id,
+						message.message_id,
+					)
+					if session:
+						session["accepted_count"] = max(
+							int(session.get("processed_count", 0)),
+							int(session.get("accepted_count", 0)) - 1,
+						)
 			await message.reply(f"❌ 处理媒体失败: {exc}")
 		finally:
 			if key:
@@ -2216,6 +2265,29 @@ async def on_media(message: Message) -> None:
 		return
 
 	session = UPLOAD_SESSIONS.get(key)
+	if session and int(session["accepted_count"]) >= MAX_BATCH_MEDIA:
+		await _notify_media_limit(message, "每批最多上传 10 个媒体，多余媒体未加入")
+		return
+
+	try:
+		file_type, file_id = _extract_media_info(message)
+		file_unique_id = _extract_media_unique_id(message)
+	except ValueError as exc:
+		await message.reply(f"❌ 无法识别媒体: {exc}")
+		return
+
+	claimed = received_media_store.claim(
+		file_unique_id=file_unique_id,
+		file_id=file_id,
+		file_type=file_type,
+		user_id=int(message.from_user.id),
+		source_chat_id=int(message.chat.id),
+		source_message_id=int(message.message_id),
+	)
+	if not claimed:
+		await _notify_media_limit(message, "此媒体已经收过，本批未计入")
+		return
+
 	if not session:
 		session = {
 			"items": [],
@@ -2225,13 +2297,14 @@ async def on_media(message: Message) -> None:
 		}
 		UPLOAD_SESSIONS[key] = session
 
-	if int(session["accepted_count"]) >= MAX_BATCH_MEDIA:
-		await _notify_media_limit(message, "每批最多上传 10 个媒体，多余媒体未加入")
-		return
-
 	try:
 		MEDIA_QUEUE.put_nowait(message)
 	except asyncio.QueueFull:
+		received_media_store.release_pending(
+			file_unique_id,
+			message.chat.id,
+			message.message_id,
+		)
 		if int(session["accepted_count"]) == 0:
 			UPLOAD_SESSIONS.pop(key, None)
 		await _notify_media_limit(message, "系统正在处理较多媒体，请稍后再试")
@@ -2835,6 +2908,7 @@ async def main() -> None:
 		forward_worker.cancel()
 		await asyncio.gather(*workers, forward_worker, return_exceptions=True)
 		blacklist_store.close()
+		received_media_store.close()
 		user_expire_cache.close()
 
 

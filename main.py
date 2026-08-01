@@ -23,6 +23,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageOps
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import User, BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, ChatJoinRequest, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -42,6 +43,8 @@ from utils.blacklist_utils import BlacklistEntry, BlacklistStore
 from utils.received_media_utils import ReceivedMediaStore
 from utils.user_utils import UserExpireCache, UserExpire
 from dotenv import load_dotenv
+
+
 
 def _parse_whitelist_ids(raw: str) -> set[int]:
 	ids: set[int] = set()
@@ -158,6 +161,33 @@ AIRPORT_QUIZ_QUESTIONS = (
 		5,
 	),
 )
+
+
+
+ENCODED_FORWARD_SEND_LOCK = asyncio.Lock()
+async def _telegram_call_with_retry(
+    label: str,
+    operation,
+    max_attempts: int = 4,
+):
+	async with ENCODED_FORWARD_SEND_LOCK:
+		for attempt in range(max_attempts):
+			try:
+				return await operation()
+			except TelegramRetryAfter as exc:
+				if attempt + 1 >= max_attempts:
+					raise
+
+				delay = max(1, int(exc.retry_after)) + 1
+				print(
+					f"[TELEGRAM_RATE_LIMIT] {label}: "
+					f"retry in {delay}s ({attempt + 1}/{max_attempts})",
+					flush=True,
+				)
+				await asyncio.sleep(delay)
+
+
+
 SELINE_IMAGE_PATHS = (
 	Path(__file__).resolve().parent / "sepline.jpeg",
 )
@@ -752,19 +782,21 @@ async def _send_media_by_type(message: Message, data: dict[str, Any], receiver_i
 	if file_type == "document":
 		return await bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward)
 	if file_type == "photo":
-		return await bot.send_photo(
-			chat_id=chat_id,
-			photo=file_id,
-			protect_content=no_forward,
-			has_spoiler=if_spoiler,
-		)
+		async with ENCODED_FORWARD_SEND_LOCK:
+			return await bot.send_photo(
+				chat_id=chat_id,
+				photo=file_id,
+				protect_content=no_forward,
+				has_spoiler=if_spoiler,
+			)
 	if file_type == "video":
-		return await bot.send_video(
-			chat_id=chat_id,
-			video=file_id,
-			protect_content=no_forward,
-			has_spoiler=if_spoiler,
-		)
+		async with ENCODED_FORWARD_SEND_LOCK:
+			return await bot.send_video(
+				chat_id=chat_id,
+				video=file_id,
+				protect_content=no_forward,
+				has_spoiler=if_spoiler,
+			)
 	if file_type == "audio":
 		return await bot.send_audio(chat_id=chat_id, audio=file_id, protect_content=no_forward)
 	if file_type == "voice":
@@ -835,12 +867,13 @@ async def _send_all_media(
                 for item in pending_group
             ]
 
-            result = await bot.send_media_group(
-                chat_id=receiver_id or message.from_user.id,
-                media=media,
-                protect_content=no_forward,
-            )
-            sent_messages.extend(result)
+            async with ENCODED_FORWARD_SEND_LOCK:
+                result = await bot.send_media_group(
+                    chat_id=receiver_id or message.from_user.id,
+                    media=media,
+                    protect_content=no_forward,
+                )
+                sent_messages.extend(result)
         else:
             item_data = dict(data)
             item_data.update(pending_group[0])
@@ -1023,13 +1056,12 @@ async def _forward_encoded_if_whitelisted(
 	owner_user_id: int,
 	encoded: str,
 	items: list[dict[str, Any]],
-) -> bool:
+) -> dict:
 	global DEFAULT_COVER_FILE_ID
 	if ENCODED_FORWARD_CHAT_ID == 0:
-		return False
+		return {"ok":False,"error_msg":"ENCODED_FORWARD_CHAT_ID is 0"}
 
-	# if owner_user_id <= 0 or owner_user_id not in ENCODED_FORWARD_WHITELIST_USER_IDS:
-	# 	return False
+
 
 	preview_show = True
 
@@ -1107,6 +1139,13 @@ async def _forward_encoded_if_whitelisted(
 		thread_id = ENCODED_FORWARD_THREAD_ID if ENCODED_FORWARD_THREAD_ID > 0 else None
 		caption = display_text if len(display_text) <= 1024 else None
 
+	except Exception as exc:
+		return {"ok":False}
+		print(f"{exec}")
+
+		
+	try:
+
 		if preview_show and preview_payloads:
 			media = [
 				InputMediaPhoto(
@@ -1120,39 +1159,55 @@ async def _forward_encoded_if_whitelisted(
 
 			if len(media) == 1:
 				content, filename = preview_payloads[0]
-				await bot.send_photo(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
-					message_thread_id=thread_id,
-					photo=BufferedInputFile(content, filename=filename),
-					caption=caption,
-					reply_markup=display_keyboard,
-					parse_mode="HTML" if caption else None,
-					has_spoiler=if_spoiler,
-				)
-				if caption is None:
-					await bot.send_message(
+				await _telegram_call_with_retry(
+					"send preview photo",
+					lambda: bot.send_photo(
 						chat_id=ENCODED_FORWARD_CHAT_ID,
 						message_thread_id=thread_id,
-						text=display_text,
-						parse_mode="HTML",
+						photo=BufferedInputFile(content, filename=filename),
+						caption=caption,
+						reply_markup=display_keyboard if caption else None,
+						parse_mode="HTML" if caption else None,
+						has_spoiler=if_spoiler,
+					),
+				)
+				if caption is None:
+					await _telegram_call_with_retry(
+						"send encoded text",
+						lambda: bot.send_message(
+							chat_id=ENCODED_FORWARD_CHAT_ID,
+							message_thread_id=thread_id,
+							text=display_text,
+							reply_markup=display_keyboard,
+							parse_mode="HTML",
+						),
 					)
 
 			else:
-				album = await bot.send_media_group(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
-					message_thread_id=thread_id,
-					media=media
+
+				album = await _telegram_call_with_retry(
+					"send preview album",
+					lambda: bot.send_media_group(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						media=media,
+					),
+				)
+
+				await _telegram_call_with_retry(
+					"send encoded text",
+					lambda: bot.send_message(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						text=display_text,
+						reply_markup=display_keyboard,
+						parse_mode="HTML",
+						reply_to_message_id=album[-1].message_id,
+					),
 				)
 
 
-				await bot.send_message(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
-					message_thread_id=thread_id,
-					text=display_text,
-					reply_markup=display_keyboard,
-					parse_mode="HTML" if caption else None,
-					reply_to_message_id=album[-1].message_id
-				)
+
 
 				# if DEFAULT_COVER_FILE_ID is None:
 				# 	send_result = await bot.send_photo(
@@ -1179,69 +1234,98 @@ async def _forward_encoded_if_whitelisted(
 				# 		reply_to_message_id=album[-1].message_id
 				# 	)
 
-				if caption is None:
-					await bot.send_message(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
-						message_thread_id=thread_id,
-						text=display_text,
-						parse_mode="HTML",
-					)
-
+				# if caption is None:
+				# 	await bot.send_message(
+				# 		chat_id=ENCODED_FORWARD_CHAT_ID,
+				# 		message_thread_id=thread_id,
+				# 		text=display_text,
+				# 		parse_mode="HTML",
+				# 	)
+			return {"ok":True}
 		elif preview_show:
-			await bot.send_message(
-				chat_id=ENCODED_FORWARD_CHAT_ID,
-				message_thread_id=thread_id,
-				text=display_text,
-				reply_markup=display_keyboard,
-				parse_mode="HTML",
-			)
 
-		else:
-			# print(f"DEFAULT_COVER_FILE_ID = {DEFAULT_COVER_FILE_ID}")
-			if DEFAULT_COVER_FILE_ID is None:
-				send_result = await bot.send_photo(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
-					message_thread_id=thread_id,
-					photo=BufferedInputFile(
-						_get_seline_image_bytes(),
-						filename="seline.jpeg",
-					),
-					caption=caption,
-					reply_markup=display_keyboard,
-					parse_mode="HTML" if caption else None,
-				)
-				DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
-			else:
-				await bot.send_photo(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
-					message_thread_id=thread_id,
-					photo=DEFAULT_COVER_FILE_ID,
-					caption=caption,
-					reply_markup=display_keyboard,
-					parse_mode="HTML" if caption else None,
-				)
-
-
-			if caption is None:
-				await bot.send_message(
+			fallback_message = await _telegram_call_with_retry(
+				"send text fallback",
+				lambda: bot.send_message(
 					chat_id=ENCODED_FORWARD_CHAT_ID,
 					message_thread_id=thread_id,
 					text=display_text,
 					parse_mode="HTML",
+					reply_markup=display_keyboard,
+				),
+			)
+
+			return {
+				"ok": True,
+				"mode": "text_fallback",
+				"message_ids": [fallback_message.message_id],
+			}
+
+
+		else:
+			# print(f"DEFAULT_COVER_FILE_ID = {DEFAULT_COVER_FILE_ID}")
+			if DEFAULT_COVER_FILE_ID is None:
+				send_result = await _telegram_call_with_retry(
+					"send default cover",
+					lambda: bot.send_photo(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						photo=BufferedInputFile(
+							_get_seline_image_bytes(),
+							filename="seline.jpeg",
+						),
+						caption=caption,
+						reply_markup=display_keyboard if caption else None,
+						parse_mode="HTML" if caption else None,
+					),
 				)
-		return True
+				DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
+			else:
+				await _telegram_call_with_retry(
+					"send cached default cover",
+					lambda: bot.send_photo(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						photo=DEFAULT_COVER_FILE_ID,
+						caption=caption,
+						reply_markup=display_keyboard if caption else None,
+						parse_mode="HTML" if caption else None,
+					),
+				)
+
+
+			if caption is None:
+				await _telegram_call_with_retry(
+					"send encoded text",
+					lambda: bot.send_message(
+						chat_id=ENCODED_FORWARD_CHAT_ID,
+						message_thread_id=thread_id,
+						text=display_text,
+						reply_markup=display_keyboard,
+						parse_mode="HTML",
+					),
+				)
+		return {"ok":True}
+	except TelegramRetryAfter as exc:
+		print(f"[ENCODED_FORWARD] rate limit retries exhausted: {exc}", flush=True)
+		return {"ok": False, "reason": "rate_limited", "retry_after": exc.retry_after}
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] send failed: {exc}", flush=True)
 		try:
-			await bot.send_message(
-				chat_id=ENCODED_FORWARD_CHAT_ID,
-				message_thread_id=ENCODED_FORWARD_THREAD_ID if ENCODED_FORWARD_THREAD_ID > 0 else None,
-				text=display_text,
-				parse_mode="HTML",
+			await _telegram_call_with_retry(
+				"send encoded fallback text",
+				lambda: bot.send_message(
+					chat_id=ENCODED_FORWARD_CHAT_ID,
+					message_thread_id=ENCODED_FORWARD_THREAD_ID if ENCODED_FORWARD_THREAD_ID > 0 else None,
+					text=display_text,
+					reply_markup=display_keyboard,
+					parse_mode="HTML",
+				),
 			)
+			return {"ok":True}
 		except Exception as fallback_exc:
 			print(f"[ENCODED_FORWARD] text fallback failed: {fallback_exc}", flush=True)
-		return False
+		return {"ok":False}
 
 
 def minutes_to_day_hour(minutes: int):
@@ -1272,8 +1356,11 @@ async def _send_encoded_snapshot(
 	items: list[dict[str, Any]],
 	is_first_send: bool,
 ) -> None:
+	success = False
+	accepted_count = 0
 	try:
-		success = await _forward_encoded_if_whitelisted(owner_user_id, encoded, items)
+		forward_status = await _forward_encoded_if_whitelisted(owner_user_id, encoded, items)
+		success = bool(forward_status.get("ok", False))
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] background send failed: {exc}", flush=True)
 		success = False
@@ -1286,7 +1373,7 @@ async def _send_encoded_snapshot(
 		# 先记录成功版本，奖励或通知异常时也不会让按钮卡在“送出中”。
 		state["sent_revision"] = revision
 		try:
-			received_media_store.mark_accepted_many([
+			accepted_count = received_media_store.mark_accepted_many([
 				str(item.get("file_unique_id", ""))
 				for item in items
 			])
@@ -1302,7 +1389,14 @@ async def _send_encoded_snapshot(
 					else 0
 				)
 				base_timestamp = max(now_timestamp, previous_expire_timestamp)
-				requested_minutes = len(items) * MEDIA_UPLOAD_EXTEND_MINUTES
+				requested_minutes = 0
+
+				if accepted_count <= 0:
+					return  # 实际代码中应继续更新 UI，而非直接退出函数
+
+				if accepted_count > 0:
+					requested_minutes = accepted_count * MEDIA_UPLOAD_EXTEND_MINUTES
+				
 				user_expire = user_expire_cache.extend_minutes(
 					owner_user_id,
 					requested_minutes,
@@ -1735,9 +1829,12 @@ async def _ban_user(
 		return entry, str(exc)
 	
 	try:
-		await bot.ban_chat_member(
-			chat_id=ENCODED_FORWARD_CHAT_ID,
-			user_id=user_id,
+		await _telegram_call_with_retry(
+			"ban encoded-forward member",
+			lambda: bot.ban_chat_member(
+				chat_id=ENCODED_FORWARD_CHAT_ID,
+				user_id=user_id,
+			),
 		)
 	except Exception as exc:
 		print(
@@ -1833,10 +1930,13 @@ async def cmd_unban(message: Message, command: CommandObject) -> None:
 		return
 
 	try:
-		await bot.unban_chat_member(
-			chat_id=ENCODED_FORWARD_CHAT_ID,
-			user_id=target_user_id,
-			only_if_banned=True,
+		await _telegram_call_with_retry(
+			"unban encoded-forward member",
+			lambda: bot.unban_chat_member(
+				chat_id=ENCODED_FORWARD_CHAT_ID,
+				user_id=target_user_id,
+				only_if_banned=True,
+			),
 		)
 	except Exception as exc:
 		print(
@@ -2594,6 +2694,7 @@ async def on_takeoff_ban(callback: CallbackQuery) -> None:
 		*(getattr(callback.message, "entities", None) or []),
 		*(getattr(callback.message, "caption_entities", None) or []),
 	]
+
 	for entity in entities:
 		entity_type = getattr(entity.type, "value", entity.type)
 		entity_url = str(entity.url or "")
@@ -2636,6 +2737,7 @@ async def on_takeoff_ban(callback: CallbackQuery) -> None:
 		await callback.answer("机长已停飞此班机", show_alert=True)
 		return
 
+	print(f"消息中找不到有效的取件码链接=>{callback.message}")
 	await callback.answer("消息中找不到有效的取件码链接", show_alert=True)
 
 

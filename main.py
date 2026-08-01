@@ -695,7 +695,11 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 		InlineKeyboardButton(
 			text=send_text,
 			callback_data="enc:send:now",
-		)
+		),
+		InlineKeyboardButton(
+			text="❌ 取消",
+			callback_data="enc:cancel:now",
+		),
 	])
 	return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1404,6 +1408,32 @@ async def _handle_send_encoded(
 			state.pop("send_task", None)
 
 	task.add_done_callback(_clear_send_task)
+
+
+async def _handle_cancel_encoded(
+	callback: CallbackQuery,
+	state_key: tuple[int, int],
+	state: dict[str, Any],
+) -> None:
+	if str(state.get("send_status", "idle")) == "sending":
+		await callback.answer("正在送出，暂时无法取消", show_alert=True)
+		return
+
+	was_sent = int(state.get("sent_revision", 0)) > 0
+	if not was_sent:
+		received_media_store.release_pending_many([
+			str(item.get("file_unique_id", ""))
+			for item in state.get("items", [])
+		])
+
+	ENCODER_UI_STATE.pop(state_key, None)
+	text = "✅ 配置已关闭，已经送出的资源不受影响。" if was_sent else "✅ 已取消，本批媒体未送出。"
+	try:
+		await callback.message.edit_text(text, reply_markup=None)
+	except Exception as exc:
+		print(f"[ENCODED_CANCEL] panel update failed: {exc}", flush=True)
+		await callback.message.edit_reply_markup(reply_markup=None)
+	await callback.answer("配置已关闭" if was_sent else "已取消")
 
 
 def _upload_keyboard() -> InlineKeyboardMarkup:
@@ -2737,6 +2767,9 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 		_, group, value = str(callback.data).split(":", 2)
 		if group == "send":
 			await _handle_send_encoded(callback, state_key, state)
+			return
+		if group == "cancel":
+			await _handle_cancel_encoded(callback, state_key, state)
 			return
 		if group == "fw":
 			state["no_forward"] = value == "1"

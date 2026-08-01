@@ -118,6 +118,27 @@ class ReceivedMediaStore:
             ))
         return cursor.rowcount > 0
 
+    def release_pending_many(self, file_unique_ids: list[str]) -> int:
+        unique_ids = list(dict.fromkeys(
+            str(value).strip()
+            for value in file_unique_ids
+            if str(value).strip()
+        ))
+        if not unique_ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"""
+                    DELETE FROM received_media
+                    WHERE status = 'pending'
+                      AND file_unique_id IN ({placeholders})
+                """,
+                tuple(unique_ids),
+            )
+        return max(0, int(cursor.rowcount))
+
     def mark_accepted_many(self, file_unique_ids: list[str]) -> int:
         unique_ids = list(dict.fromkeys(
             str(value).strip()

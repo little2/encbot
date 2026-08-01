@@ -590,7 +590,21 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 	long_flash_seconds = int(state.get("video_flash_seconds", 60))
 	long_flash_label = f"{long_flash_seconds}秒" if bool(state.get("has_video", False)) else "60秒"
 
-	rows = [
+	owner_user_id = int(state.get("owner_user_id", 0))
+
+	now_timestamp = int(datetime.now().timestamp())
+	user_expire = user_expire_cache.get(int(owner_user_id))
+	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
+		rows = [
+			[
+				InlineKeyboardButton(
+					text="🕶️ 目前不显示上传者" if anonymous else "👤 目前显示上传者",
+					callback_data=f"enc:an:{0 if anonymous else 1}",
+				)
+			]
+		]
+	else:
+		rows = [
 			[
 				InlineKeyboardButton(
 					text="🚫 目前限制转发" if no_forward else "🆗 目前可以转发",
@@ -602,15 +616,15 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 					text="🙈 目前已启用防剧透模式" if state.get("if_spoiler", False) else "🐵 目前未启用防剧透模式",
 					callback_data=f"enc:sp:{0 if state.get('if_spoiler', False) else 1}",
 					)
-				],
-				[
-					InlineKeyboardButton(
-						text="🕶️ 目前不显示上传者" if anonymous else "👤 目前显示上传者",
-						callback_data=f"enc:an:{0 if anonymous else 1}",
-					)
-				],
+			],
+			[
+				InlineKeyboardButton(
+					text="🕶️ 目前不显示上传者" if anonymous else "👤 目前显示上传者",
+					callback_data=f"enc:an:{0 if anonymous else 1}",
+				)
+			],
 
-				[
+			[
 				InlineKeyboardButton(
 					text=_choice("不闪", flash_seconds == 0),
 					callback_data="enc:fl:0",
@@ -1389,7 +1403,7 @@ async def _notify_media_limit(message: Message, text: str) -> None:
 async def _update_upload_panel(message: Message, session: dict[str, Any]) -> None:
 	count = len(session["items"])
 	text = (
-		f"📥 已收到 {count} 个媒体 ( 不同系列请分开传，每批次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
+		f"📥 已收到 {count} 个媒体 ( 不同系列请一定要分开传，每批次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
 		"继续发送媒体，或点击“上传完成”进入编辑菜单。"
 	)
 	panel_message_id = session.get("panel_message_id")
@@ -1877,29 +1891,30 @@ async def _send_airport_join_request_invite(user_id: int) -> None:
 	invite = await bot.create_chat_invite_link(
 		chat_id=MESSAGE_REWARD_CHAT_ID,
 		name=f"airport-access-{user_id}",
-		expire_date=datetime.now(timezone.utc) + timedelta(minutes=3),
+		expire_date=datetime.now(timezone.utc) + timedelta(minutes=10),
 		creates_join_request=True,
 	)
 
 	invite2 = await bot.create_chat_invite_link(
 		chat_id=ENCODED_FORWARD_CHAT_ID,
 		name=f"airport-access-{user_id}",
-		expire_date=datetime.now(timezone.utc) + timedelta(minutes=3),
+		expire_date=datetime.now(timezone.utc) + timedelta(minutes=10),
 		creates_join_request=True,
 	)
 
 	await bot.send_message(
 		chat_id=user_id,
-		text="✅ 你的专属邀请链接已产生，请在 3 分钟内送出入场审核申请。(两个都要加)",
+		text="✅ 你的专属邀请链接已产生，请在 10 分钟内送出入场审核申请。(两个都要加)",
 		reply_markup=InlineKeyboardMarkup(
 			inline_keyboard=[[
+
+				InlineKeyboardButton(
+					text="✈️ 机场大厅 🔗",
+					url=invite.invite_link,
+				),
 				InlineKeyboardButton(
 					text="✈️ 飞机场 🔗",
 					url=invite2.invite_link,
-				),
-				InlineKeyboardButton(
-					text="✈️ 旅客大厅 🔗",
-					url=invite.invite_link,
 				)
 			]]
 		),
@@ -1963,7 +1978,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过二天。\n"
-			"请先上传 10 个媒体资源 (给塔台机器人)，再重新申请。"
+			"请先上传 10 个媒体资源 ( 给塔台机器人, 若不同系列请分批次上传 )，再重新申请。"
 		)
 
 		await callback.answer(
@@ -2123,8 +2138,8 @@ async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		rejection_reason = (
-			"飞行通行证有效时间需要超过二天。\n"
-			"请先上传 10 个媒体资源 (给塔台机器人)，再重新申请。"
+			"飞行通行证有效时间需要超过 2 天。\n"
+			"请先上传 10 个媒体资源 ( 给塔台机器人, 若不同系统请分批传 )，再重新申请。"
 		)
 	else:
 		rejection_reason = "尚未完成三道机场核心精神单选题，请从申请按钮重新开始考试。"
@@ -2486,7 +2501,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				text=(
 					f"飞行通行证期限需要超过 {required_until_text}。\n"
 					f"你还差 {minutes_to_day_hour(missing_minutes)[0]}，"
-					f"你可以选择发言 {word_qty} 句 ( 1 分钟只计 1 句 )，或再分享 {upload_qty} 个资源。"
+					f"你可以选择在大厅发言 {word_qty} 句 ( 1 分钟只计 1 句 )，或再分享到塔台 {upload_qty} 个资源。"
 				),
 				show_alert=True,
 				cache_time=0,

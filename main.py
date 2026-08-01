@@ -121,7 +121,7 @@ bot_name = ""
 USED_FLASH_NONCES: dict[tuple[str, int], datetime] = {}
 PERM_FLASH_NONCE_RETENTION_DAYS = 30
 AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
-AIRPORT_QUIZ_PASS_SECONDS = 10 * 60
+AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
 AIRPORT_QUIZ_QUESTIONS = (
 	(
 		"按照机场的“三个禁止”，下列哪一项完整正确？",
@@ -1964,36 +1964,67 @@ def _airport_quiz_keyboard(question_index: int) -> InlineKeyboardMarkup:
 
 
 async def _send_airport_join_request_invite(user_id: int) -> None:
-	if MESSAGE_REWARD_CHAT_ID == 0:
-		raise RuntimeError("机场大厅尚未配置")
+	if MESSAGE_REWARD_CHAT_ID == 0 or ENCODED_FORWARD_CHAT_ID == 0:
+		raise RuntimeError("航站大厅尚未配置")
+
+	status = await bot.get_chat_member(chat_id=MESSAGE_REWARD_CHAT_ID, user_id=user_id)
+	airport_invitation = ""
+	create_chat_id = 0
+	chat_title = ""
+
+	is_current_member = (
+		status.status in ("member", "administrator", "creator")
+		or (
+			status.status == "restricted"
+			and status.is_member is True
+		)
+	)
+
+	if is_current_member:
+		create_chat_id = ENCODED_FORWARD_CHAT_ID
+		chat_title = "🛫 镇泰飞机场 "
+
+		airport_invitation = (
+			"亲爱的旅客，欢迎抵达「镇泰飞机场」航站大厅。\n\n"
+			"进入航站楼后，请先向候机区的其他旅客发言问好。"
+			"大厅内的航班信息板将显示目前开放登机、可以起飞的航班。\n\n"
+			"移动端旅客可点击「镇泰飞机场」字样查看航班；"
+			"桌面端旅客可点击旁边的小箭头，选择您准备搭乘的航班并前往对应登机口。\n\n"
+			"办理登机前，请先加入「镇泰机场」频道，以完成登机资格验证，"
+			"确保您能够顺利登机起飞。\n\n"
+			"祝您候机愉快，航程顺利。"
+		)
+
+
+	else:
+		create_chat_id = MESSAGE_REWARD_CHAT_ID
+		airport_invitation = (
+			"亲爱的旅客，诚邀您进入「镇泰飞机场航站大厅」。\n\n"
+			"航站大厅是所有旅客起飞前必须加入的候机区域，"
+			"您可以在这里查看航班动态、办理登机手续，并与其他旅客交流。\n\n"
+			"在大厅内参与交流，还可延长飞行通行证有效期限。"
+		)
+		chat_title = "🏢 航站大厅 "
+
 
 	invite = await bot.create_chat_invite_link(
-		chat_id=MESSAGE_REWARD_CHAT_ID,
+		chat_id=create_chat_id,
 		name=f"airport-access-{user_id}",
-		expire_date=datetime.now(timezone.utc) + timedelta(minutes=10),
+		expire_date=datetime.now(timezone.utc) + timedelta(minutes=5),
 		creates_join_request=True,
 	)
 
-	invite2 = await bot.create_chat_invite_link(
-		chat_id=ENCODED_FORWARD_CHAT_ID,
-		name=f"airport-access-{user_id}",
-		expire_date=datetime.now(timezone.utc) + timedelta(minutes=10),
-		creates_join_request=True,
-	)
+
 
 	await bot.send_message(
 		chat_id=user_id,
-		text="✅ 你的专属邀请链接已产生，请在 10 分钟内送出入场审核申请。(两个都要加)",
+		text=f"✅ {airport_invitation}\n\n你的专属邀请链接已产生，请在 5 分钟内送出入场审核申请。",
 		reply_markup=InlineKeyboardMarkup(
 			inline_keyboard=[[
 
 				InlineKeyboardButton(
-					text="✈️ 机场大厅 🔗",
+					text=f"{chat_title}🔗",
 					url=invite.invite_link,
-				),
-				InlineKeyboardButton(
-					text="✈️ 飞机场 🔗",
-					url=invite2.invite_link,
 				)
 			]]
 		),
@@ -2012,9 +2043,9 @@ async def cmd_rule(message: Message) -> None:
 		"<i>飞行通行证期限是镇泰飞机场查看媒体的有效时间，通行证有效时间可以通过分享媒体、群组发言来延长；请求媒体会消耗通行证有效时间。</i>\n\n"
 		"1️⃣ 分享媒体奖励\n"
 		f"每成功分享一个媒体，增加 {upload_extend_text}。\n\n"
-		"2️⃣ 请求媒体消耗\n"
+		"2️⃣ 请求媒体消耗(飞机场)\n"
 		f"每请求一个媒体，消耗 {view_cost_text}。\n\n"
-		"3️⃣ 群组发言奖励\n"
+		"3️⃣ 群组(航站大厅)发言奖励\n"
 		f"符合条件的一次群组发言，增加 {message_extend_text}，一分钟只采计一次。\n\n"
 		"4️⃣ 通行证期限上限\n"
 		f"飞行通行证最多保留 {max_duration_text}，可重覆扩展效期；效期超过上限就不会继续累加，低于效期即可再扩展。\n",
@@ -2056,7 +2087,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
-			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过二天。\n"
+			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
 			"请先上传 10 个媒体资源 ( 给塔台机器人, 若不同系列请分批次上传 )，再重新申请。"
 		)
 
@@ -2195,6 +2226,7 @@ async def on_airport_quiz_answer(callback: CallbackQuery) -> None:
 @dp.chat_join_request(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
 async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 	user_id = int(join_request.from_user.id)
+	chat_id = int(join_request.chat.id)
 	now_timestamp = int(datetime.now().timestamp())
 	user_expire = user_expire_cache.get(user_id)
 	remaining_seconds = max(
@@ -2203,17 +2235,7 @@ async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 	)
 
 	quiz_passed = AIRPORT_QUIZ_PASSED_UNTIL.get(user_id, 0) > now_timestamp
-	if remaining_seconds > 2 * 24 * 60 * 60 and quiz_passed:
-		try:
-			await bot.approve_chat_join_request(
-				chat_id=join_request.chat.id,
-				user_id=user_id,
-			)
-		except Exception as exc:
-			print(f"[AIRPORT_ACCESS] join approval failed: {exc}", flush=True)
-		else:
-			AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
-		return
+
 
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		rejection_reason = (
@@ -2221,7 +2243,108 @@ async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 			"请先上传 10 个媒体资源 ( 给塔台机器人, 若不同系统请分批传 )，再重新申请。"
 		)
 	else:
-		rejection_reason = "尚未完成三道机场核心精神单选题，请从申请按钮重新开始考试。"
+		if quiz_passed:
+			if chat_id ==ENCODED_FORWARD_CHAT_ID:
+				'''先判断是否在航站大厅群'''
+				is_current_member = False
+				try:
+					status = await bot.get_chat_member(chat_id=MESSAGE_REWARD_CHAT_ID, user_id=user_id)
+
+					is_current_member = (
+						status.status in ("member", "administrator", "creator")
+						or (
+							status.status == "restricted"
+							and status.is_member is True
+						)
+					)
+
+				except Exception as exc:
+					await bot.send_message(
+						chat_id=user_id,
+						text=f"Telegram 发生异常，请稍候再申请",
+					)
+					print(f"[AIRPORT_ACCESS] get_chat_member failed: {exc}", flush=True)
+					return
+
+
+				if is_current_member:
+					welcome_notice = (
+						"亲爱的旅客，欢迎加入「镇泰飞机场」。\n\n"
+						"接下来，您可以通过以下设施开启旅程：\n\n"
+						"🗼 使用「镇泰塔台」机器人提交与分享资源；\n"
+						"🏢 前往「航站大厅」与其他旅客交流发言；\n"
+						"🛫 进入「镇泰飞机场」频道搭乘航班，"
+						"选择您想要搭乘并起飞的班机。\n\n"
+						"各项设施已准备就绪，祝您航程愉快。"
+					)
+
+					try:
+						await bot.approve_chat_join_request(
+							chat_id=join_request.chat.id,
+							user_id=user_id,
+						)
+
+						await bot.send_message(
+							chat_id=user_id,
+							text=f"✅ {welcome_notice}",
+						)
+					except Exception as exc:
+						print(f"[AIRPORT_ACCESS] join approval failed: {exc}", flush=True)
+					else:
+						AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
+					return
+				else:
+					rejection_reason = "请先加入航站大厅群组，再申请加入飞机场群组。"
+
+			elif chat_id ==MESSAGE_REWARD_CHAT_ID:
+				try:
+					await bot.approve_chat_join_request(
+						chat_id=join_request.chat.id,
+						user_id=user_id,
+					)
+
+					await _send_airport_join_request_invite(user_id)
+
+					# invite2 = await bot.create_chat_invite_link(
+					# 	chat_id=ENCODED_FORWARD_CHAT_ID,
+					# 	name=f"airport-access-{user_id}",
+					# 	expire_date=datetime.now(timezone.utc) + timedelta(minutes=5),
+					# 	creates_join_request=True,
+					# )
+
+					# airport_notice = (
+					# 	"亲爱的旅客，欢迎抵达「镇泰飞机场」航站大厅。\n\n"
+					# 	"进入航站楼后，请先向候机区的其他旅客发言问好。"
+					# 	"大厅内的航班信息板将显示目前开放登机、可以起飞的航班。\n\n"
+					# 	"移动端旅客可点击「镇泰飞机场」字样查看航班；"
+					# 	"桌面端旅客可点击旁边的小箭头，选择您准备搭乘的航班并前往对应登机口。\n\n"
+					# 	"办理登机前，请先加入「镇泰机场」频道，以完成登机资格验证，"
+					# 	"确保您能够顺利登机起飞。\n\n"
+					# 	"祝您候机愉快，航程顺利。"
+					# )
+
+					# await bot.send_message(
+					# 	chat_id=user_id,
+					# 	text=f"✅ {airport_notice}",
+					# 	reply_markup=InlineKeyboardMarkup(
+					# 		inline_keyboard=[[
+					# 			InlineKeyboardButton(
+					# 				text="✈️ 飞机场 🔗",
+					# 				url=invite2.invite_link,
+					# 			)
+					# 		]]
+					# 	),
+					# )
+
+				except Exception as exc:
+					print(f"[AIRPORT_ACCESS] join approval failed: {exc}", flush=True)
+				
+				return
+
+		
+			
+		else:
+			rejection_reason = "尚未完成三道机场核心精神单选题，请从申请按钮重新开始考试。"
 
 	try:
 		await bot.send_message(

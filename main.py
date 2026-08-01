@@ -23,7 +23,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageOps
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import User, BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, ChatJoinRequest, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -1140,8 +1140,9 @@ async def _forward_encoded_if_whitelisted(
 		caption = display_text if len(display_text) <= 1024 else None
 
 	except Exception as exc:
-		return {"ok":False}
 		print(f"{exec}")
+		return {"ok":False}
+		
 
 		
 	try:
@@ -1309,8 +1310,22 @@ async def _forward_encoded_if_whitelisted(
 	except TelegramRetryAfter as exc:
 		print(f"[ENCODED_FORWARD] rate limit retries exhausted: {exc}", flush=True)
 		return {"ok": False, "reason": "rate_limited", "retry_after": exc.retry_after}
+	except TelegramBadRequest as exc:
+		if "CHAT_RESTRICTED" in str(exc):
+			print(
+				"[ENCODED_FORWARD] target chat forbids media",
+				flush=True,
+			)
+			return {
+				"ok": False,
+				"reason": "chat_restricted",
+				"failed_stage": "media",
+			}
+		raise
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] send failed: {exc}", flush=True)
+
+
 		try:
 			await _telegram_call_with_retry(
 				"send encoded fallback text",
@@ -1446,6 +1461,8 @@ async def _send_encoded_snapshot(
 		)
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] status keyboard update failed: {exc}", flush=True)
+
+	
 
 
 async def _handle_send_encoded(
@@ -2775,6 +2792,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 
 	parse_text = _extract_takeoff_code(callback.message)
 	if not parse_text:
+		
 		await callback.answer("消息中找不到有效的取件码链接", show_alert=True)
 		return
 

@@ -1767,10 +1767,7 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 			await message.reply("用法：/bonus [用户id]")
 			return
 
-	target_user_id = int(args)
-	if target_user_id <= 0:
-		await message.reply("❌ 用户id 无效")
-		return
+
 
 	bonus_minutes = MAX_VALID_DURATION_MINUTES
 	now_timestamp = int(datetime.now().timestamp())

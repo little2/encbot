@@ -2080,7 +2080,7 @@ def _airport_quiz_keyboard(question_index: int) -> InlineKeyboardMarkup:
 	)
 
 
-async def _send_airport_join_request_invite(user_id: int) -> None:
+async def _send_airport_join_request_invite(user_id: int, request_plant_channel: int = 0) -> None:
 	if MESSAGE_REWARD_CHAT_ID == 0 or ENCODED_FORWARD_CHAT_ID == 0:
 		raise RuntimeError("航站大厅尚未配置")
 
@@ -2088,16 +2088,18 @@ async def _send_airport_join_request_invite(user_id: int) -> None:
 	airport_invitation = ""
 	create_chat_id = 0
 	chat_title = ""
+	is_current_member = False
 
-	is_current_member = (
-		status.status in ("member", "administrator", "creator")
-		or (
-			status.status == "restricted"
-			and status.is_member is True
+	if request_plant_channel <= 0:
+		is_current_member = (
+			status.status in ("member", "administrator", "creator")
+			or (
+				status.status == "restricted"
+				and status.is_member is True
+			)
 		)
-	)
 
-	if is_current_member:
+	if request_plant_channel ==1 or is_current_member:
 		create_chat_id = ENCODED_FORWARD_CHAT_ID
 		chat_title = "🛫 镇泰飞机场 "
 
@@ -2420,7 +2422,7 @@ async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 						user_id=user_id,
 					)
 
-					await _send_airport_join_request_invite(user_id)
+					await _send_airport_join_request_invite(user_id, request_plant_channel=1)
 
 					# invite2 = await bot.create_chat_invite_link(
 					# 	chat_id=ENCODED_FORWARD_CHAT_ID,

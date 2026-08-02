@@ -1750,24 +1750,29 @@ async def cmd_me(message: Message) -> None:
 
 @dp.message(F.chat.type == "private", Command("bonus"))
 async def cmd_bonus(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
 	if not message.from_user:
 		return
 
-	# if int(message.from_user.id) != MEDIA_FORWARD_USER_ID:
-	# 	await message.reply("❌ 你没有权限使用此指令")
-	# 	return
-
 	args = str(command.args or "").strip()
-	if not args or not args.lstrip("-").isdigit():
-		await message.reply("用法：/bonus [用户id]")
-		return
+
+	if not args:
+		target_user_id = int(message.from_user.id)
+	else:
+		target_user_id = _parse_positive_user_id(args)
+		if target_user_id is None:
+			await message.reply("用法：/bonus [用户id]")
+			return
 
 	target_user_id = int(args)
 	if target_user_id <= 0:
 		await message.reply("❌ 用户id 无效")
 		return
 
-	bonus_minutes = 10 * 24 * 60
+	bonus_minutes = MAX_VALID_DURATION_MINUTES
 	now_timestamp = int(datetime.now().timestamp())
 	previous_user_expire = user_expire_cache.get(target_user_id)
 	previous_expire_timestamp = (

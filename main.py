@@ -1406,8 +1406,8 @@ async def _send_encoded_snapshot(
 				base_timestamp = max(now_timestamp, previous_expire_timestamp)
 				requested_minutes = 0
 
-				if accepted_count <= 0:
-					return  # 实际代码中应继续更新 UI，而非直接退出函数
+				# if accepted_count <= 0:
+				# 	return  # 实际代码中应继续更新 UI，而非直接退出函数
 
 				if accepted_count > 0:
 					requested_minutes = accepted_count * MEDIA_UPLOAD_EXTEND_MINUTES
@@ -3010,8 +3010,30 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 		await callback.answer("只能由原发送者操作", show_alert=True)
 		return
 
+
+
+
 	try:
 		_, group, value = str(callback.data).split(":", 2)
+
+		if (
+			str(state.get("send_status", "idle")) == "sending"
+			and group != "cancel"
+		):
+			await callback.answer(
+				"资源正在送出，暂时不能修改设定",
+				show_alert=True,
+			)
+			return
+
+
+		if int(state.get("sent_revision", 0)) > 0 and group != "cancel":
+			await callback.answer(
+				"此批资源已经送出，设定已锁定，不能修改或再次送出",
+				show_alert=True,
+			)
+			return
+
 		if group == "send":
 			await _handle_send_encoded(callback, state_key, state)
 			return

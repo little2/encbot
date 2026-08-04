@@ -2849,7 +2849,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			not user_expire
 			or now_timestamp - user_expire.group_message_timestamp > 24 * 60 * 60
 		):
-			await callback.answer("只有资源没有各位旅客的发言，会被电报官方封禁，所以请先在「航站大厅」群里发言，可以对你起飞的资源做点评", show_alert=True)
+			await callback.answer("📢 航站广播：为确保航站持续开放，避免因缺少互动而触发电报官方限制，请各位旅客先前往「航站大厅」参与发言交流。您也可以在大厅内分享对已搭乘班机资源的体验与点评，让航站保持良好运行。", show_alert=True)
 			return
 
 		available_minutes = max(

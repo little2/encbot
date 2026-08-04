@@ -10,6 +10,7 @@ from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_COST_MINUTES, MESSAGE
 class UserExpire:
     expire_timestamp: int
     update_timestamp: int
+    group_message_timestamp: int = 0
 
 
 class UserExpireCache:
@@ -26,23 +27,43 @@ class UserExpireCache:
             CREATE TABLE IF NOT EXISTS user_expire (
                 user_id INTEGER PRIMARY KEY,
                 expire_timestamp INTEGER NOT NULL,
-                update_timestamp INTEGER NOT NULL
+                update_timestamp INTEGER NOT NULL,
+                group_message_timestamp INTEGER NOT NULL DEFAULT 0
             )
         """)
+        columns = {
+            str(row[1])
+            for row in self.connection.execute("PRAGMA table_info(user_expire)")
+        }
+        if "group_message_timestamp" not in columns:
+            self.connection.execute("""
+                ALTER TABLE user_expire
+                ADD COLUMN group_message_timestamp INTEGER NOT NULL DEFAULT 0
+            """)
         self.connection.commit()
         self._load()
 
     def _load(self) -> None:
         rows = self.connection.execute("""
-            SELECT user_id, expire_timestamp, update_timestamp
+            SELECT
+                user_id,
+                expire_timestamp,
+                update_timestamp,
+                group_message_timestamp
             FROM user_expire
         """).fetchall()
         self.users = {
             int(user_id): UserExpire(
                 expire_timestamp=int(expire_timestamp),
                 update_timestamp=int(update_timestamp),
+                group_message_timestamp=int(group_message_timestamp),
             )
-            for user_id, expire_timestamp, update_timestamp in rows
+            for (
+                user_id,
+                expire_timestamp,
+                update_timestamp,
+                group_message_timestamp,
+            ) in rows
         }
 
     def _save(self, user_id: int) -> None:
@@ -52,26 +73,38 @@ class UserExpireCache:
                 INSERT INTO user_expire (
                     user_id,
                     expire_timestamp,
-                    update_timestamp
+                    update_timestamp,
+                    group_message_timestamp
                 )
-                VALUES (?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     expire_timestamp = excluded.expire_timestamp,
-                    update_timestamp = excluded.update_timestamp
+                    update_timestamp = excluded.update_timestamp,
+                    group_message_timestamp = excluded.group_message_timestamp
             """, (
                 user_id,
                 user.expire_timestamp,
                 user.update_timestamp,
+                user.group_message_timestamp,
             ))
 
     def get(self, user_id: int) -> UserExpire | None:
         return self.users.get(user_id)
 
-    def update(self, user_id: int, expire_timestamp: int) -> UserExpire:
+    def update(
+        self,
+        user_id: int,
+        expire_timestamp: int,
+        group_message_timestamp: int | None = None,
+    ) -> UserExpire:
         now = int(time.time())
         user = self.users.get(user_id)
         previous_values = (
-            (user.expire_timestamp, user.update_timestamp)
+            (
+                user.expire_timestamp,
+                user.update_timestamp,
+                user.group_message_timestamp,
+            )
             if user
             else None
         )
@@ -79,10 +112,17 @@ class UserExpireCache:
         if user:
             user.expire_timestamp = expire_timestamp
             user.update_timestamp = now
+            if group_message_timestamp is not None:
+                user.group_message_timestamp = group_message_timestamp
         else:
             user = UserExpire(
                 expire_timestamp=expire_timestamp,
                 update_timestamp=now,
+                group_message_timestamp=(
+                    group_message_timestamp
+                    if group_message_timestamp is not None
+                    else 0
+                ),
             )
             self.users[user_id] = user
 
@@ -92,7 +132,11 @@ class UserExpireCache:
             if previous_values is None:
                 self.users.pop(user_id, None)
             else:
-                user.expire_timestamp, user.update_timestamp = previous_values
+                (
+                    user.expire_timestamp,
+                    user.update_timestamp,
+                    user.group_message_timestamp,
+                ) = previous_values
             raise
 
         return user
@@ -117,7 +161,12 @@ class UserExpireCache:
         return len(self.users)
 
 
-    def extend_minutes(self, user_id: int, minutes: int) -> UserExpire:
+    def extend_minutes(
+        self,
+        user_id: int,
+        minutes: int,
+        group_message_timestamp: int | None = None,
+    ) -> UserExpire:
         now = int(time.time())
         user = self.users.get(user_id)
 
@@ -132,7 +181,11 @@ class UserExpireCache:
             min(wanted_expire_timestamp, max_expire_timestamp),
         )
 
-        self.update(user_id, expire_timestamp)
+        self.update(
+            user_id,
+            expire_timestamp,
+            group_message_timestamp=group_message_timestamp,
+        )
         return self.users[user_id]
 
     def consume_minutes(self, user_id: int, minutes: int) -> UserExpire | None:

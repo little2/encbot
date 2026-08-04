@@ -1779,7 +1779,11 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 	)
 	base_timestamp = max(now_timestamp, previous_expire_timestamp)
 
-	user_expire = user_expire_cache.extend_minutes(target_user_id, bonus_minutes)
+	user_expire = user_expire_cache.extend_minutes(
+		target_user_id,
+		bonus_minutes,
+		group_message_timestamp=now_timestamp,
+	)
 	actual_added_minutes = max(
 		0,
 		(user_expire.expire_timestamp - base_timestamp) // 60,
@@ -2502,16 +2506,20 @@ async def on_reward_group_message(message: Message) -> None:
 	previous_user_expire = user_expire_cache.get(user_id)
 	if (
 		previous_user_expire
-		and now_timestamp - previous_user_expire.update_timestamp < 60
+		and now_timestamp - previous_user_expire.group_message_timestamp < 60
 	):
-		# print(f"[MESSAGE_REWARD] user {user_id} message too frequent, skip reward -{now_timestamp - previous_user_expire.update_timestamp}", flush=True)
+		# print(f"[MESSAGE_REWARD] user {user_id} message too frequent, skip reward -{now_timestamp - previous_user_expire.group_message_timestamp}", flush=True)
 		return
 
 	base_timestamp = max(
 		now_timestamp,
 		previous_user_expire.expire_timestamp if previous_user_expire else 0,
 	)
-	user_expire = user_expire_cache.extend_minutes(user_id, MESSAGE_EXTEND_MINUTES)
+	user_expire = user_expire_cache.extend_minutes(
+		user_id,
+		MESSAGE_EXTEND_MINUTES,
+		group_message_timestamp=now_timestamp,
+	)
 	actual_added_minutes = max(
 		0,
 		(user_expire.expire_timestamp - base_timestamp) // 60,
@@ -2837,6 +2845,13 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 	async with user_lock:
 		now_timestamp = int(datetime.now().timestamp())
 		user_expire = user_expire_cache.get(reader_user_id)
+		if (
+			not user_expire
+			or now_timestamp - user_expire.group_message_timestamp > 24 * 60 * 60
+		):
+			await callback.answer("只有资源没有各位旅客的发言，会被电报官方封禁，所以请先在「航站大厅」群里发言，可以对你起飞的资源做点评", show_alert=True)
+			return
+
 		available_minutes = max(
 			0,
 			((user_expire.expire_timestamp if user_expire else 0) - now_timestamp) // 60,

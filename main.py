@@ -842,6 +842,7 @@ def _build_input_media(item: dict[str, Any], if_spoiler: bool = False):
 def _is_invalid_media_reference_error(exc: TelegramBadRequest) -> bool:
     error_text = str(getattr(exc, "message", exc)).casefold()
     return any(marker in error_text for marker in (
+        "media_file_invalid",
         "wrong file identifier",
         "wrong file_id",
         "file is temporarily unavailable",

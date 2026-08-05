@@ -838,21 +838,57 @@ def _build_input_media(item: dict[str, Any], if_spoiler: bool = False):
 
     raise ValueError(f"Unsupported album type: {file_type}")
 
+
+def _is_invalid_media_reference_error(exc: TelegramBadRequest) -> bool:
+    error_text = str(getattr(exc, "message", exc)).casefold()
+    return any(marker in error_text for marker in (
+        "wrong file identifier",
+        "wrong file_id",
+        "file is temporarily unavailable",
+    ))
+
+
 async def _send_all_media(
     message: Message,
     data: dict[str, Any],
     receiver_id: int = None,
-) -> list[Message]:
-    items = data.get("items") or [{
+) -> tuple[list[Message], list[dict[str, Any]]]:
+    source_items = data.get("items") or [{
         "file_id": data["file_id"],
         "file_type": data["file_type"],
     }]
+    items = [
+        {**item, "_item_index": index}
+        for index, item in enumerate(source_items, start=1)
+    ]
 
     no_forward = bool(data.get("no_forward", False))
     if_spoiler = bool(data.get("if_spoiler", False))
     sent_messages: list[Message] = []
+    skipped_items: list[dict[str, Any]] = []
     pending_group: list[dict[str, Any]] = []
     pending_kind: str | None = None
+
+    async def send_item(item: dict[str, Any]) -> None:
+        item_data = dict(data)
+        item_data.update(item)
+        try:
+            sent = await _send_media_by_type(
+                message,
+                item_data,
+                receiver_id=receiver_id,
+            )
+        except TelegramBadRequest as exc:
+            if not _is_invalid_media_reference_error(exc):
+                raise
+            skipped_items.append(item)
+            print(
+                f"[MEDIA_SEND] skipped invalid file_id at item "
+                f"#{item.get('_item_index', '?')}: {exc.message}",
+                flush=True,
+            )
+            return
+        sent_messages.append(sent)
 
     async def flush_group() -> None:
         nonlocal pending_group, pending_kind
@@ -867,23 +903,27 @@ async def _send_all_media(
                 for item in pending_group
             ]
 
-            async with ENCODED_FORWARD_SEND_LOCK:
-                result = await bot.send_media_group(
-                    chat_id=receiver_id or message.from_user.id,
-                    media=media,
-                    protect_content=no_forward,
+            try:
+                async with ENCODED_FORWARD_SEND_LOCK:
+                    result = await bot.send_media_group(
+                        chat_id=receiver_id or message.from_user.id,
+                        media=media,
+                        protect_content=no_forward,
+                    )
+            except TelegramBadRequest as exc:
+                if not _is_invalid_media_reference_error(exc):
+                    raise
+                print(
+                    "[MEDIA_SEND] album contains an invalid file_id; "
+                    "retrying items individually",
+                    flush=True,
                 )
+                for item in pending_group:
+                    await send_item(item)
+            else:
                 sent_messages.extend(result)
         else:
-            item_data = dict(data)
-            item_data.update(pending_group[0])
-
-            sent = await _send_media_by_type(
-                message,
-                item_data,
-                receiver_id=receiver_id,
-            )
-            sent_messages.append(sent)
+            await send_item(pending_group[0])
 
         pending_group = []
         pending_kind = None
@@ -894,16 +934,7 @@ async def _send_all_media(
         # 不支持相簿的类型
         if kind is None:
             await flush_group()
-
-            item_data = dict(data)
-            item_data.update(item)
-
-            sent = await _send_media_by_type(
-                message,
-                item_data,
-                receiver_id=receiver_id,
-            )
-            sent_messages.append(sent)
+            await send_item(item)
             continue
 
         # 类型不兼容或者已经达到 10 个
@@ -917,7 +948,7 @@ async def _send_all_media(
         pending_group.append(item)
 
     await flush_group()
-    return sent_messages
+    return sent_messages, skipped_items
 
 async def _send_all_media_old(message: Message, data: dict[str, Any]) -> list[Message]:
 	sent_messages: list[Message] = []
@@ -2901,7 +2932,16 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 
 
 
-			requested_human_time = minutes_to_day_hour(requested_minutes)[0]
+			skipped_qty = int(send_result.get("skipped_count", 0) or 0)
+			delivered_qty = max(0, requested_qty - skipped_qty)
+			delivered_minutes = delivered_qty * MEDIA_VIEW_COST_MINUTES
+			if skipped_qty:
+				user_expire_cache.extend_minutes(
+					reader_user_id,
+					skipped_qty * MEDIA_VIEW_COST_MINUTES,
+				)
+
+			requested_human_time = minutes_to_day_hour(delivered_minutes)[0]
 
 
 			new_user_expire = user_expire_cache.get(reader_user_id)
@@ -2916,10 +2956,15 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			remaining_text, remaining_view_count = minutes_to_day_hour(remaining_minutes)
 
 			notify_text = (
-				f"✅ 获取 {requested_qty} 个资源成功，本次消耗 {requested_human_time} 的有效时间。\n"
+				f"✅ 获取 {delivered_qty} 个资源成功，本次消耗 {requested_human_time} 的有效时间。\n"
 				f"🎫 当前飞行通行证到期时间为：{expire_text}。（ 相当于 {remaining_view_count} 个资源 ） \n\n"
 				f"🎈 每获取一个媒体需要消耗  {MEDIA_VIEW_COST_MINUTES} 分钟的飞行通行证有效期。"
 			)
+			if skipped_qty:
+				notify_text += (
+					f"\n⚠️ 已跳过 {skipped_qty} 个失效或暂时不可用的资源，"
+					"未扣除对应时间。"
+				)
 
 			if is_admin:
 				uploader_id = int(parsed.get("user_id", 0) or 0)
@@ -3145,7 +3190,13 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 
 	print(f"extract_encode: token={token}, data={data}, receiver_id={receiver_id}, flash_seconds={flash_seconds}, marked_flash_key={marked_flash_key}", flush=True)
 	try:
-		sent_media_messages = await _send_all_media(message, data, receiver_id=receiver_id)
+		sent_media_messages, skipped_items = await _send_all_media(
+			message,
+			data,
+			receiver_id=receiver_id,
+		)
+		if not sent_media_messages and skipped_items:
+			raise ValueError("所有媒体的 file_id 均无效或暂时不可用")
 	except Exception:
 		if marked_flash_key:
 			USED_FLASH_NONCES.pop(marked_flash_key, None)
@@ -3158,6 +3209,8 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	return {
 		"ok": True,
 		"sent_media_messages": sent_media_messages,
+		"skipped_items": skipped_items,
+		"skipped_count": len(skipped_items),
 		"marked_flash_key": marked_flash_key,
 	}
 

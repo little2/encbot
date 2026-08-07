@@ -3590,6 +3590,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 					"诉说需要发言\n"
 				),
 				parse_mode="HTML",
+				show_alert=True,
 			)
 
 			return

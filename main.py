@@ -11,10 +11,15 @@
 
 
 from __future__ import annotations
+import base64
+import hashlib
+import hmac
 import re
 import asyncio
 import os
+import secrets
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -26,7 +31,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
-from aiogram.types import User, BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, ChatJoinRequest, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import User, BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, ChatJoinRequest, ChatMemberUpdated, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.types import (
     InputMediaAudio,
     InputMediaDocument,
@@ -109,6 +114,10 @@ AIRPORT_QUIZ_PROGRESS: dict[int, int] = {}
 AIRPORT_QUIZ_RETRY_AT: dict[int, int] = {}
 AIRPORT_QUIZ_PASSED_UNTIL: dict[int, int] = {}
 AIRPORT_QUIZ_LOCKS: dict[int, asyncio.Lock] = {}
+PAID_INVITE_LOCKS: dict[str, asyncio.Lock] = {}
+USED_PAID_INVITES: dict[str, int] = {}
+USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
+PENDING_AIRPORT_JOIN_INVITES: dict[int, tuple[str, int]] = {}
 MEDIA_QUEUE: asyncio.Queue[Message] = asyncio.Queue(maxsize=100)
 MEDIA_FORWARD_QUEUE: asyncio.Queue[tuple[int, int]] = asyncio.Queue(maxsize=200)
 MEDIA_WORKER_COUNT = 3
@@ -125,6 +134,13 @@ USED_FLASH_NONCES: dict[tuple[str, int], datetime] = {}
 PERM_FLASH_NONCE_RETENTION_DAYS = 30
 AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
 AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
+PAID_INVITE_COST_MINUTES = 24 * 60
+PAID_INVITE_REWARD_MINUTES = 2 * 24 * 60
+PAID_INVITE_LIFETIME_HOURS = 24
+PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
+PAID_INVITE_NAME_PATTERN = re.compile(
+	r"^PI1\.([0-9a-z]{1,13})\.([0-9a-z]{5})\.([A-Za-z0-9_-]{8})$"
+)
 AIRPORT_QUIZ_QUESTIONS = (
 	(
 		"关于机场内资源的使用与讨论，以下哪种做法符合“三个禁止”？",
@@ -184,6 +200,7 @@ AIRPORT_QUIZ_QUESTIONS = (
 	),
 )
 
+JOIN_MODE = "invite"  # 可选值: "invite" 或 "request"
 
 
 ENCODED_FORWARD_SEND_LOCK = asyncio.Lock()
@@ -2079,6 +2096,288 @@ async def cmd_banlist(message: Message, command: CommandObject) -> None:
 	await message.reply("\n".join(lines))
 
 
+def _base36_encode(value: int) -> str:
+	digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+	value = int(value)
+	if value < 0:
+		raise ValueError("Base36 value cannot be negative")
+	if value == 0:
+		return "0"
+	encoded = ""
+	while value:
+		value, remainder = divmod(value, 36)
+		encoded = digits[remainder] + encoded
+	return encoded
+
+
+def _paid_invite_signature(payload: str) -> str:
+	secret = str(os.getenv("INVITE_SIGNING_SECRET", "") or BOT_TOKEN or "")
+	digest = hmac.new(
+		secret.encode("utf-8"),
+		payload.encode("ascii"),
+		hashlib.sha256,
+	).digest()
+	return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")[:8]
+
+
+def _build_paid_invite_name(inviter_user_id: int) -> str:
+	encoded_user_id = _base36_encode(inviter_user_id)
+	if len(encoded_user_id) > 13:
+		raise ValueError("Telegram user ID is too large for paid invite name")
+	nonce = _base36_encode(secrets.randbelow(36 ** 5)).zfill(5)
+	payload = f"PI1.{encoded_user_id}.{nonce}"
+	name = f"{payload}.{_paid_invite_signature(payload)}"
+	if len(name) > 32:
+		raise ValueError("Paid invite name exceeds Telegram's 32-character limit")
+	return name
+
+
+def _parse_paid_invite_name(name: str | None) -> int | None:
+	match = PAID_INVITE_NAME_PATTERN.fullmatch(str(name or ""))
+	if not match:
+		return None
+	encoded_user_id, nonce, supplied_signature = match.groups()
+	payload = f"PI1.{encoded_user_id}.{nonce}"
+	expected_signature = _paid_invite_signature(payload)
+	if not hmac.compare_digest(supplied_signature, expected_signature):
+		return None
+	try:
+		user_id = int(encoded_user_id, 36)
+	except ValueError:
+		return None
+	return user_id if user_id > 0 else None
+
+
+def _prune_used_paid_invites(now_timestamp: int | None = None) -> None:
+	now_timestamp = now_timestamp or int(datetime.now().timestamp())
+	cutoff = now_timestamp - PAID_INVITE_USED_RETENTION_SECONDS
+	for invite_link, used_at in list(USED_PAID_INVITES.items()):
+		if used_at < cutoff:
+			USED_PAID_INVITES.pop(invite_link, None)
+			lock = PAID_INVITE_LOCKS.get(invite_link)
+			if lock is not None and not lock.locked():
+				PAID_INVITE_LOCKS.pop(invite_link, None)
+	for confirmation_key, used_at in list(USED_INVITE_CONFIRMATIONS.items()):
+		if used_at < cutoff:
+			USED_INVITE_CONFIRMATIONS.pop(confirmation_key, None)
+	for user_id, (_, expire_timestamp) in list(PENDING_AIRPORT_JOIN_INVITES.items()):
+		if expire_timestamp > 0 and expire_timestamp <= now_timestamp:
+			PENDING_AIRPORT_JOIN_INVITES.pop(user_id, None)
+
+
+def _is_current_chat_member(status: Any) -> bool:
+	return (
+		status.status in ("member", "administrator", "creator")
+		or (status.status == "restricted" and status.is_member is True)
+	)
+
+
+async def _is_airport_member(user_id: int) -> bool:
+	for chat_id in (MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID):
+		if chat_id == 0:
+			continue
+		try:
+			status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+		except Exception as exc:
+			print(
+				f"[PAID_INVITE] member lookup failed for user {user_id} "
+				f"in chat {chat_id}: {exc}",
+				flush=True,
+			)
+			continue
+		if _is_current_chat_member(status):
+			return True
+	return False
+
+
+def _paid_invite_confirmation_keyboard() -> InlineKeyboardMarkup:
+	return InlineKeyboardMarkup(
+		inline_keyboard=[[
+			InlineKeyboardButton(
+				text="✅ 确认扣除 1 天并建立",
+				callback_data="paid_invite:confirm",
+			),
+			InlineKeyboardButton(
+				text="取消",
+				callback_data="paid_invite:cancel",
+			),
+		]],
+	)
+
+
+@dp.message(F.chat.type == "private", Command("invite"))
+async def cmd_invite(message: Message) -> None:
+	if not message.from_user:
+		return
+	user_id = int(message.from_user.id)
+	if blacklist_store.is_blocked(user_id):
+		# await message.reply("❌ 你目前无法建立邀请连结。")
+		return
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		await message.reply("❌ 航站大厅尚未配置，请联系塔台。")
+		return
+	if not await _is_airport_member(user_id):
+		await message.reply("❌ 只有航站大厅或机场的现有成员可以建立邀请。")
+		return
+	user_expire = user_expire_cache.get(user_id)
+	now_timestamp = int(datetime.now().timestamp())
+	if (
+		not user_expire
+		or user_expire.expire_timestamp - now_timestamp
+		< PAID_INVITE_COST_MINUTES * 60
+	):
+		await message.reply(
+			"❌ 飞行通行证余额不足。\n\n"
+			f"你目前的飞行通行证剩余时间为：{_format_duration(0 if not user_expire else max(0, user_expire.expire_timestamp - now_timestamp))}\n"
+			"建立邀请需要消耗完整的 1 天有效期。您可以透过在指定「机场大厅」群组发言或分享资源给塔台机器人来增加有效时间。"
+		)
+		return
+	await message.reply(
+		"🎟️ 建立单人邀请\n\n"
+		"建立邀请将消耗 1 天飞行通行证。\n\n"
+		"🔹 邀请连结有效 24 小时，仅限一位符合资格的申请者通过。\n"
+		"🔹 申请者仍须拥有超过 2 天的通行证 (透过分享资源)，并完成飞官考试。\n"
+		"🔹 连结建立后，过期、无人使用或申请遭拒均不退还通行证期限。\n"
+		"🎁 申请者进入机场后，邀请人可得 2 天通行证期限。",
+		reply_markup=_paid_invite_confirmation_keyboard(),
+	)
+
+
+@dp.callback_query(F.data == "paid_invite:cancel")
+async def on_paid_invite_cancel(callback: CallbackQuery) -> None:
+	if not callback.message:
+		await callback.answer("无效的邀请确认", show_alert=True, cache_time=0)
+		return
+	key = (int(callback.from_user.id), int(callback.message.message_id))
+	_prune_used_paid_invites()
+	if key in USED_INVITE_CONFIRMATIONS:
+		await callback.answer("此操作已经处理", cache_time=0)
+		return
+	USED_INVITE_CONFIRMATIONS[key] = int(datetime.now().timestamp())
+	await callback.message.edit_text("已取消建立邀请。")
+	await callback.answer("已取消", cache_time=0)
+
+
+@dp.callback_query(F.data == "paid_invite:confirm")
+async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
+	if not callback.message or callback.message.chat.type != "private":
+		await callback.answer("邀请只能在机器人私聊中建立", show_alert=True, cache_time=0)
+		return
+	user_id = int(callback.from_user.id)
+	confirmation_key = (user_id, int(callback.message.message_id))
+	_prune_used_paid_invites()
+	if confirmation_key in USED_INVITE_CONFIRMATIONS:
+		await callback.answer("此操作已经处理", cache_time=0)
+		return
+	USED_INVITE_CONFIRMATIONS[confirmation_key] = int(datetime.now().timestamp())
+	await callback.answer("正在建立邀请……", cache_time=0)
+	try:
+		await callback.message.edit_reply_markup(reply_markup=None)
+	except Exception:
+		pass
+
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		await callback.message.edit_text("❌ 航站大厅尚未配置，请联系塔台。")
+		return
+	if blacklist_store.is_blocked(user_id):
+		await callback.message.edit_text("❌ 你目前无法建立邀请连结。")
+		return
+	if not await _is_airport_member(user_id):
+		await callback.message.edit_text(
+			"❌ 只有航站大厅或机场的现有成员可以建立邀请。"
+		)
+		return
+
+	user_lock = TAKEOFF_USER_LOCKS.setdefault(user_id, asyncio.Lock())
+	async with user_lock:
+		user_expire = user_expire_cache.get(user_id)
+		now_timestamp = int(datetime.now().timestamp())
+		if (
+			not user_expire
+			or user_expire.expire_timestamp - now_timestamp
+			< PAID_INVITE_COST_MINUTES * 60
+		):
+			await callback.message.edit_text(
+				"❌ 飞行通行证余额不足。\n"
+				"建立邀请需要消耗完整的 1 天有效期。"
+			)
+			return
+
+		invite = None
+		consumed = False
+		try:
+			invite = await bot.create_chat_invite_link(
+				chat_id=MESSAGE_REWARD_CHAT_ID,
+				name=_build_paid_invite_name(user_id),
+				expire_date=datetime.now(timezone.utc) + timedelta(
+					hours=PAID_INVITE_LIFETIME_HOURS
+				),
+				creates_join_request=True,
+			)
+			updated_user = user_expire_cache.consume_minutes(
+				user_id,
+				PAID_INVITE_COST_MINUTES,
+			)
+			if updated_user is None:
+				raise RuntimeError("飞行通行证余额不足")
+			consumed = True
+			remaining_seconds = max(
+				0,
+				updated_user.expire_timestamp - int(datetime.now().timestamp()),
+			)
+			await callback.message.edit_text(
+				"✅ 单人审核邀请已建立\n\n"
+				"已扣除 1 天飞行通行证。\n"
+				"连结将在 24 小时后失效，并会在一位符合资格的申请者"
+				"通过审核后撤销。\n"
+				"申请者仍须拥有超过 2 天通行证并完成机场考试。\n\n"
+				f"目前剩余时间：{_format_duration(remaining_seconds)}",
+				reply_markup=InlineKeyboardMarkup(
+					inline_keyboard=[[
+						InlineKeyboardButton(
+							text="点击复制邀请连结 📋",
+							copy_text=CopyTextButton(text=invite.invite_link),
+						)
+					]],
+				),
+			)
+		except Exception as exc:
+			if invite is not None:
+				try:
+					await bot.revoke_chat_invite_link(
+						chat_id=MESSAGE_REWARD_CHAT_ID,
+						invite_link=invite.invite_link,
+					)
+				except Exception as revoke_exc:
+					USED_PAID_INVITES[invite.invite_link] = int(
+						datetime.now().timestamp()
+					)
+					print(
+						f"[PAID_INVITE] rollback revoke failed for user "
+						f"{user_id}: {revoke_exc}",
+						flush=True,
+					)
+			if consumed:
+				try:
+					user_expire_cache.extend_minutes(
+						user_id,
+						PAID_INVITE_COST_MINUTES,
+					)
+				except Exception as refund_exc:
+					print(
+						f"[PAID_INVITE] refund failed for user {user_id}: "
+						f"{refund_exc}",
+						flush=True,
+					)
+			print(f"[PAID_INVITE] creation failed for user {user_id}: {exc}", flush=True)
+			try:
+				await callback.message.edit_text(
+					"❌ 暂时无法建立邀请；若已扣除期限，系统已尝试自动退还。"
+				)
+			except Exception:
+				pass
+
+
 def _airport_access_text() -> str:
 	return dedent("""
 		现实世界已经足够喧嚣，我们都需要一个安静的角落，卸下疲惫与伪装，做回最真实的自己。
@@ -2185,25 +2484,52 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 		)
 		chat_title = "🏢 航站大厅 "
 
+	invite_link = ""
+	invite_expire_timestamp = 0
+	if create_chat_id == MESSAGE_REWARD_CHAT_ID:
+		remembered_invite = PENDING_AIRPORT_JOIN_INVITES.get(user_id)
+		if remembered_invite is not None:
+			remembered_link, remembered_expire_timestamp = remembered_invite
+			now_timestamp = int(datetime.now().timestamp())
+			if (
+				(remembered_expire_timestamp <= 0 or remembered_expire_timestamp > now_timestamp)
+				and remembered_link not in USED_PAID_INVITES
+			):
+				invite_link = remembered_link
+				invite_expire_timestamp = remembered_expire_timestamp
+			else:
+				PENDING_AIRPORT_JOIN_INVITES.pop(user_id, None)
 
-	invite = await bot.create_chat_invite_link(
-		chat_id=create_chat_id,
-		name=f"airport-access-{user_id}",
-		expire_date=datetime.now(timezone.utc) + timedelta(minutes=5),
-		creates_join_request=True,
+	if not invite_link:
+		invite_expire_date = datetime.now(timezone.utc) + timedelta(minutes=5)
+		invite = await bot.create_chat_invite_link(
+			chat_id=create_chat_id,
+			name=f"airport-access-{user_id}",
+			expire_date=invite_expire_date,
+			creates_join_request=True,
+		)
+		invite_link = str(invite.invite_link)
+		invite_expire_timestamp = int(invite_expire_date.timestamp())
+
+	remaining_invite_seconds = max(
+		0,
+		invite_expire_timestamp - int(datetime.now().timestamp()),
+	) if invite_expire_timestamp > 0 else 0
+	invite_deadline_text = (
+		f"请在 {_format_duration(remaining_invite_seconds)} 内送出入场审核申请。"
+		if remaining_invite_seconds > 0
+		else "请使用此连结送出入场审核申请。"
 	)
-
-
 
 	await bot.send_message(
 		chat_id=user_id,
-		text=f"✅ {airport_invitation}\n\n你的专属邀请链接已产生，请在 5 分钟内送出入场审核申请。",
+		text=f"✅ {airport_invitation}\n\n你的专属邀请链接已准备完成，{invite_deadline_text}",
 		reply_markup=InlineKeyboardMarkup(
 			inline_keyboard=[[
 
 				InlineKeyboardButton(
 					text=f"{chat_title}🔗",
-					url=invite.invite_link,
+					url=invite_link,
 				)
 			]]
 		),
@@ -2267,7 +2593,9 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
-			"请先上传 10 个媒体资源 ( 给塔台机器人, 若不同系列请分批次上传 )，再重新申请。"
+			"请先上传 10 个媒体资源 ( 给镇泰塔台机器人 )，再重新申请。\n"
+			"\n"
+			"‼️ 不同系列放在同批上传，将被拉黑，请分批上传。\n"
 		)
 
 		await callback.answer(
@@ -2408,152 +2736,425 @@ async def on_airport_quiz_answer(callback: CallbackQuery) -> None:
 			)
 
 
-@dp.chat_join_request(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
-async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
-	user_id = int(join_request.from_user.id)
+@dataclass(slots=True)
+class AirportJoinContext:
+	request: ChatJoinRequest
+	user_id: int
+	chat_id: int
+	is_paid_invite: bool = False
+	invite_link: str = ""
+	invite_expire_timestamp: int = 0
+	inviter_user_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class JoinRejection:
+	code: str
+	reason: str
+
+
+def _build_join_context(join_request: ChatJoinRequest) -> AirportJoinContext:
 	chat_id = int(join_request.chat.id)
+	invite = join_request.invite_link
+	invite_expire_date = getattr(invite, "expire_date", None) if invite else None
+	invite_expire_timestamp = (
+		int(invite_expire_date.timestamp()) if invite_expire_date else 0
+	)
+	inviter_user_id = (
+		_parse_paid_invite_name(invite.name)
+		if invite is not None and chat_id == MESSAGE_REWARD_CHAT_ID
+		else None
+	)
+	return AirportJoinContext(
+		request=join_request,
+		user_id=int(join_request.from_user.id),
+		chat_id=chat_id,
+		is_paid_invite=inviter_user_id is not None,
+		invite_link=str(invite.invite_link) if invite is not None else "",
+		invite_expire_timestamp=invite_expire_timestamp,
+		inviter_user_id=inviter_user_id or 0,
+	)
+
+
+async def _is_member_of_chat(chat_id: int, user_id: int) -> bool:
+	status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+	return _is_current_chat_member(status)
+
+
+async def _get_join_rejection_reason(
+	context: AirportJoinContext,
+) -> JoinRejection | None:
+	if blacklist_store.is_blocked(context.user_id):
+		return JoinRejection("blacklisted", "你目前无法申请进入机场。")
+
 	now_timestamp = int(datetime.now().timestamp())
-	user_expire = user_expire_cache.get(user_id)
+	user_expire = user_expire_cache.get(context.user_id)
 	remaining_seconds = max(
 		0,
 		(user_expire.expire_timestamp if user_expire else 0) - now_timestamp,
 	)
-
-	quiz_passed = AIRPORT_QUIZ_PASSED_UNTIL.get(user_id, 0) > now_timestamp
-
-
 	if remaining_seconds <= 2 * 24 * 60 * 60:
-		rejection_reason = (
-			"飞行通行证有效时间需要超过 2 天。\n"
-			"请先上传 10 个媒体资源 ( 给塔台机器人, 若不同系统请分批传 )，再重新申请。"
+		text = (
+			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
+			"请先上传 10 个媒体资源 ( 给镇泰塔台机器人 )，再重新申请。\n"
+			"\n"
+			"‼️ 不同系列放在同批上传，将被拉黑，请分批上传。\n"
 		)
-	else:
-		if quiz_passed:
-			if chat_id ==ENCODED_FORWARD_CHAT_ID:
-				'''先判断是否在航站大厅群'''
-				is_current_member = False
-				try:
-					status = await bot.get_chat_member(chat_id=MESSAGE_REWARD_CHAT_ID, user_id=user_id)
-
-					is_current_member = (
-						status.status in ("member", "administrator", "creator")
-						or (
-							status.status == "restricted"
-							and status.is_member is True
-						)
-					)
-
-				except Exception as exc:
-					await bot.send_message(
-						chat_id=user_id,
-						text=f"Telegram 发生异常，请稍候再申请",
-					)
-					print(f"[AIRPORT_ACCESS] get_chat_member failed: {exc}", flush=True)
-					return
 
 
-				if is_current_member:
-					welcome_notice = (
-						"亲爱的旅客，欢迎加入「镇泰飞机场」。\n\n"
-						"接下来，您可以通过以下设施开启旅程：\n\n"
-						"🗼 使用「镇泰塔台」机器人提交与分享资源；\n"
-						"🏢 前往「航站大厅」与其他旅客交流发言；\n"
-						"🛫 进入「镇泰飞机场」频道搭乘航班，"
-						"选择您想要搭乘并起飞的班机。\n\n"
-						"各项设施已准备就绪，祝您航程愉快。"
-					)
+		return JoinRejection("insufficient_time", text)
 
-					try:
-						await bot.approve_chat_join_request(
-							chat_id=join_request.chat.id,
-							user_id=user_id,
-						)
-
-						await bot.send_message(
-							chat_id=user_id,
-							text=f"✅ {welcome_notice}",
-						)
-					except Exception as exc:
-						print(f"[AIRPORT_ACCESS] join approval failed: {exc}", flush=True)
-					else:
-						AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
-					return
-				else:
-					rejection_reason = "请先加入航站大厅群组，再申请加入飞机场群组。"
-
-			elif chat_id ==MESSAGE_REWARD_CHAT_ID:
-				try:
-					await bot.approve_chat_join_request(
-						chat_id=join_request.chat.id,
-						user_id=user_id,
-					)
-
-					await _send_airport_join_request_invite(user_id, request_plant_channel=1)
-
-					# invite2 = await bot.create_chat_invite_link(
-					# 	chat_id=ENCODED_FORWARD_CHAT_ID,
-					# 	name=f"airport-access-{user_id}",
-					# 	expire_date=datetime.now(timezone.utc) + timedelta(minutes=5),
-					# 	creates_join_request=True,
-					# )
-
-					# airport_notice = (
-					# 	"亲爱的旅客，欢迎抵达「镇泰飞机场」航站大厅。\n\n"
-					# 	"进入航站楼后，请先向候机区的其他旅客发言问好。"
-					# 	"大厅内的航班信息板将显示目前开放登机、可以起飞的航班。\n\n"
-					# 	"移动端旅客可点击「镇泰飞机场」字样查看航班；"
-					# 	"桌面端旅客可点击旁边的小箭头，选择您准备搭乘的航班并前往对应登机口。\n\n"
-					# 	"办理登机前，请先加入「镇泰机场」频道，以完成登机资格验证，"
-					# 	"确保您能够顺利登机起飞。\n\n"
-					# 	"祝您候机愉快，航程顺利。"
-					# )
-
-					# await bot.send_message(
-					# 	chat_id=user_id,
-					# 	text=f"✅ {airport_notice}",
-					# 	reply_markup=InlineKeyboardMarkup(
-					# 		inline_keyboard=[[
-					# 			InlineKeyboardButton(
-					# 				text="✈️ 飞机场 🔗",
-					# 				url=invite2.invite_link,
-					# 			)
-					# 		]]
-					# 	),
-					# )
-
-				except Exception as exc:
-					print(f"[AIRPORT_ACCESS] join approval failed: {exc}", flush=True)
-				
-				return
-
-		
-			
-		else:
-			rejection_reason = (
+	if AIRPORT_QUIZ_PASSED_UNTIL.get(context.user_id, 0) <= now_timestamp:
+		return JoinRejection(
+			"quiz_required",
+			(
 				f"尚未完成 {len(AIRPORT_QUIZ_QUESTIONS)} 道机场核心精神单选题，"
 				"请从申请按钮重新开始考试。"
+			),
+		)
+
+	if context.chat_id == ENCODED_FORWARD_CHAT_ID:
+		if not await _is_member_of_chat(
+			MESSAGE_REWARD_CHAT_ID,
+			context.user_id,
+		):
+			return JoinRejection(
+				"lobby_required",
+				"请先加入航站大厅群组，再申请加入飞机场群组。",
 			)
 
+	return None
+
+
+async def _reject_join_request(
+	context: AirportJoinContext,
+	reason: str,
+	*,
+	include_access_help: bool = True,
+) -> None:
 	try:
 		await bot.send_message(
-			chat_id=join_request.user_chat_id,
-			text=(
-				f"❌ 入场审核未通过：{rejection_reason}\n\n"
-				f"{_airport_access_text()}"
-			),
-			parse_mode="HTML",
-			reply_markup=_airport_access_keyboard(),
+			chat_id=context.request.user_chat_id,
+			text=f"{_airport_access_text()}",
+			parse_mode="HTML" if include_access_help else None
+		)
+
+
+		text = f"❌ 入场审核未通过：{reason}"
+		if context.is_paid_invite and include_access_help:
+			text += "\n\n付费邀请不会免除机场资格要求，本次申请不会占用此邀请连结。"
+		# if include_access_help:
+		# 	text += f"\n\n{_airport_access_text()}"
+
+
+
+		await bot.send_message(
+			chat_id=context.request.user_chat_id,
+			text=text,
+			parse_mode="HTML" if include_access_help else None,
+			reply_markup=_airport_access_keyboard() if include_access_help else None,
 		)
 	except Exception as exc:
 		print(f"[AIRPORT_ACCESS] rejection notice failed: {exc}", flush=True)
 
 	try:
 		await bot.decline_chat_join_request(
-			chat_id=join_request.chat.id,
-			user_id=user_id,
+			chat_id=context.chat_id,
+			user_id=context.user_id,
 		)
 	except Exception as exc:
 		print(f"[AIRPORT_ACCESS] join rejection failed: {exc}", flush=True)
+
+
+async def _notify_join_retry(context: AirportJoinContext) -> None:
+	try:
+		await bot.send_message(
+			chat_id=context.request.user_chat_id,
+			text="Telegram 暂时无法完成入场审核，请稍后使用原连结重试。",
+		)
+	except Exception as exc:
+		print(f"[AIRPORT_ACCESS] retry notice failed: {exc}", flush=True)
+
+
+def _remember_failed_join_invite(context: AirportJoinContext) -> None:
+	if context.chat_id != MESSAGE_REWARD_CHAT_ID or not context.invite_link:
+		return
+	now_timestamp = int(datetime.now().timestamp())
+	if (
+		context.invite_expire_timestamp > 0
+		and context.invite_expire_timestamp <= now_timestamp
+	):
+		return
+	PENDING_AIRPORT_JOIN_INVITES[context.user_id] = (
+		context.invite_link,
+		context.invite_expire_timestamp,
+	)
+
+
+async def _approve_join_request(context: AirportJoinContext) -> bool:
+	try:
+		await bot.approve_chat_join_request(
+			chat_id=context.chat_id,
+			user_id=context.user_id,
+		)
+		return True
+	except Exception as exc:
+		print(
+			f"[AIRPORT_ACCESS] approval failed for user {context.user_id}, "
+			f"chat {context.chat_id}: {exc}",
+			flush=True,
+		)
+		return False
+
+
+async def _consume_paid_invite(context: AirportJoinContext) -> None:
+	USED_PAID_INVITES[context.invite_link] = int(datetime.now().timestamp())
+	try:
+		await bot.revoke_chat_invite_link(
+			chat_id=context.chat_id,
+			invite_link=context.invite_link,
+		)
+	except Exception as exc:
+		print(
+			f"[PAID_INVITE] revoke failed after approval for link "
+			f"{context.invite_link}, applicant {context.user_id}, "
+			f"inviter {context.inviter_user_id}: {exc}",
+			flush=True,
+		)
+
+
+async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
+	if not context.is_paid_invite:
+		return
+	if context.user_id == context.inviter_user_id:
+		return
+
+	inviter_lock = TAKEOFF_USER_LOCKS.setdefault(
+		context.inviter_user_id,
+		asyncio.Lock(),
+	)
+	async with inviter_lock:
+		now_timestamp = int(datetime.now().timestamp())
+		previous_user = user_expire_cache.get(context.inviter_user_id)
+		previous_expire_timestamp = (
+			previous_user.expire_timestamp if previous_user else 0
+		)
+		base_timestamp = max(now_timestamp, previous_expire_timestamp)
+		updated_user = user_expire_cache.extend_minutes(
+			context.inviter_user_id,
+			PAID_INVITE_REWARD_MINUTES,
+		)
+		actual_added_seconds = max(
+			0,
+			updated_user.expire_timestamp - base_timestamp,
+		)
+		remaining_seconds = max(
+			0,
+			updated_user.expire_timestamp - int(datetime.now().timestamp()),
+		)
+
+	print(
+		f"[PAID_INVITE] rewarded inviter {context.inviter_user_id} "
+		f"{actual_added_seconds} seconds for applicant {context.user_id}",
+		flush=True,
+	)
+	try:
+		if actual_added_seconds > 0:
+			text = (
+				"🎉 推荐成功\n\n"
+				"你建立的单人邀请已有一位旅客通过审核。\n"
+				"飞行通行证奖励：2 天。\n"
+				f"本次实际增加：{_format_duration(actual_added_seconds)}。\n"
+				f"当前剩余时间：{_format_duration(remaining_seconds)}。"
+			)
+		else:
+			text = (
+				"🎉 推荐成功\n\n"
+				"你建立的单人邀请已有一位旅客通过审核。\n"
+				"由于飞行通行证已达到 3 天上限，本次未再增加期限。"
+			)
+		await bot.send_message(chat_id=context.inviter_user_id, text=text)
+	except Exception as exc:
+		print(
+			f"[PAID_INVITE] reward notice failed for inviter "
+			f"{context.inviter_user_id}: {exc}",
+			flush=True,
+		)
+
+
+async def _send_airport_welcome(user_id: int) -> None:
+	welcome_notice = (
+		"亲爱的旅客，欢迎加入「镇泰飞机场」。\n\n"
+		"接下来，您可以通过以下设施开启旅程：\n\n"
+		"🗼 使用「镇泰塔台」机器人提交与分享资源；\n"
+		"🏢 前往「航站大厅」与其他旅客交流发言；\n"
+		"🛫 进入「镇泰飞机场」频道搭乘航班，"
+		"选择您想要搭乘并起飞的班机。\n\n"
+		"各项设施已准备就绪，祝您航程愉快。"
+	)
+	await bot.send_message(chat_id=user_id, text=f"✅ {welcome_notice}")
+
+
+async def _after_join_approved(context: AirportJoinContext) -> None:
+	if context.is_paid_invite:
+		await _consume_paid_invite(context)
+		try:
+			await _reward_paid_invite_creator(context)
+		except Exception as exc:
+			print(
+				f"[PAID_INVITE] creator reward failed for inviter "
+				f"{context.inviter_user_id}: {exc}",
+				flush=True,
+			)
+
+	if context.chat_id == MESSAGE_REWARD_CHAT_ID:
+		PENDING_AIRPORT_JOIN_INVITES.pop(context.user_id, None)
+		try:
+			await _send_airport_join_request_invite(
+				context.user_id,
+				request_plant_channel=1,
+			)
+		except Exception as exc:
+			print(
+				f"[AIRPORT_ACCESS] next-stage invite failed for user "
+				f"{context.user_id}: {exc}",
+				flush=True,
+			)
+			try:
+				await bot.send_message(
+					chat_id=context.request.user_chat_id,
+					text=(
+						"✅ 已通过审核并加入航站大厅。\n"
+						"暂时无法建立机场频道邀请，请稍后重新申请进入机场。"
+					),
+				)
+			except Exception:
+				pass
+		return
+
+	if context.chat_id == ENCODED_FORWARD_CHAT_ID:
+		AIRPORT_QUIZ_PASSED_UNTIL.pop(context.user_id, None)
+		try:
+			await _send_airport_welcome(context.user_id)
+		except Exception as exc:
+			print(
+				f"[AIRPORT_ACCESS] welcome notice failed for user "
+				f"{context.user_id}: {exc}",
+				flush=True,
+			)
+
+
+async def _process_join_request(context: AirportJoinContext) -> None:
+	if (
+		context.is_paid_invite
+		and context.invite_link in USED_PAID_INVITES
+	):
+		remembered_invite = PENDING_AIRPORT_JOIN_INVITES.get(context.user_id)
+		if remembered_invite and remembered_invite[0] == context.invite_link:
+			PENDING_AIRPORT_JOIN_INVITES.pop(context.user_id, None)
+		await _reject_join_request(
+			context,
+			"此单人邀请已经由其他申请者使用，请向邀请人索取新的连结。",
+			include_access_help=False,
+		)
+		return
+
+	try:
+		rejection = await _get_join_rejection_reason(context)
+	except Exception as exc:
+		print(
+			f"[AIRPORT_ACCESS] eligibility check failed for user "
+			f"{context.user_id}: {exc}",
+			flush=True,
+		)
+		await _notify_join_retry(context)
+		return
+
+	if rejection:
+		if rejection.code in {"insufficient_time", "quiz_required"}:
+			_remember_failed_join_invite(context)
+		await _reject_join_request(context, rejection.reason)
+		return
+
+	if not await _approve_join_request(context):
+		await _notify_join_retry(context)
+		return
+
+	await _after_join_approved(context)
+
+
+@dp.chat_join_request(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
+async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
+	context = _build_join_context(join_request)
+	if context.is_paid_invite:
+		_prune_used_paid_invites()
+		lock = PAID_INVITE_LOCKS.setdefault(context.invite_link, asyncio.Lock())
+		async with lock:
+			await _process_join_request(context)
+		return
+
+	await _process_join_request(context)
+
+
+@dp.chat_member(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
+async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
+	target_user = update.new_chat_member.user
+	target_user_id = int(target_user.id)
+	actor_user_id = int(update.from_user.id)
+
+	if target_user.is_bot:
+		return
+	if target_user_id in ADMIN_USER_IDS:
+		return
+	if blacklist_store.is_blocked(target_user_id):
+		return
+	if not _is_current_chat_member(update.old_chat_member):
+		return
+	if update.new_chat_member.status != "left":
+		return
+	if actor_user_id != target_user_id:
+		return
+
+	chat_name = (
+		"航站大厅"
+		if int(update.chat.id) == MESSAGE_REWARD_CHAT_ID
+		else "镇泰飞机场"
+	)
+	reason = f"主动离开{chat_name}，系统自动加入黑名单"
+	PENDING_AIRPORT_JOIN_INVITES.pop(target_user_id, None)
+	try:
+		_, group_ban_error = await _ban_user(
+			user_id=target_user_id,
+			reason=reason,
+			created_by=int(bot.id),
+		)
+	except Exception as exc:
+		print(
+			f"[AUTO_BLACKLIST] failed for user {target_user_id}, "
+			f"chat {update.chat.id}: {exc}",
+			flush=True,
+		)
+		return
+
+	print(
+		f"[AUTO_BLACKLIST] user {target_user_id} voluntarily left "
+		f"{chat_name} ({update.chat.id}); ban error: {group_ban_error or 'none'}",
+		flush=True,
+	)
+	try:
+		await bot.send_message(
+			chat_id=target_user_id,
+			text=(
+				"🚫 已列入黑名单\n\n"
+				f"系统检测到你主动离开{chat_name}。\n"
+				"根据机场规则，主动离群将自动失去再次申请资格。"
+			),
+		)
+	except Exception as exc:
+		print(
+			f"[AUTO_BLACKLIST] notice failed for user {target_user_id}: {exc}",
+			flush=True,
+		)
 
 
 @dp.message(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}), F.text)
@@ -2912,7 +3513,19 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			not user_expire
 			or now_timestamp - user_expire.group_message_timestamp > 24 * 60 * 60
 		):
-			await callback.answer("📢 航站广播：为确保航站持续开放，避免因缺少互动而触发电报官方限制，请各位旅客先前往「航站大厅」参与发言交流。您也可以在大厅内分享对已搭乘班机资源的体验与点评，让航站保持良好运行。", show_alert=True)
+
+			await callback.answer(
+					"📢 航站广播\n\n"
+					"为确保航站持续开放，避免因缺少互动而触发电报官方限制，请各位旅客先前往「航站大厅」参与发言交流，让航站保持良好运行。\n\n"
+					"👍 你可以:\n"
+					"回覆对已搭乘班机资源的体验与点评\n"
+					"回应其他旅客的发言\n\n"
+					"👎 不建议:\n"
+					"发问候语\n"
+					"诉说需要发言\n",
+					parse_mode="HTML",
+				)
+
 			return
 
 		available_minutes = max(
@@ -3291,12 +3904,13 @@ async def main() -> None:
 	print(f"Bot started as @{bot_name}", flush=True)
 	await bot.set_my_commands(
 		[
-			BotCommand(command="start", description="开始"),
-			BotCommand(command="about", description="关于我"),
+			# BotCommand(command="start", description="开始"),
+			# BotCommand(command="about", description="关于我"),
 			BotCommand(command="me", description="查询飞行通行证"),
 			# BotCommand(command="bonus", description="塔台发放 10 天时限"),
 			BotCommand(command="rule", description="查看飞行通行证规则"),
 			BotCommand(command="airport_access_request", description="请求进入机场"),
+			BotCommand(command="invite", description="建立单人审核邀请"),
 		],
 		scope=BotCommandScopeAllPrivateChats(),
 	)

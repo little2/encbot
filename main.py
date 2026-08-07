@@ -3107,6 +3107,23 @@ async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 	await _process_join_request(context)
 
 
+async def _send_lobby_welcome(user: User) -> None:
+	display_name = escape(str(user.full_name or "新旅客"))
+	mention = f'<a href="tg://user?id={int(user.id)}">{display_name}</a>'
+	await bot.send_message(
+		chat_id=MESSAGE_REWARD_CHAT_ID,
+		text=(
+			f"🎉 欢迎抵达航站大厅，{mention}！\n\n"
+			"🏢 航站大厅：与其他旅客交流，符合条件的发言可以延长飞行通行证。\n"
+			"🗼 镇泰塔台：提交、编码与分享资源。\n"
+			"🛫 镇泰飞机场：查看航班并获取资源。\n\n"
+			"请先和其他旅客进行有内容的交流。问候语、刷屏或为了取得时数而发送的无意义内容不会获得奖励。\n\n"
+			"祝你候机愉快，航程顺利。"
+		),
+		parse_mode="HTML",
+	)
+
+
 @dp.chat_member(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
 async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 	target_user = update.new_chat_member.user
@@ -3115,11 +3132,47 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 
 	if target_user.is_bot:
 		return
+
+	was_member = _is_current_chat_member(update.old_chat_member)
+	is_member = _is_current_chat_member(update.new_chat_member)
+	is_new_lobby_member = (
+		int(update.chat.id) == MESSAGE_REWARD_CHAT_ID
+		and not was_member
+		and is_member
+	)
+	if is_new_lobby_member:
+		if (
+			target_user_id not in ADMIN_USER_IDS
+			and blacklist_store.is_blocked(target_user_id)
+		):
+			try:
+				await _ban_user(
+					user_id=target_user_id,
+					reason="黑名单用户异常重新加入航站大厅",
+					created_by=int(bot.id),
+				)
+			except Exception as exc:
+				print(
+					f"[LOBBY_WELCOME] failed to remove blacklisted user "
+					f"{target_user_id}: {exc}",
+					flush=True,
+				)
+			return
+
+		try:
+			await _send_lobby_welcome(target_user)
+		except Exception as exc:
+			print(
+				f"[LOBBY_WELCOME] notice failed for user {target_user_id}: {exc}",
+				flush=True,
+			)
+		return
+
 	if target_user_id in ADMIN_USER_IDS:
 		return
 	if blacklist_store.is_blocked(target_user_id):
 		return
-	if not _is_current_chat_member(update.old_chat_member):
+	if not was_member:
 		return
 	if update.new_chat_member.status != "left":
 		return

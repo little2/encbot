@@ -3526,6 +3526,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		):
 
 			await callback.answer(
+				text=(
 					"📢 航站广播\n\n"
 					"为确保航站持续开放，避免因缺少互动而触发电报官方限制，请各位旅客先前往「航站大厅」参与发言交流，让航站保持良好运行。\n\n"
 					"👍 你可以:\n"
@@ -3533,9 +3534,10 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 					"回应其他旅客的发言\n\n"
 					"👎 不建议:\n"
 					"发问候语\n"
-					"诉说需要发言\n",
-					parse_mode="HTML",
-				)
+					"诉说需要发言\n"
+				),
+				parse_mode="HTML",
+			)
 
 			return
 

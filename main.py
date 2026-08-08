@@ -3221,8 +3221,8 @@ async def _send_lobby_welcome(user: User) -> None:
 	)
 	welcome_keyboard = InlineKeyboardMarkup(
 		inline_keyboard=[[
-			InlineKeyboardButton(text="🛫 镇泰飞机场", url=airport_url),
-			InlineKeyboardButton(text="🗼 镇泰塔台", url=tower_url),
+			InlineKeyboardButton(text="🛫 飞机场", url=airport_url),
+			InlineKeyboardButton(text="🗼 塔台", url=tower_url),
 			InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztTowerRobot")
 		]],
 	)

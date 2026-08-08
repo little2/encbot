@@ -3205,8 +3205,8 @@ async def _send_lobby_welcome(user: User) -> None:
 	mention = f'<a href="tg://user?id={int(user.id)}">{display_name}</a>'
 	welcome_text = (
 		f"🎉 欢迎抵达航站大厅，{mention}！\n\n"
-		"🏢 航站大厅(本群)：与其他旅客交流，符合条件的发言可以延长飞行通行证。\n"
-		"🗼 镇泰塔台：提交、编码与分享资源。\n"
+		"🏢 航站大厅(本群)：与其他旅客交流，发言可延长飞行通行证。\n"
+		"🗼 镇泰塔台：提交、分享资源与邀请他人。\n"
 		"🛫 镇泰飞机场：查看航班并获取资源。\n\n"
 		"请先和其他旅客进行有内容的交流。问候语、刷屏或为了取得时数而发送的无意义内容不会获得奖励。\n\n"
 		"祝你候机愉快，航程顺利。"
@@ -3936,7 +3936,24 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 	chat_id = callback.message.chat.id
 	message_id = callback.message.message_id
 	try:
-		await _increment_takeoff_count(callback.message)
+		takeoff_count = await _increment_takeoff_count(callback.message)
+		print(f"{callback.message.chat.id}/{callback.message.message_id} takeoff count updated: {takeoff_count}", flush=True)
+
+		if takeoff_count and takeoff_count >= 3:
+			message_url = f"https://t.me/c/{str(chat_id).lstrip('-100')}/{message_id}"
+			
+			text =(
+				f"📢 <b>航站广播：</b>目前已有 <code><b>{takeoff_count}</b></code> 位旅客搭乘 <b><a href=\"{message_url}\">ZT-{message_id}</a></b> 航班。\n"
+				f"尚未登机的旅客，请尽速前往 <b><a href=\"{message_url}\">登机口</a></b> 办理登机手续。"
+			)
+
+
+			await bot.send_message(
+				chat_id=MESSAGE_REWARD_CHAT_ID,
+				text=text.strip(),
+				parse_mode="HTML",
+			)
+
 	except Exception as exc:
 		print(f"[TAKEOFF] counter update failed: {exc}", flush=True)
 

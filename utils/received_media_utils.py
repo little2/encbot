@@ -24,6 +24,7 @@ class ReceivedMediaStore:
                 source_message_id INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'accepted')),
+                batch_id TEXT,
                 created_at INTEGER NOT NULL,
                 accepted_at INTEGER
             )
@@ -39,6 +40,18 @@ class ReceivedMediaStore:
                 "ALTER TABLE received_media "
                 "ADD COLUMN file_id TEXT NOT NULL DEFAULT ''"
             )
+        if "batch_id" not in columns:
+            self.connection.execute(
+                "ALTER TABLE received_media ADD COLUMN batch_id TEXT"
+            )
+        if "accepted_at" not in columns:
+            self.connection.execute(
+                "ALTER TABLE received_media ADD COLUMN accepted_at INTEGER"
+            )
+        self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_received_media_batch_id
+            ON received_media(batch_id)
+        """)
         self.connection.commit()
         self.cleanup_stale_pending()
 
@@ -139,7 +152,11 @@ class ReceivedMediaStore:
             )
         return max(0, int(cursor.rowcount))
 
-    def mark_accepted_many(self, file_unique_ids: list[str]) -> int:
+    def accept_batch(
+        self,
+        file_unique_ids: list[str],
+        batch_id: str,
+    ) -> int:
         unique_ids = list(dict.fromkeys(
             str(value).strip()
             for value in file_unique_ids
@@ -147,6 +164,11 @@ class ReceivedMediaStore:
         ))
         if not unique_ids:
             return 0
+        normalized_batch_id = str(batch_id or "").strip()
+        if not normalized_batch_id:
+            raise ValueError("batch_id is required")
+        if len(normalized_batch_id) > 64:
+            raise ValueError("batch_id cannot exceed 64 characters")
 
         accepted_at = int(time.time())
         placeholders = ",".join("?" for _ in unique_ids)
@@ -154,13 +176,68 @@ class ReceivedMediaStore:
             cursor = self.connection.execute(
                 f"""
                     UPDATE received_media
-                    SET status = 'accepted', accepted_at = ?
+                    SET
+                        status = 'accepted',
+                        accepted_at = ?,
+                        batch_id = ?
                     WHERE status = 'pending'
                       AND file_unique_id IN ({placeholders})
                 """,
-                (accepted_at, *unique_ids),
+                (accepted_at, normalized_batch_id, *unique_ids),
             )
         return max(0, int(cursor.rowcount))
+
+    def get_batch_ids(
+        self,
+        file_unique_ids: list[str],
+    ) -> dict[str, str | None]:
+        unique_ids = list(dict.fromkeys(
+            str(value).strip()
+            for value in file_unique_ids
+            if str(value).strip()
+        ))
+        if not unique_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self.connection.execute(
+            f"""
+                SELECT file_unique_id, batch_id
+                FROM received_media
+                WHERE file_unique_id IN ({placeholders})
+            """,
+            tuple(unique_ids),
+        ).fetchall()
+        return {
+            str(file_unique_id): (
+                str(batch_id) if batch_id is not None else None
+            )
+            for file_unique_id, batch_id in rows
+        }
+
+    def get_media_by_batch_id(self, batch_id: str) -> list[dict[str, str]]:
+        normalized_batch_id = str(batch_id or "").strip()
+        if not normalized_batch_id:
+            return []
+
+        rows = self.connection.execute(
+            """
+                SELECT file_id, file_type
+                FROM received_media
+                WHERE batch_id = ?
+                  AND status = 'accepted'
+                  AND file_id <> ''
+                ORDER BY source_message_id, file_unique_id
+            """,
+            (normalized_batch_id,),
+        ).fetchall()
+        return [
+            {
+                "file_id": str(file_id),
+                "file_type": str(file_type),
+            }
+            for file_id, file_type in rows
+        ]
 
     def close(self) -> None:
         self.connection.close()

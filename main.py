@@ -714,7 +714,7 @@ def _choice(label: str, selected: bool) -> str:
 
 def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeyboardMarkup:
 	no_forward = bool(state.get("no_forward", False))
-	anonymous = bool(state.get("anonymous", True))
+	
 	flash_seconds = int(state.get("flash_seconds", 0))
 	valid_mode = str(state.get("valid_mode", "perm"))
 	long_flash_seconds = int(state.get("video_flash_seconds", 60))
@@ -725,6 +725,7 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 	now_timestamp = int(datetime.now().timestamp())
 	user_expire = user_expire_cache.get(int(owner_user_id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
+		anonymous = bool(state.get("anonymous", False))
 		rows = [
 			[
 				InlineKeyboardButton(
@@ -734,6 +735,7 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 			]
 		]
 	else:
+		anonymous = bool(state.get("anonymous", True))
 		rows = [
 			[
 				InlineKeyboardButton(

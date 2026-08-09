@@ -46,6 +46,7 @@ from typing import Union
 
 from utils.utf_utils import UtfConverter
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
+from utils.batch_utils import BatchStore
 from utils.invite_link_utils import SharedInviteLinkStore
 from utils.received_media_utils import ReceivedMediaStore
 from utils.user_utils import UserExpireCache, UserExpire
@@ -86,6 +87,7 @@ user_expire_db_path = Path(
 )
 user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
 blacklist_store = BlacklistStore(db_path=user_expire_db_path)
+batch_store = BatchStore(db_path=user_expire_db_path)
 received_media_store = ReceivedMediaStore(db_path=user_expire_db_path)
 shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 
@@ -113,6 +115,11 @@ OVERFLOW_NOTICE_TIME: dict[tuple[int, int], float] = {}
 TAKEOFF_COUNTER_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 TAKEOFF_COUNTS: dict[tuple[int, int], int] = {}
 TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
+BATCH_LOCATION_LOCK = asyncio.Lock()
+PENDING_BATCH_DISCUSSION_LOCATIONS: OrderedDict[
+	tuple[int, int], tuple[int, int]
+] = OrderedDict()
+MAX_PENDING_BATCH_DISCUSSION_LOCATIONS = 500
 AIRPORT_QUIZ_PROGRESS: dict[int, int] = {}
 AIRPORT_QUIZ_RETRY_AT: dict[int, int] = {}
 AIRPORT_QUIZ_PASSED_UNTIL: dict[int, int] = {}
@@ -582,11 +589,30 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 		return_text += f"⏳ {valid_until_display} | "
 
 
-	media_count = len(data.get("items", []))
+	media_items = list(data.get("items", []))
+	media_count = len(media_items)
 	if media_count > 1:
-		return_text += f"📦 {media_count} \n"
+		video_count = sum(
+			1 for item in media_items
+			if str(item.get("file_type", "")) == "video"
+		)
+		photo_count = sum(
+			1 for item in media_items
+			if str(item.get("file_type", "")) == "photo"
+		)
+		other_count = media_count - video_count - photo_count
+		media_composition = [
+			label
+			for count, label in (
+				(video_count, f"🎬x{video_count} "),
+				(photo_count, f"🖼x{photo_count} "),
+				(other_count, f"📄x{other_count} "),
+			)
+			if count > 0
+		]
+		return_text += f"📦 {media_count}  (  {' '.join(media_composition)} )\n"
 
-	for item in data.get("items", []):
+	for item in media_items:
 		
 		_file_type = str(item.get("file_type", ""))
 		if _file_type not in {"document", "audio", "voice"}:
@@ -1149,6 +1175,14 @@ async def _forward_encoded_if_whitelisted(
 	if ENCODED_FORWARD_CHAT_ID == 0:
 		return {"ok":False,"error_msg":"ENCODED_FORWARD_CHAT_ID is 0"}
 
+	def success_result(published_message: Message, mode: str) -> dict[str, Any]:
+		return {
+			"ok": True,
+			"mode": mode,
+			"channel_chat_id": int(published_message.chat.id),
+			"channel_message_id": int(published_message.message_id),
+		}
+
 
 
 	preview_show = True
@@ -1248,7 +1282,7 @@ async def _forward_encoded_if_whitelisted(
 
 			if len(media) == 1:
 				content, filename = preview_payloads[0]
-				await _telegram_call_with_retry(
+				published_message = await _telegram_call_with_retry(
 					"send preview photo",
 					lambda: bot.send_photo(
 						chat_id=ENCODED_FORWARD_CHAT_ID,
@@ -1261,7 +1295,7 @@ async def _forward_encoded_if_whitelisted(
 					),
 				)
 				if caption is None:
-					await _telegram_call_with_retry(
+					published_message = await _telegram_call_with_retry(
 						"send encoded text",
 						lambda: bot.send_message(
 							chat_id=ENCODED_FORWARD_CHAT_ID,
@@ -1283,7 +1317,7 @@ async def _forward_encoded_if_whitelisted(
 					),
 				)
 
-				await _telegram_call_with_retry(
+				published_message = await _telegram_call_with_retry(
 					"send encoded text",
 					lambda: bot.send_message(
 						chat_id=ENCODED_FORWARD_CHAT_ID,
@@ -1330,7 +1364,7 @@ async def _forward_encoded_if_whitelisted(
 				# 		text=display_text,
 				# 		parse_mode="HTML",
 				# 	)
-			return {"ok":True}
+			return success_result(published_message, "preview")
 		elif preview_show:
 
 			fallback_message = await _telegram_call_with_retry(
@@ -1344,17 +1378,12 @@ async def _forward_encoded_if_whitelisted(
 				),
 			)
 
-			return {
-				"ok": True,
-				"mode": "text_fallback",
-				"message_ids": [fallback_message.message_id],
-			}
+			return success_result(fallback_message, "text_fallback")
 
 
 		else:
-			# print(f"DEFAULT_COVER_FILE_ID = {DEFAULT_COVER_FILE_ID}")
 			if DEFAULT_COVER_FILE_ID is None:
-				send_result = await _telegram_call_with_retry(
+				published_message = await _telegram_call_with_retry(
 					"send default cover",
 					lambda: bot.send_photo(
 						chat_id=ENCODED_FORWARD_CHAT_ID,
@@ -1368,9 +1397,13 @@ async def _forward_encoded_if_whitelisted(
 						parse_mode="HTML" if caption else None,
 					),
 				)
-				DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
+				DEFAULT_COVER_FILE_ID = (
+					published_message.photo[-1].file_id
+					if published_message.photo
+					else None
+				)
 			else:
-				await _telegram_call_with_retry(
+				published_message = await _telegram_call_with_retry(
 					"send cached default cover",
 					lambda: bot.send_photo(
 						chat_id=ENCODED_FORWARD_CHAT_ID,
@@ -1382,9 +1415,8 @@ async def _forward_encoded_if_whitelisted(
 					),
 				)
 
-
 			if caption is None:
-				await _telegram_call_with_retry(
+				published_message = await _telegram_call_with_retry(
 					"send encoded text",
 					lambda: bot.send_message(
 						chat_id=ENCODED_FORWARD_CHAT_ID,
@@ -1394,7 +1426,7 @@ async def _forward_encoded_if_whitelisted(
 						parse_mode="HTML",
 					),
 				)
-		return {"ok":True}
+			return success_result(published_message, "default_cover")
 	except TelegramRetryAfter as exc:
 		print(f"[ENCODED_FORWARD] rate limit retries exhausted: {exc}", flush=True)
 		return {"ok": False, "reason": "rate_limited", "retry_after": exc.retry_after}
@@ -1415,7 +1447,7 @@ async def _forward_encoded_if_whitelisted(
 
 
 		try:
-			await _telegram_call_with_retry(
+			fallback_message = await _telegram_call_with_retry(
 				"send encoded fallback text",
 				lambda: bot.send_message(
 					chat_id=ENCODED_FORWARD_CHAT_ID,
@@ -1425,7 +1457,7 @@ async def _forward_encoded_if_whitelisted(
 					parse_mode="HTML",
 				),
 			)
-			return {"ok":True}
+			return success_result(fallback_message, "error_text_fallback")
 		except Exception as fallback_exc:
 			print(f"[ENCODED_FORWARD] text fallback failed: {fallback_exc}", flush=True)
 		return {"ok":False}
@@ -1451,6 +1483,31 @@ def minutes_to_day_hour(minutes: int):
 	return text, view_count
 
 
+async def _record_batch_channel_location(
+	batch_id: str,
+	channel_chat_id: int,
+	channel_message_id: int,
+) -> None:
+	channel_key = (int(channel_chat_id), int(channel_message_id))
+	async with BATCH_LOCATION_LOCK:
+		batch_store.upsert_channel_location(
+			batch_id,
+			channel_key[0],
+			channel_key[1],
+		)
+		pending_discussion = PENDING_BATCH_DISCUSSION_LOCATIONS.pop(
+			channel_key,
+			None,
+		)
+		if pending_discussion:
+			batch_store.update_discussion_location(
+				channel_key[0],
+				channel_key[1],
+				pending_discussion[0],
+				pending_discussion[1],
+			)
+
+
 async def _send_encoded_snapshot(
 	state_key: tuple[int, int],
 	revision: int,
@@ -1462,12 +1519,22 @@ async def _send_encoded_snapshot(
 ) -> None:
 	success = False
 	accepted_count = 0
+	forward_status: dict[str, Any] = {}
 	try:
 		forward_status = await _forward_encoded_if_whitelisted(owner_user_id, encoded, items)
 		success = bool(forward_status.get("ok", False))
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] background send failed: {exc}", flush=True)
 		success = False
+	if success:
+		try:
+			await _record_batch_channel_location(
+				batch_id,
+				int(forward_status["channel_chat_id"]),
+				int(forward_status["channel_message_id"]),
+			)
+		except Exception as exc:
+			print(f"[BATCH] channel location save failed: {exc}", flush=True)
 	state = ENCODER_UI_STATE.get(state_key)
 	if not state:
 		return
@@ -3341,6 +3408,63 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 		)
 
 
+def _extract_automatic_forward_source(message: Message) -> tuple[int, int] | None:
+	if not bool(message.is_automatic_forward):
+		return None
+
+	origin = message.forward_origin
+	origin_chat = getattr(origin, "chat", None)
+	origin_message_id = getattr(origin, "message_id", None)
+	if origin_chat is not None and origin_message_id is not None:
+		return int(origin_chat.id), int(origin_message_id)
+
+	if message.forward_from_chat and message.forward_from_message_id:
+		return (
+			int(message.forward_from_chat.id),
+			int(message.forward_from_message_id),
+		)
+	return None
+
+
+@dp.message(
+	F.chat.id == MESSAGE_REWARD_CHAT_ID,
+	F.is_automatic_forward == True,
+)
+async def on_lobby_channel_auto_forward(message: Message) -> None:
+	source_location = _extract_automatic_forward_source(message)
+	if not source_location:
+		return
+	if source_location[0] != ENCODED_FORWARD_CHAT_ID:
+		return
+
+	discussion_location = (int(message.chat.id), int(message.message_id))
+	async with BATCH_LOCATION_LOCK:
+		updated = batch_store.update_discussion_location(
+			source_location[0],
+			source_location[1],
+			discussion_location[0],
+			discussion_location[1],
+		)
+		if not updated:
+			PENDING_BATCH_DISCUSSION_LOCATIONS[source_location] = (
+				discussion_location
+			)
+			PENDING_BATCH_DISCUSSION_LOCATIONS.move_to_end(source_location)
+			while (
+				len(PENDING_BATCH_DISCUSSION_LOCATIONS)
+				> MAX_PENDING_BATCH_DISCUSSION_LOCATIONS
+			):
+				PENDING_BATCH_DISCUSSION_LOCATIONS.popitem(last=False)
+			return
+
+	print(
+		f"[BATCH] discussion location updated "
+		f"channel={source_location[0]}/{source_location[1]} "
+		f"discussion={discussion_location[0]}/{discussion_location[1]}",
+		flush=True,
+	)
+
+
 @dp.message(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}), F.text)
 async def on_reward_group_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
@@ -3948,10 +4072,23 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			)
 
 
+			discussion_location = batch_store.get_discussion_location(
+				int(chat_id),
+				int(message_id),
+			)
+			reply_parameters: dict[str, int] = {}
+			if (
+				discussion_location
+				and discussion_location[0] == MESSAGE_REWARD_CHAT_ID
+				and discussion_location[1] is not None
+			):
+				reply_parameters["reply_to_message_id"] = discussion_location[1]
+
 			await bot.send_message(
 				chat_id=MESSAGE_REWARD_CHAT_ID,
 				text=text.strip(),
 				parse_mode="HTML",
+				**reply_parameters,
 			)
 
 	except Exception as exc:
@@ -4270,6 +4407,7 @@ async def main() -> None:
 		forward_worker.cancel()
 		await asyncio.gather(*workers, forward_worker, return_exceptions=True)
 		blacklist_store.close()
+		batch_store.close()
 		received_media_store.close()
 		shared_invite_link_store.close()
 		user_expire_cache.close()

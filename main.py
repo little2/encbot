@@ -3939,7 +3939,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		takeoff_count = await _increment_takeoff_count(callback.message)
 		print(f"{callback.message.chat.id}/{callback.message.message_id} takeoff count updated: {takeoff_count}", flush=True)
 
-		if takeoff_count and takeoff_count >= 3:
+		if takeoff_count and (takeoff_count == 3 or takeoff_count == 9 or takeoff_count == 12):
 			message_url = f"https://t.me/c/{str(chat_id).lstrip('-100')}/{message_id}"
 			
 			text =(

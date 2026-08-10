@@ -205,12 +205,12 @@ AIRPORT_QUIZ_QUESTIONS = (
 		"上传媒体资源时，以下哪种做法符合机场的上传规定？",
 		(
 			"不同系列混批上传且数量不限",
-			"不同系列分批，每批最多十个",
 			"重复上传无效或相同资源",
 			"上传清水媒体换取正太资源",
-			"上传后无需检查内容与系列",
+			"可以上传萝莉或男同的内容",
+			"不同系列不可以混在一起上传，每批最多十个",
 		),
-		1,
+		4,
 	),
 	(
 		"关于塔台(机器人)、飞机场(频道)与航站大厅(群组)的作用，以下哪一项说明错误？",
@@ -720,13 +720,13 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 	valid_mode = str(state.get("valid_mode", "perm"))
 	long_flash_seconds = int(state.get("video_flash_seconds", 60))
 	long_flash_label = f"{long_flash_seconds}秒" if bool(state.get("has_video", False)) else "60秒"
-
+	anonymous = bool(state.get("anonymous", True))
 	owner_user_id = int(state.get("owner_user_id", 0))
 
 	now_timestamp = int(datetime.now().timestamp())
 	user_expire = user_expire_cache.get(int(owner_user_id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
-		anonymous = bool(state.get("anonymous", False))
+		
 		rows = [
 			[
 				InlineKeyboardButton(
@@ -736,7 +736,7 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 			]
 		]
 	else:
-		anonymous = bool(state.get("anonymous", True))
+		
 		rows = [
 			[
 				InlineKeyboardButton(
@@ -1597,9 +1597,22 @@ async def _send_encoded_snapshot(
 					f"🎈 请注意，通行证有效时间上限为 {minutes_to_day_hour(MAX_VALID_DURATION_MINUTES)[0]}，超过上限的部分将不会延长。"
 				)
 
+				remembered_invite = PENDING_AIRPORT_JOIN_INVITES.get(owner_user_id)
+				invite_keyboard = None
+				if remembered_invite and remembered_invite[0]:
+					invite_keyboard = InlineKeyboardMarkup(
+						inline_keyboard=[[
+							InlineKeyboardButton(
+								text="进入飞机场",
+								url=remembered_invite[0],
+							),
+						]],
+					)
+
 				await bot.send_message(
 					chat_id=owner_user_id,
 					text=notify_text,
+					reply_markup=invite_keyboard,
 				)
 
 				print(
@@ -2545,7 +2558,7 @@ async def _airport_registration_error() -> str | None:
 			"若您希望进入「镇泰飞机场」搭乘航班，请联系已在航站内的旅客，请对方通过塔台机器人：「建立单人审核邀请」功能生成专属登机邀请连结。持该邀请连结完成入场审核后，即可获准进入「镇泰飞机场」。\n"
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
-			"您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「飞机场入场邀请连结」「求镇泰飞机场邀请连结」。\n"
+			"您可以前往熟悉的正太群组或废弃机场，向其他群友询问：是否能协助提供「飞机场入场邀请连结」「求镇泰飞机场邀请连结」。\n"
 			"\n"
 			"\n"
 			"感谢您的理解与配合，祝您旅途愉快，顺利起飞 ✈️\n"
@@ -2780,7 +2793,18 @@ async def cmd_rule(message: Message) -> None:
 async def cmd_airport_access_request(message: Message) -> None:
 	registration_error = await _airport_registration_error()
 	if registration_error:
-		await message.reply(registration_error, parse_mode="HTML")
+		await message.reply(
+			registration_error,
+			parse_mode="HTML",
+			reply_markup=InlineKeyboardMarkup(
+				inline_keyboard=[[
+					InlineKeyboardButton(
+						text="废弃机场(无资源)",
+						url="https://t.me/+GHeK4dW-KcdlNDI1",
+					),
+				]],
+			),
+		)
 		return
 
 	await message.reply(
@@ -2804,14 +2828,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 
 @dp.callback_query(F.data == "airport:access:request")
 async def on_airport_access_request(callback: CallbackQuery) -> None:
-	registration_error = await _airport_registration_error()
-	if registration_error:
-		await callback.answer(
-			registration_error,
-			show_alert=True,
-			cache_time=0,
-		)
-		return
+
 
 	user_id = int(callback.from_user.id)
 	now_timestamp = int(datetime.now().timestamp())
@@ -2824,7 +2841,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
-			"请先上传 10 个「正太」媒体资源 ( 给镇泰塔台机器人 )，再重新申请。\n"
+			"请先上传 10 个「正太」媒体资源 ( 给我，镇泰塔台 )，再重新申请。\n"
 			"\n"
 			"‼️ 不同系列放在同批上传，将被拉黑，请分批上传。\n"
 		)
@@ -3073,7 +3090,7 @@ async def _reject_join_request(
 
 		text = f"❌ 入场审核未通过：{reason}"
 		if context.is_paid_invite and include_access_help:
-			text += "\n\n付费邀请不会免除机场资格要求，本次申请不会占用此邀请连结。"
+			text += "\n\n本邀请不会免除机场资格要求，本次申请不会占用此邀请连结。"
 		# if include_access_help:
 		# 	text += f"\n\n{_airport_access_text()}"
 

@@ -145,6 +145,7 @@ USED_FLASH_NONCES: dict[tuple[str, int], datetime] = {}
 PERM_FLASH_NONCE_RETENTION_DAYS = 30
 AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
 AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
+AIRPORT_REGISTRATION_MEMBER_LIMIT = 1
 PAID_INVITE_COST_MINUTES = 24 * 60
 PAID_INVITE_REWARD_MINUTES = 2 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
@@ -2510,6 +2511,49 @@ def _airport_access_keyboard() -> InlineKeyboardMarkup:
 	)
 
 
+async def _airport_registration_error() -> str | None:
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		return "❌ 航站大厅尚未配置，请联系塔台。"
+
+	try:
+		member_count = await bot.get_chat_member_count(
+			chat_id=MESSAGE_REWARD_CHAT_ID,
+		)
+	except Exception as exc:
+		print(
+			f"[AIRPORT_REGISTRATION] failed to get lobby member count: {exc}",
+			flush=True,
+		)
+		return "❌ 暂时无法确认航站大厅人数，目前无法受理注册，请稍后再试。"
+
+	if member_count >= AIRPORT_REGISTRATION_MEMBER_LIMIT:
+		
+
+		message = (
+			"<blockquote>📢 航站广播</blockquote>\n"
+			"亲爱的旅客您好，很抱歉通知您：\n"
+			"\n"
+			"目前「镇泰飞机场」航站大厅旅客人数已达运行容量上限，为确保航站秩序与飞行服务品质，现已暂停开放自助入场通道。"
+			"如需进入「镇泰飞机场」，请取得现有旅客提供的专属邀请连结，并通过审核后方可入场。\n"
+			"\n"
+			"<blockquote>✈️ 关于镇泰飞机场</blockquote>\n"
+			"「镇泰飞机场」为低门槛正太资源媒体交流航站，每日皆有众多旅客提供正太资源，为旅客提供便捷的起飞体验。\n"
+			"\n"
+			"由于电报封锁力度，为避免旅客数量过载影响航站稳定运行，当大厅人数达到安全容量后，塔台将关闭自动入场服务，改由邀请审核机制维持航站正常运作。\n"
+			"\n"
+			"<blockquote>🎫 申请入场方式</blockquote>\n"
+			"若您希望进入「镇泰飞机场」搭乘航班，请联系已在航站内的旅客，请对方通过塔台机器人：「建立单人审核邀请」功能生成专属登机邀请连结。持该邀请连结完成入场审核后，即可获准进入「镇泰飞机场」。\n"
+			"\n"
+			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
+			"您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「飞机场入场邀请连结」「求镇泰飞机场邀请连结」。\n"
+			"\n"
+			"\n"
+			"感谢您的理解与配合，祝您旅途愉快，顺利起飞 ✈️\n"
+		)
+		return message
+	return None
+
+
 def _airport_quiz_text(question_index: int) -> str:
 	question, _, _ = AIRPORT_QUIZ_QUESTIONS[question_index]
 	return (
@@ -2734,6 +2778,11 @@ async def cmd_rule(message: Message) -> None:
 @dp.message(F.chat.type == "private", Command("about"))
 @dp.message(F.chat.type == "private", Command("airport_access_request"))
 async def cmd_airport_access_request(message: Message) -> None:
+	registration_error = await _airport_registration_error()
+	if registration_error:
+		await message.reply(registration_error, parse_mode="HTML")
+		return
+
 	await message.reply(
 		_airport_access_text(),
 		parse_mode="HTML",
@@ -2755,6 +2804,15 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 
 @dp.callback_query(F.data == "airport:access:request")
 async def on_airport_access_request(callback: CallbackQuery) -> None:
+	registration_error = await _airport_registration_error()
+	if registration_error:
+		await callback.answer(
+			registration_error,
+			show_alert=True,
+			cache_time=0,
+		)
+		return
+
 	user_id = int(callback.from_user.id)
 	now_timestamp = int(datetime.now().timestamp())
 	user_expire = user_expire_cache.get(user_id)

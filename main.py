@@ -91,11 +91,30 @@ batch_store = BatchStore(db_path=user_expire_db_path)
 received_media_store = ReceivedMediaStore(db_path=user_expire_db_path)
 shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 
-from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_COST_MINUTES, MESSAGE_EXTEND_MINUTES, MAX_VALID_DURATION_MINUTES
+from config import (
+	MAX_VALID_DURATION_MINUTES,
+	MEDIA_UPLOAD_EXTEND_MINUTES,
+	MEDIA_VIEW_COST_MINUTES,
+	MESSAGE_EXTEND_MINUTES,
+)
 from textwrap import dedent
 
 UTC8 = timezone(timedelta(hours=8))
 
+# 私聊文字包含以下任一字串时，不进行后续处理。
+IGNORED_TEXT_SUBSTRINGS = (
+	"早上好",
+	"中午好",
+	"下午好",
+	"晚上好",
+	"凌晨好",
+	"新的一天",
+	"起飞",
+	"发个言",
+	"爬楼",
+	"打卡",
+	"撸个管"
+)
 
 
 if not BOT_TOKEN:
@@ -2558,7 +2577,7 @@ async def _airport_registration_error() -> str | None:
 			"若您希望进入「镇泰飞机场」搭乘航班，请联系已在航站内的旅客，请对方通过塔台机器人：「建立单人审核邀请」功能生成专属登机邀请连结。持该邀请连结完成入场审核后，即可获准进入「镇泰飞机场」。\n"
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
-			"您可以前往熟悉的正太群组或废弃机场，向其他群友询问：是否能协助提供「飞机场入场邀请连结」「求镇泰飞机场邀请连结」。\n"
+			"您可以前往熟悉的正太群组或废弃机场，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
 			"\n"
 			"\n"
 			"感谢您的理解与配合，祝您旅途愉快，顺利起飞 ✈️\n"
@@ -3206,11 +3225,13 @@ async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
 		f"{actual_added_seconds} seconds for applicant {context.user_id}",
 		flush=True,
 	)
+	invited_user_name = str(context.request.from_user.full_name or context.user_id)
 	try:
 		if actual_added_seconds > 0:
 			text = (
 				"🎉 推荐成功\n\n"
 				"你建立的单人邀请已有一位旅客通过审核。\n"
+				f"受邀旅客：{invited_user_name}。\n"
 				"飞行通行证奖励：2 天。\n"
 				f"本次实际增加：{_format_duration(actual_added_seconds)}。\n"
 				f"当前剩余时间：{_format_duration(remaining_seconds)}。"
@@ -3219,6 +3240,7 @@ async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
 			text = (
 				"🎉 推荐成功\n\n"
 				"你建立的单人邀请已有一位旅客通过审核。\n"
+				f"受邀旅客：{invited_user_name}。\n"
 				"由于飞行通行证已达到 3 天上限，本次未再增加期限。"
 			)
 		await bot.send_message(chat_id=context.inviter_user_id, text=text)
@@ -3968,9 +3990,10 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 					"👍 你可以:\n"
 					"回覆对已搭乘班机资源的体验与点评\n"
 					"回应其他旅客的发言\n\n"
-					"👎 不建议:\n"
+					"👎 不建议: (可能会被踢)\n"
 					"发问候语\n"
 					"述说需要发言\n"
+					"硬要发言\n"
 				),
 				parse_mode="HTML",
 				show_alert=True,
@@ -4140,7 +4163,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		takeoff_count = await _increment_takeoff_count(callback.message)
 		print(f"{callback.message.chat.id}/{callback.message.message_id} takeoff count updated: {takeoff_count}", flush=True)
 
-		if takeoff_count and (takeoff_count == 3 or takeoff_count == 9 or takeoff_count == 12):
+		if takeoff_count and (takeoff_count == 5 or takeoff_count == 10 or takeoff_count == 20):
 			message_url = f"https://t.me/c/{str(chat_id).lstrip('-100')}/{message_id}"
 			
 			text =(
@@ -4392,6 +4415,9 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 async def on_text(message: Message) -> None:
 	text = (message.text or "").strip()
 	if not text:
+		return
+
+	if any(ignored_text in text for ignored_text in IGNORED_TEXT_SUBSTRINGS):
 		return
 
 	batch_id = _extract_takeoff_batch_id(text)

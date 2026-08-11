@@ -2810,21 +2810,31 @@ async def cmd_rule(message: Message) -> None:
 @dp.message(F.chat.type == "private", Command("about"))
 @dp.message(F.chat.type == "private", Command("airport_access_request"))
 async def cmd_airport_access_request(message: Message) -> None:
-	registration_error = await _airport_registration_error()
-	if registration_error:
-		await message.reply(
-			registration_error,
-			parse_mode="HTML",
-			reply_markup=InlineKeyboardMarkup(
-				inline_keyboard=[[
-					InlineKeyboardButton(
-						text="废弃机场(无资源)",
-						url="https://t.me/+GHeK4dW-KcdlNDI1",
-					),
-				]],
-			),
-		)
+
+	if MESSAGE_REWARD_CHAT_ID == 0:
+		await message.reply("❌ 航站大厅尚未配置，请联系塔台。")
 		return
+
+	user_id = int(message.from_user.id)
+	if not await _is_member_of_chat(
+		MESSAGE_REWARD_CHAT_ID,
+		user_id,
+	):
+		registration_error = await _airport_registration_error()
+		if registration_error:
+			await message.reply(
+				registration_error,
+				parse_mode="HTML",
+				reply_markup=InlineKeyboardMarkup(
+					inline_keyboard=[[
+						InlineKeyboardButton(
+							text="废弃机场(无资源)",
+							url="https://t.me/+GHeK4dW-KcdlNDI1",
+						),
+					]],
+				),
+			)
+			return
 
 	await message.reply(
 		_airport_access_text(),

@@ -2862,7 +2862,8 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
 			"请先上传 10 个「正太」媒体资源 ( 给我，镇泰塔台 )，再重新申请。\n"
 			"\n"
-			"‼️ 不同系列放在同批上传，将被拉黑，请分批上传。\n"
+			"‼️ 不同系列请不要在同批混在一起上传，请分批上传。\n"
+			"‼️ 不同系列若混在同批一起上传，有可能会被拉黑。\n"
 		)
 
 		await callback.answer(

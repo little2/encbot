@@ -94,8 +94,11 @@ shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 from config import (
 	MAX_VALID_DURATION_MINUTES,
 	MEDIA_UPLOAD_EXTEND_MINUTES,
+	OTHERS_UPLOAD_EXTEND_MINUTES,
+	PHOTO_UPLOAD_EXTEND_MINUTES,
 	MEDIA_VIEW_COST_MINUTES,
 	MESSAGE_EXTEND_MINUTES,
+	VIDEO_UPLOAD_EXTEND_MINUTES,
 )
 from textwrap import dedent
 
@@ -104,6 +107,9 @@ UTC8 = timezone(timedelta(hours=8))
 # 私聊文字包含以下任一字串时，不进行后续处理。
 IGNORED_TEXT_SUBSTRINGS = (
 	"早上好",
+	"大家好",
+	"早早",
+	"早啊",
 	"中午好",
 	"下午好",
 	"晚上好",
@@ -1591,7 +1597,14 @@ async def _send_encoded_snapshot(
 				# 	return  # 实际代码中应继续更新 UI，而非直接退出函数
 
 				if accepted_count > 0:
-					requested_minutes = accepted_count * MEDIA_UPLOAD_EXTEND_MINUTES
+					for item in items:
+						file_type = str(item.get("file_type", ""))
+						if file_type == "photo":
+							requested_minutes += PHOTO_UPLOAD_EXTEND_MINUTES
+						elif file_type == "video":
+							requested_minutes += VIDEO_UPLOAD_EXTEND_MINUTES
+						else:
+							requested_minutes += OTHERS_UPLOAD_EXTEND_MINUTES
 				
 				user_expire = user_expire_cache.extend_minutes(
 					owner_user_id,
@@ -2787,7 +2800,9 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 
 @dp.message(F.chat.type == "private", Command("rule"))
 async def cmd_rule(message: Message) -> None:
-	upload_extend_text = minutes_to_day_hour(MEDIA_UPLOAD_EXTEND_MINUTES)[0]
+	photo_upload_extend_text = minutes_to_day_hour(PHOTO_UPLOAD_EXTEND_MINUTES)[0]
+	video_upload_extend_text = minutes_to_day_hour(VIDEO_UPLOAD_EXTEND_MINUTES)[0]
+	others_upload_extend_text = minutes_to_day_hour(OTHERS_UPLOAD_EXTEND_MINUTES)[0]
 	view_cost_text = minutes_to_day_hour(MEDIA_VIEW_COST_MINUTES)[0]
 	message_extend_text = minutes_to_day_hour(MESSAGE_EXTEND_MINUTES)[0]
 	max_duration_text = minutes_to_day_hour(MAX_VALID_DURATION_MINUTES)[0]
@@ -2796,7 +2811,9 @@ async def cmd_rule(message: Message) -> None:
 		"📋 镇泰塔台当前规则\n\n"
 		"<i>飞行通行证期限是镇泰飞机场查看媒体的有效时间，通行证有效时间可以通过分享媒体、群组发言来延长；请求媒体会消耗通行证有效时间。</i>\n\n"
 		"1️⃣ 分享媒体奖励\n"
-		f"每成功分享一个媒体，增加 {upload_extend_text}。\n\n"
+		f"每成功分享一张图片，增加 {photo_upload_extend_text}。\n"
+		f"每成功分享一个视频，增加 {video_upload_extend_text}。\n"
+		f"每成功分享一个其他媒体，增加 {others_upload_extend_text}。\n\n"
 		"2️⃣ 请求媒体消耗(飞机场)\n"
 		f"每请求一个媒体，消耗 {view_cost_text}。\n\n"
 		"3️⃣ 群组(航站大厅)发言奖励\n"
@@ -3580,7 +3597,7 @@ async def on_reward_group_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
 		return
 	text = (message.text or "").strip()
-	if not text or text.startswith("/"):
+	if len(text) < 2 or text.startswith("/"):
 		return
 
 	if any(ignored_text in text for ignored_text in IGNORED_TEXT_SUBSTRINGS):

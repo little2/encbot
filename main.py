@@ -3583,6 +3583,10 @@ async def on_reward_group_message(message: Message) -> None:
 	if not text or text.startswith("/"):
 		return
 
+	if any(ignored_text in text for ignored_text in IGNORED_TEXT_SUBSTRINGS):
+		return
+
+
 	user_id = int(message.from_user.id)
 	now_timestamp = int(datetime.now().timestamp())
 	previous_user_expire = user_expire_cache.get(user_id)
@@ -4428,8 +4432,7 @@ async def on_text(message: Message) -> None:
 	if not text:
 		return
 
-	if any(ignored_text in text for ignored_text in IGNORED_TEXT_SUBSTRINGS):
-		return
+
 
 	batch_id = _extract_takeoff_batch_id(text)
 	if batch_id:

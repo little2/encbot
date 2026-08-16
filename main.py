@@ -93,6 +93,7 @@ shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 
 from config import (
 	MAX_VALID_DURATION_MINUTES,
+	INACTIVE_EXPIRE_DAYS,
 	MEDIA_UPLOAD_EXTEND_MINUTES,
 	OTHERS_UPLOAD_EXTEND_MINUTES,
 	PHOTO_UPLOAD_EXTEND_MINUTES,
@@ -113,13 +114,16 @@ IGNORED_TEXT_SUBSTRINGS = (
 	"中午好",
 	"下午好",
 	"晚上好",
+	"晚好",
 	"凌晨好",
 	"新的一天",
 	"起飞",
+	"飞飞飞",
 	"发个言",
 	"爬楼",
 	"打卡",
-	"撸个管"
+	"撸个管",
+	"插眼"
 )
 
 
@@ -175,6 +179,7 @@ PAID_INVITE_COST_MINUTES = 24 * 60
 PAID_INVITE_REWARD_MINUTES = 2 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
 PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
+INACTIVE_CANDIDATE_PAGE_SIZE = 20
 PAID_INVITE_NAME_PATTERN = re.compile(
 	r"^PI1\.([0-9a-z]{1,13})\.([0-9a-z]{5})\.([A-Za-z0-9_-]{8})$"
 )
@@ -254,6 +259,7 @@ JOIN_MODE = "invite"  # 可选值: "invite" 或 "request"
 
 
 ENCODED_FORWARD_SEND_LOCK = asyncio.Lock()
+INACTIVE_CLEANUP_LOCK = asyncio.Lock()
 async def _telegram_call_with_retry(
     label: str,
     operation,
@@ -769,12 +775,12 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 					callback_data=f"enc:fw:{0 if no_forward else 1}",
 				)
 			],
-			[
-				InlineKeyboardButton(
-					text="🙈 目前已启用防剧透模式" if state.get("if_spoiler", False) else "🐵 目前未启用防剧透模式",
-					callback_data=f"enc:sp:{0 if state.get('if_spoiler', False) else 1}",
-					)
-			],
+			# [
+			# 	InlineKeyboardButton(
+			# 		text="🙈 目前已启用防剧透模式" if state.get("if_spoiler", False) else "🐵 目前未启用防剧透模式",
+			# 		callback_data=f"enc:sp:{0 if state.get('if_spoiler', False) else 1}",
+			# 		)
+			# ],
 			[
 				InlineKeyboardButton(
 					text="🕶️ 目前不显示上传者" if anonymous else "👤 目前显示上传者",
@@ -1812,6 +1818,7 @@ async def _finish_upload(
 		for item in items
 		if item.get("file_type") == "video"
 	]
+
 	state = {
 		"owner_user_id": key[1],
 		"user_id": key[1],
@@ -2047,6 +2054,7 @@ async def _ban_user(
 	created_by: int,
 ) -> tuple[BlacklistEntry, str]:
 	entry = blacklist_store.ban(user_id, reason, created_by)
+	user_expire_cache.remove(user_id)
 	if MESSAGE_REWARD_CHAT_ID == 0:
 		return entry, "MESSAGE_REWARD_CHAT_ID 尚未配置"
 
@@ -2235,6 +2243,311 @@ async def cmd_banlist(message: Message, command: CommandObject) -> None:
 			f"{_format_timestamp_utc8(entry.created_at)}"
 		)
 	await message.reply("\n".join(lines))
+
+
+def _inactive_cutoff_timestamp(now_timestamp: int | None = None) -> int:
+	now_timestamp = now_timestamp or int(datetime.now().timestamp())
+	return now_timestamp - INACTIVE_EXPIRE_DAYS * 24 * 60 * 60
+
+
+def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
+	user_id = int(user_id)
+	if user_id in ADMIN_USER_IDS or blacklist_store.is_blocked(user_id):
+		return False
+	bot_user_id = int(getattr(bot, "id", 0) or 0)
+	if bot_user_id and user_id == bot_user_id:
+		return False
+	user_expire = user_expire_cache.get(user_id)
+	return bool(
+		user_expire
+		and user_expire.expire_timestamp <= _inactive_cutoff_timestamp(now_timestamp)
+	)
+
+
+def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]:
+	candidates = [
+		(user_id, user_expire)
+		for user_id, user_expire in list(user_expire_cache.users.items())
+		if _is_inactive_candidate(user_id, now_timestamp)
+	]
+	return sorted(
+		candidates,
+		key=lambda item: (item[1].expire_timestamp, item[0]),
+	)
+
+
+def _chat_member_status_text(status: Any) -> str:
+	status_name = str(getattr(status, "status", "unknown"))
+	return {
+		"creator": "群主",
+		"administrator": "管理员",
+		"member": "成员",
+		"restricted": "受限成员" if getattr(status, "is_member", False) else "不在群内",
+		"left": "不在群内",
+		"kicked": "已封禁",
+	}.get(status_name, status_name)
+
+
+async def _lookup_inactive_chat_status(chat_id: int, user_id: int) -> str:
+	if chat_id == 0:
+		return "未配置"
+	try:
+		status = await _telegram_call_with_retry(
+			f"lookup inactive member {user_id} in {chat_id}",
+			lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id),
+		)
+		return _chat_member_status_text(status)
+	except Exception as exc:
+		error_text = str(exc).replace("\n", " ")
+		return f"查询失败({error_text[:50]})"
+
+
+async def _remove_inactive_user_from_chat(
+	chat_id: int,
+	user_id: int,
+	chat_name: str,
+) -> tuple[bool, str]:
+	if chat_id == 0:
+		return False, f"{chat_name}未配置"
+
+	try:
+		status = await _telegram_call_with_retry(
+			f"lookup inactive member {user_id} in {chat_id}",
+			lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id),
+		)
+	except Exception as exc:
+		return False, f"{chat_name}成员状态查询失败：{exc}"
+
+	status_name = str(getattr(status, "status", "unknown"))
+	if status_name == "kicked":
+		try:
+			await _telegram_call_with_retry(
+				f"unban inactive member {user_id} from {chat_id}",
+				lambda: bot.unban_chat_member(
+					chat_id=chat_id,
+					user_id=user_id,
+					only_if_banned=True,
+				),
+			)
+		except Exception as exc:
+			return False, f"{chat_name}解除封禁失败：{exc}"
+		return True, f"{chat_name}已解除旧封禁"
+
+	if not _is_current_chat_member(status):
+		return True, f"{chat_name}原本不在群内"
+
+	try:
+		await _telegram_call_with_retry(
+			f"remove inactive member {user_id} from {chat_id}",
+			lambda: bot.ban_chat_member(chat_id=chat_id, user_id=user_id),
+		)
+		await _telegram_call_with_retry(
+			f"unban removed inactive member {user_id} from {chat_id}",
+			lambda: bot.unban_chat_member(
+				chat_id=chat_id,
+				user_id=user_id,
+				only_if_banned=True,
+			),
+		)
+	except Exception as exc:
+		return False, f"{chat_name}移出失败：{exc}"
+	return True, f"{chat_name}已移出"
+
+
+@dp.message(Command("inactive_candidate"))
+async def cmd_inactive_candidate(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		return
+
+	page_text = str(command.args or "").strip()
+	page = _parse_positive_user_id(page_text) if page_text else 1
+	if page is None:
+		await message.reply("用法：/inactive_candidate [页码]")
+		return
+
+	now_timestamp = int(datetime.now().timestamp())
+	candidates = _get_inactive_candidates(now_timestamp)
+	if not candidates:
+		await message.reply(
+			f"目前没有通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天的用户"
+		)
+		return
+
+	total = len(candidates)
+	total_pages = (total + INACTIVE_CANDIDATE_PAGE_SIZE - 1) // INACTIVE_CANDIDATE_PAGE_SIZE
+	if page > total_pages:
+		await message.reply(f"❌ 页码超出范围，共 {total_pages} 页")
+		return
+
+	start = (page - 1) * INACTIVE_CANDIDATE_PAGE_SIZE
+	page_candidates = candidates[start:start + INACTIVE_CANDIDATE_PAGE_SIZE]
+	lines = [
+		f"🧹 不活跃候选名单（第 {page}/{total_pages} 页，共 {total} 人）",
+		f"条件：通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天",
+	]
+	for user_id, user_expire in page_candidates:
+		airport_status = await _lookup_inactive_chat_status(
+			ENCODED_FORWARD_CHAT_ID,
+			user_id,
+		)
+		lobby_status = await _lookup_inactive_chat_status(
+			MESSAGE_REWARD_CHAT_ID,
+			user_id,
+		)
+		expired_days = max(
+			0,
+			(now_timestamp - user_expire.expire_timestamp) // (24 * 60 * 60),
+		)
+		lines.append(
+			f"\n{user_id}｜过期 {expired_days} 天｜"
+			f"{_format_timestamp_utc8(user_expire.expire_timestamp)}\n"
+			f"飞机场：{airport_status}｜大厅：{lobby_status}"
+		)
+	await message.reply("\n".join(lines))
+
+
+@dp.message(Command("inactive_cleanup"))
+async def cmd_inactive_cleanup(message: Message) -> None:
+	if not _is_admin_message(message):
+		return
+	if INACTIVE_CLEANUP_LOCK.locked():
+		await message.reply("⏳ 不活跃用户清理正在执行，请稍后再试")
+		return
+	if ENCODED_FORWARD_CHAT_ID == 0 or MESSAGE_REWARD_CHAT_ID == 0:
+		await message.reply("❌ 飞机场或航站大厅尚未配置，无法执行清理")
+		return
+
+	async with INACTIVE_CLEANUP_LOCK:
+		now_timestamp = int(datetime.now().timestamp())
+		candidates = _get_inactive_candidates(now_timestamp)
+		if not candidates:
+			await message.reply(
+				f"目前没有通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天的用户"
+			)
+			return
+
+		await message.reply(f"🧹 开始检查并清理 {len(candidates)} 名候选用户")
+		removed_user_ids: list[int] = []
+		skipped_user_ids: list[int] = []
+		failed_results: list[str] = []
+		broadcast_failed_results: list[str] = []
+
+		for user_id, _ in candidates:
+			check_timestamp = int(datetime.now().timestamp())
+			if not _is_inactive_candidate(user_id, check_timestamp):
+				skipped_user_ids.append(user_id)
+				continue
+
+			user_expire = user_expire_cache.get(user_id)
+			expired_days = max(
+				0,
+				(check_timestamp - user_expire.expire_timestamp) // (24 * 60 * 60),
+			) if user_expire else INACTIVE_EXPIRE_DAYS
+			try:
+				await _telegram_call_with_retry(
+					f"notify inactive member {user_id}",
+					lambda: bot.send_message(
+						chat_id=user_id,
+						text=(
+							"🛫 机场成员清理通知\n\n"
+							f"你的飞行通行证已经过期 {expired_days} 天，"
+							f"超过机场设定的 {INACTIVE_EXPIRE_DAYS} 天不活跃期限。"
+							"系统将你移出「镇泰飞机场」和「航站大厅」，"
+							"并清除相关通行证数据。\n\n"
+							"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
+						),
+					),
+				)
+			except Exception as exc:
+				print(
+					f"[INACTIVE_CLEANUP] notice failed for user {user_id}: {exc}",
+					flush=True,
+				)
+
+			if not _is_inactive_candidate(user_id, int(datetime.now().timestamp())):
+				skipped_user_ids.append(user_id)
+				continue
+
+			airport_ok, airport_result = await _remove_inactive_user_from_chat(
+				ENCODED_FORWARD_CHAT_ID,
+				user_id,
+				"飞机场",
+			)
+			lobby_ok, lobby_result = await _remove_inactive_user_from_chat(
+				MESSAGE_REWARD_CHAT_ID,
+				user_id,
+				"航站大厅",
+			)
+			if not airport_ok or not lobby_ok:
+				failed_results.append(
+					f"{user_id}：{airport_result}；{lobby_result}"
+				)
+				continue
+
+			try:
+				await _telegram_call_with_retry(
+					f"broadcast inactive cleanup for {user_id}",
+					lambda: bot.send_message(
+						chat_id=MESSAGE_REWARD_CHAT_ID,
+						text=(
+							"🧹 长期不活跃成员清理\n\n"
+							f'<a href="tg://user?id={user_id}">旅客 {user_id}</a> '
+							f"的飞行通行证已过期 {expired_days} 天，"
+							"现已从「镇泰飞机场」与「航站大厅」移出。\n\n"
+							"本次属于不活跃成员整理，不是黑名单封禁，"
+							"之后仍可按照届时的入场规则重新申请加入。"
+						),
+						parse_mode="HTML",
+					),
+				)
+			except Exception as exc:
+				broadcast_failed_results.append(f"{user_id}：{exc}")
+				print(
+					f"[INACTIVE_CLEANUP] lobby broadcast failed for "
+					f"user {user_id}: {exc}",
+					flush=True,
+				)
+
+			try:
+				user_expire_cache.remove(user_id)
+			except Exception as exc:
+				failed_results.append(f"{user_id}：数据库删除失败：{exc}")
+				continue
+
+			PENDING_AIRPORT_JOIN_INVITES.pop(user_id, None)
+			AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
+			AIRPORT_QUIZ_RETRY_AT.pop(user_id, None)
+			AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
+			removed_user_ids.append(user_id)
+			print(
+				f"[INACTIVE_CLEANUP] removed user {user_id}: "
+				f"{airport_result}; {lobby_result}; database deleted",
+				flush=True,
+			)
+
+		summary_lines = [
+			"✅ 不活跃用户清理完成",
+			f"候选：{len(candidates)} 人",
+			f"成功：{len(removed_user_ids)} 人",
+			f"跳过：{len(skipped_user_ids)} 人",
+			f"失败：{len(failed_results)} 人",
+			f"大厅广播失败：{len(broadcast_failed_results)} 人",
+		]
+		if removed_user_ids:
+			summary_lines.append(
+				"成功用户：" + ", ".join(map(str, removed_user_ids[:50]))
+			)
+		if skipped_user_ids:
+			summary_lines.append(
+				"跳过用户：" + ", ".join(map(str, skipped_user_ids[:50]))
+			)
+		if failed_results:
+			summary_lines.append("失败详情：\n" + "\n".join(failed_results[:20]))
+		if broadcast_failed_results:
+			summary_lines.append(
+				"广播失败详情：\n" + "\n".join(broadcast_failed_results[:20])
+			)
+		await message.reply("\n".join(summary_lines))
 
 
 def _base36_encode(value: int) -> str:

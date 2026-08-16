@@ -2979,12 +2979,20 @@ def _airport_access_text() -> str:
 	""").strip()
 
 
+AIRPORT_ACCESS_REQUEST_TTL_SECONDS = 30 * 60
+
+
+def _airport_access_request_callback_data(now_timestamp: int | None = None) -> str:
+	stamp = int(now_timestamp if now_timestamp is not None else datetime.now().timestamp())
+	return f"airport:access:request:{stamp}"
+
+
 def _airport_access_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(
 		inline_keyboard=[[
 			InlineKeyboardButton(
 				text="✈️ 申请进入机场",
-				callback_data="airport:access:request",
+				callback_data=_airport_access_request_callback_data(),
 			)
 		]],
 	)
@@ -3306,12 +3314,38 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 	await cmd_airport_access_request(message)
 
 
-@dp.callback_query(F.data == "airport:access:request")
+@dp.callback_query(F.data.startswith("airport:access:request"))
 async def on_airport_access_request(callback: CallbackQuery) -> None:
+	data = str(callback.data or "")
+	parts = data.split(":")
+	if len(parts) != 4 or parts[:3] != ["airport", "access", "request"]:
+		await callback.answer(
+			"此入场申请已失效，请重新打开机场入口。",
+			show_alert=True,
+			cache_time=0,
+		)
+		return
 
+	try:
+		issued_at = int(parts[3])
+	except ValueError:
+		await callback.answer(
+			"此入场申请已失效，请重新打开机场入口。",
+			show_alert=True,
+			cache_time=0,
+		)
+		return
+
+	now_timestamp = int(datetime.now().timestamp())
+	if now_timestamp - issued_at > AIRPORT_ACCESS_REQUEST_TTL_SECONDS:
+		await callback.answer(
+			"此入场申请已超过 30 分钟有效期，请重新打开机场入口。",
+			show_alert=True,
+			cache_time=0,
+		)
+		return
 
 	user_id = int(callback.from_user.id)
-	now_timestamp = int(datetime.now().timestamp())
 	user_expire = user_expire_cache.get(user_id)
 	remaining_seconds = max(
 		0,

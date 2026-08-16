@@ -99,6 +99,7 @@ from config import (
 	PHOTO_UPLOAD_EXTEND_MINUTES,
 	MEDIA_VIEW_COST_MINUTES,
 	MESSAGE_EXTEND_MINUTES,
+	REWARD_HOURS_PER_MEDIA,
 	VIDEO_UPLOAD_EXTEND_MINUTES,
 )
 from textwrap import dedent
@@ -3320,7 +3321,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
-			"请先上传 10 个「正太」媒体资源 ( 给我，镇泰塔台 )，再重新申请。\n"
+			"请先上传「正太」媒体视频资源 ( 给我，镇泰塔台 )，再重新申请。\n"
 			"\n"
 			"‼️ 不同系列请不要在同批混在一起上传，请分批上传。\n"
 			"‼️ 不同系列若混在同批一起上传，有可能会被拉黑。\n"
@@ -4746,6 +4747,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		parsed = UtfConverter.parse_file_token(token)
 		parsed_items = list(parsed.get("items", []))
 		requested_qty = len(parsed_items) if parsed_items else 1
+		uploader_id = int(parsed.get("user_id", 0) or 0)
 		valid_until_dt = datetime.strptime(
 			str(parsed["valid_until"]),
 			"%Y%m%d%H%M%S",
@@ -4895,7 +4897,6 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				])
 
 			if is_admin:
-				uploader_id = int(parsed.get("user_id", 0) or 0)
 				source_chat_id = int(callback.message.chat.id)
 				source_message_id = int(callback.message.message_id)
 				uploader_text = await get_user_hyperlink(
@@ -4939,15 +4940,79 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 	try:
 		takeoff_count = await _increment_takeoff_count(callback.message)
 		print(f"{callback.message.chat.id}/{callback.message.message_id} takeoff count updated: {takeoff_count}", flush=True)
+	except Exception as exc:
+		print(f"[TAKEOFF] counter update failed: {exc}", flush=True)
+		takeoff_count = 0
 
-		if takeoff_count and (takeoff_count == 5 or takeoff_count == 10 or takeoff_count == 20):
-			message_url = f"https://t.me/c/{str(chat_id).lstrip('-100')}/{message_id}"
-			
-			text =(
-				f"📢 <b>航站广播：</b>目前已有 <code><b>{takeoff_count}</b></code> 位旅客搭乘 <b><a href=\"{message_url}\">ZT-{message_id}</a></b> 航班。\n"
-				f"尚未登机的旅客，请尽速前往 <b><a href=\"{message_url}\">登机口</a></b> 办理登机手续。"
+	reward_actual_minutes: int | None = None
+	reward_expire_timestamp: int | None = None
+	if takeoff_count in (10, 20):
+		if uploader_id > 0:
+			try:
+				reward_minutes = requested_qty * REWARD_HOURS_PER_MEDIA * 60
+				reward_now_timestamp = int(datetime.now().timestamp())
+				previous_uploader_expire = user_expire_cache.get(uploader_id)
+				reward_base_timestamp = max(
+					reward_now_timestamp,
+					previous_uploader_expire.expire_timestamp
+					if previous_uploader_expire
+					else 0,
+				)
+				updated_uploader = user_expire_cache.extend_minutes(
+					uploader_id,
+					reward_minutes,
+				)
+				reward_actual_minutes = max(
+					0,
+					(updated_uploader.expire_timestamp - reward_base_timestamp) // 60,
+				)
+				reward_expire_timestamp = updated_uploader.expire_timestamp
+			except Exception as exc:
+				print(
+					f"[TAKEOFF] milestone reward failed for uploader "
+					f"{uploader_id}: {exc}",
+					flush=True,
+				)
+		else:
+			print(
+				f"[TAKEOFF] milestone reward skipped: invalid uploader "
+				f"for {chat_id}/{message_id}",
+				flush=True,
 			)
 
+		if reward_actual_minutes is not None and reward_expire_timestamp is not None:
+			try:
+				await bot.send_message(
+					chat_id=uploader_id,
+					text=(
+						f"🎉 你的航班 ZT-{message_id} 已达到 "
+						f"{takeoff_count} 次成功起飞。\n"
+						f"航班媒体数：{requested_qty}\n"
+						f"理论奖励：{minutes_to_day_hour(requested_qty * REWARD_HOURS_PER_MEDIA * 60)[0]}\n"
+						f"实际增加：{minutes_to_day_hour(reward_actual_minutes)[0]}\n"
+						f"到期时间：{_format_timestamp_utc8(reward_expire_timestamp)}"
+					),
+				)
+			except Exception as exc:
+				print(
+					f"[TAKEOFF] milestone notice failed for uploader "
+					f"{uploader_id}: {exc}",
+					flush=True,
+				)
+
+	if takeoff_count in (5, 10, 20):
+		message_url = f"https://t.me/c/{str(chat_id).lstrip('-100')}/{message_id}"
+		text = (
+			f"📢 <b>航站广播：</b>目前已有 <code><b>{takeoff_count}</b></code> "
+			f"位旅客搭乘 <b><a href=\"{message_url}\">ZT-{message_id}</a></b> 航班。\n"
+			f"尚未登机的旅客，请尽速前往 "
+			f"<b><a href=\"{message_url}\">登机口</a></b> 办理登机手续。"
+		)
+		try:
+			if reward_actual_minutes is not None:
+				text += (
+					f"\n\n🎉 已奖励上传者 {minutes_to_day_hour(reward_actual_minutes)[0]} 的飞行通行证期限。"
+				)
 
 			discussion_location = batch_store.get_discussion_location(
 				int(chat_id),
@@ -4967,9 +5032,8 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				parse_mode="HTML",
 				**reply_parameters,
 			)
-
-	except Exception as exc:
-		print(f"[TAKEOFF] counter update failed: {exc}", flush=True)
+		except Exception as exc:
+			print(f"[TAKEOFF] lobby broadcast failed: {exc}", flush=True)
 
 	await callback.answer(
 		url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",

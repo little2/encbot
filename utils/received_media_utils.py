@@ -111,6 +111,90 @@ class ReceivedMediaStore:
                 """, (reusable_file_id, unique_id))
         return cursor.rowcount > 0
 
+    def is_accepted(self, file_unique_id: str) -> bool:
+        row = self.connection.execute("""
+            SELECT 1
+            FROM received_media
+            WHERE file_unique_id = ? AND status = 'accepted'
+            LIMIT 1
+        """, (str(file_unique_id),)).fetchone()
+        return row is not None
+
+    def claim_batch(
+        self,
+        items: list[dict],
+        user_id: int,
+        batch_id: str,
+    ) -> list[str]:
+        normalized_batch_id = str(batch_id or "").strip()
+        if not normalized_batch_id:
+            raise ValueError("batch_id is required")
+        if len(normalized_batch_id) > 64:
+            raise ValueError("batch_id cannot exceed 64 characters")
+
+        rows: list[tuple[str, str, str, int, int, int, str, int]] = []
+        seen: set[str] = set()
+        for item in items:
+            file_unique_id = str(item.get("file_unique_id", "")).strip()
+            if not file_unique_id or file_unique_id in seen:
+                continue
+            seen.add(file_unique_id)
+            rows.append((
+                file_unique_id,
+                str(item.get("file_id", "")),
+                str(item.get("file_type", "")),
+                int(user_id),
+                int(item.get("source_chat_id", 0)),
+                int(item.get("source_message_id", 0)),
+                normalized_batch_id,
+                int(time.time()),
+            ))
+        if not rows:
+            raise ValueError("media items are required")
+
+        file_unique_ids = [row[0] for row in rows]
+        placeholders = ",".join("?" for _ in file_unique_ids)
+        with self.connection:
+            # 旧版会在上传阶段留下 batch_id 为空的 pending 记录；这些记录
+            # 不代表用户已经确认送出，可以由本次确认安全取代。
+            self.connection.execute(
+                f"""
+                    DELETE FROM received_media
+                    WHERE status = 'pending'
+                      AND batch_id IS NULL
+                      AND file_unique_id IN ({placeholders})
+                """,
+                tuple(file_unique_ids),
+            )
+            existing_rows = self.connection.execute(
+                f"""
+                    SELECT file_unique_id
+                    FROM received_media
+                    WHERE file_unique_id IN ({placeholders})
+                """,
+                tuple(file_unique_ids),
+            ).fetchall()
+            conflicts = [str(row[0]) for row in existing_rows]
+            if conflicts:
+                return conflicts
+
+            self.connection.executemany("""
+                INSERT INTO received_media (
+                    file_unique_id,
+                    file_id,
+                    file_type,
+                    first_user_id,
+                    source_chat_id,
+                    source_message_id,
+                    status,
+                    batch_id,
+                    created_at,
+                    accepted_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
+            """, rows)
+        return []
+
     def release_pending(
         self,
         file_unique_id: str,
@@ -152,6 +236,17 @@ class ReceivedMediaStore:
             )
         return max(0, int(cursor.rowcount))
 
+    def release_pending_batch(self, batch_id: str) -> int:
+        normalized_batch_id = str(batch_id or "").strip()
+        if not normalized_batch_id:
+            return 0
+        with self.connection:
+            cursor = self.connection.execute("""
+                DELETE FROM received_media
+                WHERE status = 'pending' AND batch_id = ?
+            """, (normalized_batch_id,))
+        return max(0, int(cursor.rowcount))
+
     def accept_batch(
         self,
         file_unique_ids: list[str],
@@ -181,9 +276,10 @@ class ReceivedMediaStore:
                         accepted_at = ?,
                         batch_id = ?
                     WHERE status = 'pending'
+                      AND batch_id = ?
                       AND file_unique_id IN ({placeholders})
                 """,
-                (accepted_at, normalized_batch_id, *unique_ids),
+                (accepted_at, normalized_batch_id, normalized_batch_id, *unique_ids),
             )
         return max(0, int(cursor.rowcount))
 

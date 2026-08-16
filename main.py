@@ -775,12 +775,12 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 					callback_data=f"enc:fw:{0 if no_forward else 1}",
 				)
 			],
-			# [
-			# 	InlineKeyboardButton(
-			# 		text="🙈 目前已启用防剧透模式" if state.get("if_spoiler", False) else "🐵 目前未启用防剧透模式",
-			# 		callback_data=f"enc:sp:{0 if state.get('if_spoiler', False) else 1}",
-			# 		)
-			# ],
+			[
+				InlineKeyboardButton(
+					text="🙈 目前已启用防剧透模式" if state.get("if_spoiler", False) else "🐵 目前未启用防剧透模式",
+					callback_data=f"enc:sp:{0 if state.get('if_spoiler', False) else 1}",
+					)
+			],
 			[
 				InlineKeyboardButton(
 					text="🕶️ 目前不显示上传者" if anonymous else "👤 目前显示上传者",
@@ -833,6 +833,8 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 		send_text = "⏳ 送出中"
 	elif sent_revision == revision:
 		send_text = "✅ 已送出"
+	elif bool(state.get("send_confirm_pending", False)):
+		send_text = "📤 确认送出"
 	elif send_status == "failed":
 		send_text = "⚠️ 送出失败，重试"
 	else:
@@ -1569,14 +1571,6 @@ async def _send_encoded_snapshot(
 			)
 		except Exception as exc:
 			print(f"[BATCH] channel location save failed: {exc}", flush=True)
-	state = ENCODER_UI_STATE.get(state_key)
-	if not state:
-		return
-
-	current_revision = int(state.get("revision", 1))
-	if success:
-		# 先记录成功版本，奖励或通知异常时也不会让按钮卡在“送出中”。
-		state["sent_revision"] = revision
 		try:
 			accepted_count = received_media_store.accept_batch(
 				[
@@ -1587,6 +1581,19 @@ async def _send_encoded_snapshot(
 			)
 		except Exception as exc:
 			print(f"[RECEIVED_MEDIA] accept failed: {exc}", flush=True)
+	else:
+		try:
+			received_media_store.release_pending_batch(batch_id)
+		except Exception as exc:
+			print(f"[RECEIVED_MEDIA] pending release failed: {exc}", flush=True)
+	state = ENCODER_UI_STATE.get(state_key)
+	if not state:
+		return
+
+	current_revision = int(state.get("revision", 1))
+	if success:
+		# 先记录成功版本，奖励或通知异常时也不会让按钮卡在“送出中”。
+		state["sent_revision"] = revision
 		if is_first_send:
 			try:
 				now_timestamp = int(datetime.now().timestamp())
@@ -1661,6 +1668,7 @@ async def _send_encoded_snapshot(
 			except Exception as exc:
 				print(f"[ENCODED_FORWARD] membership reward failed: {exc}", flush=True)
 
+	state["send_confirm_pending"] = False
 	state["send_status"] = "idle" if success or current_revision != revision else "failed"
 
 	current_encoded = str(state.get("encoded", ""))
@@ -1710,8 +1718,35 @@ async def _handle_send_encoded(
 		batch_id = secrets.token_urlsafe(12)
 		state["batch_id"] = batch_id
 
+	try:
+		conflicts = received_media_store.claim_batch(
+			items_snapshot,
+			owner_user_id,
+			batch_id,
+		)
+	except Exception as exc:
+		await callback.message.edit_reply_markup(
+			reply_markup=_build_controls_keyboard(state, encoded_snapshot),
+		)
+		await callback.answer(f"媒体确认失败：{exc}", show_alert=True)
+		return
+	if conflicts:
+		await callback.message.edit_reply_markup(
+			reply_markup=_build_controls_keyboard(state, encoded_snapshot),
+		)
+		await callback.answer(
+			"本批次包含已经送出或正在送出的媒体，请取消后重新上传。",
+			show_alert=True,
+		)
+		return
+
 	state["send_status"] = "sending"
-	await callback.answer("正在送出")
+	try:
+		await callback.answer("正在送出")
+	except Exception:
+		state["send_status"] = "failed"
+		received_media_store.release_pending_batch(batch_id)
+		raise
 	try:
 		await callback.message.edit_reply_markup(
 			reply_markup=_build_controls_keyboard(state, encoded_snapshot),
@@ -1749,11 +1784,6 @@ async def _handle_cancel_encoded(
 		return
 
 	was_sent = int(state.get("sent_revision", 0)) > 0
-	if not was_sent:
-		received_media_store.release_pending_many([
-			str(item.get("file_unique_id", ""))
-			for item in state.get("items", [])
-		])
 
 	ENCODER_UI_STATE.pop(state_key, None)
 	text = "✅ 配置已关闭，已经送出的资源不受影响。" if was_sent else "✅ 已取消，本批媒体未送出。"
@@ -1786,9 +1816,14 @@ async def _notify_media_limit(message: Message, text: str) -> None:
 
 async def _update_upload_panel(message: Message, session: dict[str, Any]) -> None:
 	count = len(session["items"])
+	next_step_text = (
+		"本批次已达上传上限，请点击“上传完成”进入编辑菜单。"
+		if count >= MAX_BATCH_MEDIA
+		else "继续发送媒体，或点击“上传完成”进入编辑菜单。"
+	)
 	text = (
 		f"📥 已收到 {count} 个媒体 ( 不同系列请一定要分开传，每批次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
-		"继续发送媒体，或点击“上传完成”进入编辑菜单。"
+		f"{next_step_text}"
 	)
 	panel_message_id = session.get("panel_message_id")
 	if panel_message_id:
@@ -1835,6 +1870,7 @@ async def _finish_upload(
 		"revision": 1,
 		"sent_revision": 0,
 		"send_status": "idle",
+		"send_confirm_pending": False,
 	}
 	token, encoded, parsed = _build_token_and_encoded(state)
 	state["token"] = token
@@ -1878,15 +1914,14 @@ async def _process_queued_media(message: Message) -> None:
 			"file_id": file_id,
 			"file_unique_id": file_unique_id,
 			"file_type": file_type,
+			"source_chat_id": int(message.chat.id),
+			"source_message_id": int(message.message_id),
 			**media_metadata,
 			**preview_info,
 		})
 		session["processed_count"] = int(session.get("processed_count", 0)) + 1
 
-		if len(session["items"]) >= MAX_BATCH_MEDIA:
-			await _finish_upload(key, message, session)
-		else:
-			await _update_upload_panel(message, session)
+		await _update_upload_panel(message, session)
 
 
 async def _media_worker(worker_id: int) -> None:
@@ -1916,12 +1951,8 @@ async def _media_worker(worker_id: int) -> None:
 					for item in session.get("items", [])
 				))
 				if file_unique_id and not was_added:
-					received_media_store.release_pending(
-						file_unique_id,
-						message.chat.id,
-						message.message_id,
-					)
 					if session:
+						session.get("file_unique_ids", set()).discard(file_unique_id)
 						session["accepted_count"] = max(
 							int(session.get("processed_count", 0)),
 							int(session.get("accepted_count", 0)) - 1,
@@ -2302,13 +2333,17 @@ async def _lookup_inactive_chat_status(chat_id: int, user_id: int) -> str:
 		return f"查询失败({error_text[:50]})"
 
 
+def _is_participant_id_error(exc: Exception) -> bool:
+	return "PARTICIPANT_ID" in str(exc).upper()
+
+
 async def _remove_inactive_user_from_chat(
 	chat_id: int,
 	user_id: int,
 	chat_name: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
 	if chat_id == 0:
-		return False, f"{chat_name}未配置"
+		return False, f"{chat_name}未配置", False
 
 	try:
 		status = await _telegram_call_with_retry(
@@ -2316,7 +2351,9 @@ async def _remove_inactive_user_from_chat(
 			lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id),
 		)
 	except Exception as exc:
-		return False, f"{chat_name}成员状态查询失败：{exc}"
+		if _is_participant_id_error(exc):
+			return False, f"{chat_name}找不到成员：PARTICIPANT_ID", True
+		return False, f"{chat_name}成员状态查询失败：{exc}", False
 
 	status_name = str(getattr(status, "status", "unknown"))
 	if status_name == "kicked":
@@ -2330,11 +2367,13 @@ async def _remove_inactive_user_from_chat(
 				),
 			)
 		except Exception as exc:
-			return False, f"{chat_name}解除封禁失败：{exc}"
-		return True, f"{chat_name}已解除旧封禁"
+			if _is_participant_id_error(exc):
+				return False, f"{chat_name}找不到成员：PARTICIPANT_ID", True
+			return False, f"{chat_name}解除封禁失败：{exc}", False
+		return True, f"{chat_name}已解除旧封禁", False
 
 	if not _is_current_chat_member(status):
-		return True, f"{chat_name}原本不在群内"
+		return True, f"{chat_name}原本不在群内", False
 
 	try:
 		await _telegram_call_with_retry(
@@ -2350,8 +2389,18 @@ async def _remove_inactive_user_from_chat(
 			),
 		)
 	except Exception as exc:
-		return False, f"{chat_name}移出失败：{exc}"
-	return True, f"{chat_name}已移出"
+		if _is_participant_id_error(exc):
+			return False, f"{chat_name}找不到成员：PARTICIPANT_ID", True
+		return False, f"{chat_name}移出失败：{exc}", False
+	return True, f"{chat_name}已移出", False
+
+
+def _delete_inactive_user_data(user_id: int) -> None:
+	user_expire_cache.remove(user_id)
+	PENDING_AIRPORT_JOIN_INVITES.pop(user_id, None)
+	AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
+	AIRPORT_QUIZ_RETRY_AT.pop(user_id, None)
+	AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
 
 
 @dp.message(Command("inactive_candidate"))
@@ -2431,6 +2480,7 @@ async def cmd_inactive_cleanup(message: Message) -> None:
 		skipped_user_ids: list[int] = []
 		failed_results: list[str] = []
 		broadcast_failed_results: list[str] = []
+		participant_record_deleted_user_ids: list[int] = []
 
 		for user_id, _ in candidates:
 			check_timestamp = int(datetime.now().timestamp())
@@ -2468,16 +2518,50 @@ async def cmd_inactive_cleanup(message: Message) -> None:
 				skipped_user_ids.append(user_id)
 				continue
 
-			airport_ok, airport_result = await _remove_inactive_user_from_chat(
-				ENCODED_FORWARD_CHAT_ID,
-				user_id,
-				"飞机场",
+			airport_ok, airport_result, airport_participant_error = (
+				await _remove_inactive_user_from_chat(
+					ENCODED_FORWARD_CHAT_ID,
+					user_id,
+					"飞机场",
+				)
 			)
-			lobby_ok, lobby_result = await _remove_inactive_user_from_chat(
-				MESSAGE_REWARD_CHAT_ID,
-				user_id,
-				"航站大厅",
+			if airport_participant_error:
+				try:
+					_delete_inactive_user_data(user_id)
+				except Exception as exc:
+					failed_results.append(f"{user_id}：数据库删除失败：{exc}")
+					continue
+				participant_record_deleted_user_ids.append(user_id)
+				removed_user_ids.append(user_id)
+				print(
+					f"[INACTIVE_CLEANUP] deleted user {user_id} data after "
+					f"PARTICIPANT_ID from airport lookup",
+					flush=True,
+				)
+				continue
+
+			lobby_ok, lobby_result, lobby_participant_error = (
+				await _remove_inactive_user_from_chat(
+					MESSAGE_REWARD_CHAT_ID,
+					user_id,
+					"航站大厅",
+				)
 			)
+			if lobby_participant_error:
+				try:
+					_delete_inactive_user_data(user_id)
+				except Exception as exc:
+					failed_results.append(f"{user_id}：数据库删除失败：{exc}")
+					continue
+				participant_record_deleted_user_ids.append(user_id)
+				removed_user_ids.append(user_id)
+				print(
+					f"[INACTIVE_CLEANUP] deleted user {user_id} data after "
+					f"PARTICIPANT_ID from lobby lookup",
+					flush=True,
+				)
+				continue
+
 			if not airport_ok or not lobby_ok:
 				failed_results.append(
 					f"{user_id}：{airport_result}；{lobby_result}"
@@ -2509,15 +2593,11 @@ async def cmd_inactive_cleanup(message: Message) -> None:
 				)
 
 			try:
-				user_expire_cache.remove(user_id)
+				_delete_inactive_user_data(user_id)
 			except Exception as exc:
 				failed_results.append(f"{user_id}：数据库删除失败：{exc}")
 				continue
 
-			PENDING_AIRPORT_JOIN_INVITES.pop(user_id, None)
-			AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
-			AIRPORT_QUIZ_RETRY_AT.pop(user_id, None)
-			AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
 			removed_user_ids.append(user_id)
 			print(
 				f"[INACTIVE_CLEANUP] removed user {user_id}: "
@@ -2532,6 +2612,7 @@ async def cmd_inactive_cleanup(message: Message) -> None:
 			f"跳过：{len(skipped_user_ids)} 人",
 			f"失败：{len(failed_results)} 人",
 			f"大厅广播失败：{len(broadcast_failed_results)} 人",
+			f"PARTICIPANT_ID 直接删除资料：{len(participant_record_deleted_user_ids)} 人",
 		]
 		if removed_user_ids:
 			summary_lines.append(
@@ -3974,35 +4055,36 @@ async def on_media(message: Message) -> None:
 		await message.reply(f"❌ 无法识别媒体: {exc}")
 		return
 
-	claimed = received_media_store.claim(
-		file_unique_id=file_unique_id,
-		file_id=file_id,
-		file_type=file_type,
-		user_id=int(message.from_user.id),
-		source_chat_id=int(message.chat.id),
-		source_message_id=int(message.message_id),
-	)
-	if not claimed:
+	if received_media_store.is_accepted(file_unique_id):
 		await _notify_media_limit(message, "此媒体已经收过，本批未计入")
 		return
 
 	if not session:
 		session = {
 			"items": [],
+			"file_unique_ids": set(),
 			"accepted_count": 0,
 			"processed_count": 0,
 			"panel_message_id": None,
 		}
 		UPLOAD_SESSIONS[key] = session
 
+	file_unique_ids = session.setdefault(
+		"file_unique_ids",
+		{
+			str(item.get("file_unique_id", ""))
+			for item in session.get("items", [])
+		},
+	)
+	if file_unique_id in file_unique_ids:
+		await _notify_media_limit(message, "此媒体已在当前批次中，本批未重复加入")
+		return
+	file_unique_ids.add(file_unique_id)
+
 	try:
 		MEDIA_QUEUE.put_nowait(message)
 	except asyncio.QueueFull:
-		received_media_store.release_pending(
-			file_unique_id,
-			message.chat.id,
-			message.message_id,
-		)
+		file_unique_ids.discard(file_unique_id)
 		if int(session["accepted_count"]) == 0:
 			UPLOAD_SESSIONS.pop(key, None)
 		await _notify_media_limit(message, "系统正在处理较多媒体，请稍后再试")
@@ -4608,6 +4690,34 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			return
 
 		if group == "send":
+			if not bool(state.get("send_confirm_pending", False)):
+				state["send_confirm_pending"] = True
+				try:
+					await callback.message.edit_reply_markup(
+						reply_markup=_build_controls_keyboard(
+							state,
+							str(state.get("encoded", "")),
+						)
+					)
+				except Exception:
+					state["send_confirm_pending"] = False
+					raise
+
+				confirm_text = (
+					"⚠️ 飞机场不是垃圾场，请确认以下设定:\n"
+					f"🔹 不收清水图\n"
+					f"🔹 不收非正太资源\n"
+					f"🔹 本次上传皆同系列\n"
+					f"🔹 小众资源才用防剧透\n"
+					"\n"
+					"若正确，再「📤 确认送出」"
+				)
+				await callback.answer(
+					confirm_text,
+					show_alert=True,
+				)
+				return
+			state["send_confirm_pending"] = False
 			await _handle_send_encoded(callback, state_key, state)
 			return
 		if group == "cancel":
@@ -4627,6 +4737,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			state["valid_mode"] = value
 		else:
 			raise ValueError("unknown control group")
+		state["send_confirm_pending"] = False
 
 		long_flash_seconds = int(state.get("video_flash_seconds", 60))
 		force_no_forward = (

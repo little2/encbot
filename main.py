@@ -144,6 +144,11 @@ OVERFLOW_NOTICE_TIME: dict[tuple[int, int], float] = {}
 TAKEOFF_COUNTER_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 TAKEOFF_COUNTS: dict[tuple[int, int], int] = {}
 TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
+TAKEOFF_KICK_LOCKS: dict[int, asyncio.Lock] = {}
+TAKEOFF_KICK_ACTION_STATE: dict[tuple[int, int, int], str] = {}
+TAKEOFF_KICK_ORIGINAL_MARKUPS: dict[
+	tuple[int, int, int], InlineKeyboardMarkup
+] = {}
 BATCH_LOCATION_LOCK = asyncio.Lock()
 PENDING_BATCH_DISCUSSION_LOCATIONS: OrderedDict[
 	tuple[int, int], tuple[int, int]
@@ -180,6 +185,11 @@ PAID_INVITE_REWARD_MINUTES = 2 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
 PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
 INACTIVE_CANDIDATE_PAGE_SIZE = 20
+TAKEOFF_KICK_REASONS = {
+	"mixed": "同批不同系列",
+	"not_shota": "非正太资源",
+	"clean": "纯清水图",
+}
 PAID_INVITE_NAME_PATTERN = re.compile(
 	r"^PI1\.([0-9a-z]{1,13})\.([0-9a-z]{5})\.([A-Za-z0-9_-]{8})$"
 )
@@ -2733,7 +2743,7 @@ def _paid_invite_confirmation_keyboard() -> InlineKeyboardMarkup:
 				callback_data="paid_invite:confirm",
 			),
 			InlineKeyboardButton(
-				text="取消",
+				text="❌ 取消",
 				callback_data="paid_invite:cancel",
 			),
 		]],
@@ -4094,6 +4104,333 @@ async def on_media(message: Message) -> None:
 	USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
 
 
+def _build_takeoff_admin_keyboard(
+	uploader_id: int,
+	source_chat_id: int,
+	source_message_id: int,
+) -> list[list[InlineKeyboardButton]]:
+	return [
+		[
+			InlineKeyboardButton(
+				text="🚫 删除消息并拉黑上传者",
+				callback_data=(
+					f"ta:b:{uploader_id}:{source_chat_id}:{source_message_id}"
+				),
+			),
+		],
+		[
+			InlineKeyboardButton(
+				text="🗑 删除消息",
+				callback_data=f"ta:d:{source_chat_id}:{source_message_id}",
+			),
+		],
+		[
+			InlineKeyboardButton(
+				text="🦶 踢出用户",
+				callback_data=(
+					f"ta:k:{uploader_id}:{source_chat_id}:{source_message_id}"
+				),
+			),
+		],
+	]
+
+
+def _build_takeoff_kick_reason_keyboard(
+	uploader_id: int,
+	source_chat_id: int,
+	source_message_id: int,
+) -> InlineKeyboardMarkup:
+	rows = [
+		[
+			InlineKeyboardButton(
+				text=reason,
+				callback_data=(
+					f"ta:kr:{code}:{uploader_id}:"
+					f"{source_chat_id}:{source_message_id}"
+				),
+			)
+		]
+		for code, reason in TAKEOFF_KICK_REASONS.items()
+	]
+	rows.append([
+		InlineKeyboardButton(
+			text="❌ 取消",
+			callback_data=(
+				f"ta:kr:cancel:{uploader_id}:"
+				f"{source_chat_id}:{source_message_id}"
+			),
+		)
+	])
+	return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _takeoff_kick_processing_keyboard() -> InlineKeyboardMarkup:
+	return InlineKeyboardMarkup(inline_keyboard=[[
+		InlineKeyboardButton(
+			text="⏳ 正在移除用户",
+			callback_data="ta:kp:wait",
+		),
+	]])
+
+
+@dp.callback_query(F.data == "ta:kp:wait")
+async def on_takeoff_kick_processing(callback: CallbackQuery) -> None:
+	await callback.answer("正在处理，请勿重复操作")
+
+
+@dp.callback_query(F.data.startswith("ta:k:"))
+async def on_takeoff_admin_kick_menu(callback: CallbackQuery) -> None:
+	if int(callback.from_user.id) not in ADMIN_USER_IDS:
+		await callback.answer("❌ 你没有权限执行此操作", show_alert=True)
+		return
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	parts = str(callback.data or "").removeprefix("ta:k:").split(":")
+	if len(parts) != 3:
+		await callback.answer("踢出用户参数无效", show_alert=True)
+		return
+	uploader_id = _parse_positive_user_id(parts[0])
+	source_chat_text = parts[1]
+	source_message_id = _parse_positive_user_id(parts[2])
+	if (
+		uploader_id is None
+		or not source_chat_text.lstrip("-").isdigit()
+		or int(source_chat_text) == 0
+		or source_message_id is None
+	):
+		await callback.answer("踢出用户参数无效", show_alert=True)
+		return
+	if uploader_id in ADMIN_USER_IDS:
+		await callback.answer("❌ 不能踢出管理员", show_alert=True)
+		return
+	if blacklist_store.is_blocked(uploader_id):
+		await callback.answer("该用户已在黑名单中，不能执行普通踢出", show_alert=True)
+		return
+	action_key = (
+		int(callback.message.chat.id),
+		int(callback.message.message_id),
+		uploader_id,
+	)
+	lock = TAKEOFF_KICK_LOCKS.setdefault(uploader_id, asyncio.Lock())
+	if lock.locked() or TAKEOFF_KICK_ACTION_STATE.get(action_key) in {
+		"processing",
+		"completed",
+	}:
+		await callback.answer("该用户正在处理或已经处理完成", show_alert=True)
+		return
+	if callback.message.reply_markup:
+		TAKEOFF_KICK_ORIGINAL_MARKUPS[action_key] = callback.message.reply_markup
+
+	await callback.message.edit_reply_markup(
+		reply_markup=_build_takeoff_kick_reason_keyboard(
+			uploader_id,
+			int(source_chat_text),
+			source_message_id,
+		)
+	)
+	await callback.answer("请选择移除理由")
+
+
+@dp.callback_query(F.data.startswith("ta:kr:"))
+async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
+	if int(callback.from_user.id) not in ADMIN_USER_IDS:
+		await callback.answer("❌ 你没有权限执行此操作", show_alert=True)
+		return
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	parts = str(callback.data or "").removeprefix("ta:kr:").split(":")
+	if len(parts) != 4:
+		await callback.answer("移除理由参数无效", show_alert=True)
+		return
+	reason_code = parts[0]
+	uploader_id = _parse_positive_user_id(parts[1])
+	source_chat_text = parts[2]
+	source_message_id = _parse_positive_user_id(parts[3])
+	if (
+		uploader_id is None
+		or not source_chat_text.lstrip("-").isdigit()
+		or int(source_chat_text) == 0
+		or source_message_id is None
+	):
+		await callback.answer("移除理由参数无效", show_alert=True)
+		return
+	source_chat_id = int(source_chat_text)
+	action_key = (
+		int(callback.message.chat.id),
+		int(callback.message.message_id),
+		uploader_id,
+	)
+	lock = TAKEOFF_KICK_LOCKS.setdefault(uploader_id, asyncio.Lock())
+
+	if reason_code == "cancel":
+		if lock.locked() or TAKEOFF_KICK_ACTION_STATE.get(action_key) in {
+			"processing",
+			"completed",
+		}:
+			await callback.answer("该用户正在处理或已经处理完成", show_alert=True)
+			return
+		original_markup = TAKEOFF_KICK_ORIGINAL_MARKUPS.pop(action_key, None)
+		if original_markup is None:
+			original_markup = InlineKeyboardMarkup(
+				inline_keyboard=_build_takeoff_admin_keyboard(
+					uploader_id,
+					source_chat_id,
+					source_message_id,
+				)
+			)
+		await callback.message.edit_reply_markup(reply_markup=original_markup)
+		await callback.answer("已取消")
+		return
+
+	reason = TAKEOFF_KICK_REASONS.get(reason_code)
+	if not reason:
+		await callback.answer("未知的移除理由", show_alert=True)
+		return
+	if uploader_id in ADMIN_USER_IDS:
+		await callback.answer("❌ 不能踢出管理员", show_alert=True)
+		return
+	if blacklist_store.is_blocked(uploader_id):
+		await callback.answer("该用户已在黑名单中，不能执行普通踢出", show_alert=True)
+		return
+	if ENCODED_FORWARD_CHAT_ID == 0 or MESSAGE_REWARD_CHAT_ID == 0:
+		await callback.answer("飞机场或航站大厅尚未配置", show_alert=True)
+		return
+
+	if lock.locked() or TAKEOFF_KICK_ACTION_STATE.get(action_key) in {
+		"processing",
+		"completed",
+	}:
+		await callback.answer("该用户正在处理或已经处理完成", show_alert=True)
+		return
+
+	async with lock:
+		if TAKEOFF_KICK_ACTION_STATE.get(action_key) in {"processing", "completed"}:
+			await callback.answer("该用户正在处理或已经处理完成", show_alert=True)
+			return
+		await callback.message.edit_reply_markup(
+			reply_markup=_takeoff_kick_processing_keyboard()
+		)
+		TAKEOFF_KICK_ACTION_STATE[action_key] = "processing"
+		try:
+			await callback.answer("正在执行移除")
+		except Exception as exc:
+			print(f"[TAKEOFF_KICK] callback answer failed: {exc}", flush=True)
+
+		notice_errors: list[str] = []
+		try:
+			await _telegram_call_with_retry(
+				f"notify kicked uploader {uploader_id}",
+				lambda: bot.send_message(
+					chat_id=uploader_id,
+					text=(
+						"🦶 机场移除通知\n\n"
+						"你将被移出「镇泰飞机场」与「航站大厅」。\n"
+						f"移除理由：{reason}\n\n"
+						"本次不是黑名单封禁，之后仍可按照届时的规则重新申请。"
+					),
+				),
+			)
+		except Exception as exc:
+			notice_errors.append(f"私聊通知失败：{exc}")
+			print(
+				f"[TAKEOFF_KICK] user notice failed for {uploader_id}: {exc}",
+				flush=True,
+			)
+
+		try:
+			await _telegram_call_with_retry(
+				f"broadcast kicked uploader {uploader_id}",
+				lambda: bot.send_message(
+					chat_id=MESSAGE_REWARD_CHAT_ID,
+					text=(
+						"🦶 成员移除公告\n\n"
+						f'<a href="tg://user?id={uploader_id}">旅客 {uploader_id}</a> '
+						"将被移出机场。\n"
+						f"理由：{reason}"
+					),
+					parse_mode="HTML",
+				),
+			)
+		except Exception as exc:
+			notice_errors.append(f"大厅公告失败：{exc}")
+			print(
+				f"[TAKEOFF_KICK] lobby broadcast failed for {uploader_id}: {exc}",
+				flush=True,
+			)
+
+		airport_ok, airport_result, airport_participant_error = (
+			await _remove_inactive_user_from_chat(
+				ENCODED_FORWARD_CHAT_ID,
+				uploader_id,
+				"飞机场",
+			)
+		)
+		lobby_ok, lobby_result, lobby_participant_error = (
+			await _remove_inactive_user_from_chat(
+				MESSAGE_REWARD_CHAT_ID,
+				uploader_id,
+				"航站大厅",
+			)
+		)
+		airport_ok = airport_ok or airport_participant_error
+		lobby_ok = lobby_ok or lobby_participant_error
+
+		if not airport_ok or not lobby_ok:
+			TAKEOFF_KICK_ACTION_STATE.pop(action_key, None)
+			await callback.message.edit_reply_markup(
+				reply_markup=_build_takeoff_kick_reason_keyboard(
+					uploader_id,
+					source_chat_id,
+					source_message_id,
+				)
+			)
+			result_lines = [
+				"❌ 用户移除未全部完成，通行证数据已保留。",
+				airport_result,
+				lobby_result,
+			]
+			result_lines.extend(notice_errors)
+			await callback.message.reply("\n".join(result_lines))
+			return
+
+		try:
+			_delete_inactive_user_data(uploader_id)
+		except Exception as exc:
+			TAKEOFF_KICK_ACTION_STATE.pop(action_key, None)
+			await callback.message.edit_reply_markup(
+				reply_markup=_build_takeoff_kick_reason_keyboard(
+					uploader_id,
+					source_chat_id,
+					source_message_id,
+				)
+			)
+			await callback.message.reply(f"❌ 用户已移出，但通行证数据删除失败：{exc}")
+			return
+
+		TAKEOFF_KICK_ACTION_STATE[action_key] = "completed"
+		TAKEOFF_KICK_ORIGINAL_MARKUPS.pop(action_key, None)
+		await callback.message.edit_reply_markup(reply_markup=None)
+		print(
+			f"[TAKEOFF_KICK] removed user {uploader_id}, reason={reason}; "
+			f"{airport_result}; {lobby_result}; pass data deleted",
+			flush=True,
+		)
+		result_lines = [
+			"✅ 用户移除完成",
+			f"用户：{uploader_id}",
+			f"理由：{reason}",
+			airport_result,
+			lobby_result,
+			"通行证数据已删除。",
+		]
+		result_lines.extend(notice_errors)
+		await callback.message.reply("\n".join(result_lines))
+
+
 @dp.callback_query(F.data.startswith("ta:b:"))
 async def on_takeoff_admin_blacklist(callback: CallbackQuery) -> None:
 	if int(callback.from_user.id) not in ADMIN_USER_IDS:
@@ -4539,27 +4876,11 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				)
 				notify_text += f"\n👤 上传者：{uploader_text}"
 				notify_keyboard_rows.extend(
-					[
-						[
-							InlineKeyboardButton(
-								text="🚫 删除消息并拉黑上传者",
-								callback_data=(
-									"ta:b:"
-									f"{uploader_id}:{source_chat_id}:"
-									f"{source_message_id}"
-								),
-							),
-						],
-						[
-							InlineKeyboardButton(
-								text="🗑 删除消息",
-								callback_data=(
-									"ta:d:"
-									f"{source_chat_id}:{source_message_id}"
-								),
-							),
-						],
-					]
+					_build_takeoff_admin_keyboard(
+						uploader_id,
+						source_chat_id,
+						source_message_id,
+					)
 				)
 			notify_markup = (
 				InlineKeyboardMarkup(inline_keyboard=notify_keyboard_rows)

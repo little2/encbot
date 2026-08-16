@@ -2065,6 +2065,35 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 	)
 
 
+@dp.message(F.chat.type == "private", Command("expire15"))
+async def cmd_expire15(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
+	if not message.from_user:
+		return
+
+	args = str(command.args or "").strip()
+	if not args:
+		target_user_id = int(message.from_user.id)
+	else:
+		target_user_id = _parse_positive_user_id(args)
+		if target_user_id is None:
+			await message.reply("用法：/expire15 [用户id]")
+			return
+
+	expire_timestamp = int((datetime.now() + timedelta(days=15)).timestamp())
+	user_expire = user_expire_cache.update(target_user_id, expire_timestamp)
+
+	await message.reply(
+		"✅ 已设置特权飞行通行证\n"
+		f"目标用户：{target_user_id}\n"
+		"有效期限：15 天\n"
+		f"到期时间：{_format_timestamp_utc8(user_expire.expire_timestamp)}"
+	)
+
+
 def _is_admin_message(message: Message) -> bool:
 	return bool(
 		message.from_user

@@ -5011,7 +5011,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		try:
 			if reward_actual_minutes is not None:
 				text += (
-					f"\n\n🎉 已奖励上传者 {minutes_to_day_hour(reward_actual_minutes)[0]} 的飞行通行证期限。"
+					f"\n\n🎉 已奖励上传者 {minutes_to_day_hour(requested_qty * REWARD_HOURS_PER_MEDIA * 60)[0]} 的飞行通行证期限。"
 				)
 
 			discussion_location = batch_store.get_discussion_location(

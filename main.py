@@ -187,9 +187,9 @@ PAID_INVITE_LIFETIME_HOURS = 24
 PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
 INACTIVE_CANDIDATE_PAGE_SIZE = 20
 TAKEOFF_KICK_REASONS = {
-	"mixed": "同批不同系列",
-	"not_shota": "非正太资源",
-	"clean": "纯清水图",
+	"mixed": "同批不同系列，单品需独立上传，不同系列的不要混在一批上传",
+	"not_shota": "非正太资源，例如萝莉、男同、清水图等，机场不收。",
+	"clean": "纯清水图，没有色色的，没办法打飞机",
 }
 PAID_INVITE_NAME_PATTERN = re.compile(
 	r"^PI1\.([0-9a-z]{1,13})\.([0-9a-z]{5})\.([A-Za-z0-9_-]{8})$"
@@ -5156,6 +5156,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 					f"🔹 不收清水图\n"
 					f"🔹 不收非正太资源\n"
 					f"🔹 本次上传皆同系列\n"
+					f"🔹 单品不可合传\n"
 					f"🔹 小众资源才用防剧透\n"
 					"\n"
 					"若正确，再「📤 确认送出」"

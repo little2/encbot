@@ -187,7 +187,7 @@ PAID_INVITE_LIFETIME_HOURS = 24
 PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
 INACTIVE_CANDIDATE_PAGE_SIZE = 20
 TAKEOFF_KICK_REASONS = {
-	"mixed": "同批不同系列，单品需独立上传，不同系列的不要混在一批上传",
+	"mixed": "同批不同系列，单品需独立上传，不同系列(弟弟)的不要混在一批上传",
 	"not_shota": "非正太资源，例如萝莉、男同、清水图等，机场不收。",
 	"clean": "纯清水图，没有色色的，没办法打飞机",
 }
@@ -2009,6 +2009,33 @@ async def cmd_me(message: Message) -> None:
 	)
 
 
+@dp.message(F.chat.type == "private", Command("admin"))
+async def cmd_admin(message: Message) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
+	lines = [
+		"🛠️ 管理员命令总览",
+		"",
+		"/me — 查看当前飞行通行证状态与剩余可请求数量",
+		"/bonus [用户id] — 给指定用户发放飞行通行证奖励",
+		"/expire15 [用户id] — 直接设置指定用户 15 天通行证",
+		"/ban [用户id|回复用户] [原因] — 封禁用户并从群组移除",
+		"/unban [用户id] — 解除封禁",
+		"/baninfo [用户id] — 查看黑名单资料",
+		"/banlist [页码] — 查看黑名单列表",
+		"/inactive_candidate [页码] — 查看不活跃候选用户",
+		"/inactive_cleanup — 清理长期不活跃用户",
+		"/invite — 建立单人邀请（需先满足飞机场成员资格与通行证条件）",
+		"/rule — 查看机场规则与奖励机制",
+		"/about / /airport_access_request — 进入机场入场说明与申请入口",
+		"/start — 进入机场入口流程",
+		"/admin — 查看管理员命令说明",
+	]
+	await message.reply("\n".join(lines))
+
+
 @dp.message(F.chat.type == "private", Command("bonus"))
 async def cmd_bonus(message: Message, command: CommandObject) -> None:
 	if not _is_admin_message(message):
@@ -3032,7 +3059,7 @@ async def _airport_registration_error() -> str | None:
 			"若您希望进入「镇泰飞机场」搭乘航班，请联系已在航站内的旅客，请对方通过塔台机器人：「建立单人审核邀请」功能生成专属登机邀请连结。持该邀请连结完成入场审核后，即可获准进入「镇泰飞机场」。\n"
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
-			"您可以前往熟悉的正太群组或废弃机场，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
+			"您可以前往熟悉的正太群组或侯补大厅，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
 			"\n"
 			"\n"
 			"感谢您的理解与配合，祝您旅途愉快，顺利起飞 ✈️\n"
@@ -3287,7 +3314,7 @@ async def cmd_airport_access_request(message: Message) -> None:
 				reply_markup=InlineKeyboardMarkup(
 					inline_keyboard=[[
 						InlineKeyboardButton(
-							text="废弃机场(无资源)",
+							text="侯补大厅(无资源)",
 							url="https://t.me/+GHeK4dW-KcdlNDI1",
 						),
 					]],
@@ -3357,8 +3384,8 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
 			"请先上传「正太」媒体视频资源 ( 给我，镇泰塔台 )，再重新申请。\n"
 			"\n"
-			"‼️ 不同系列请不要在同批混在一起上传，请分批上传。\n"
-			"‼️ 不同系列若混在同批一起上传，有可能会被拉黑。\n"
+			"‼️ 不同系列(弟弟)请不要在同批混在一起上传，请分批上传。\n"
+			"‼️ 不同系列(弟弟)混在同批一起上传，会被拉黑。\n"
 		)
 
 		await callback.answer(
@@ -5155,11 +5182,12 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 					"⚠️ 飞机场不是垃圾场，请确认以下设定:\n"
 					f"🔹 不收清水图\n"
 					f"🔹 不收非正太资源\n"
-					f"🔹 本次上传皆同系列\n"
-					f"🔹 单品不可合传\n"
+					f"🔹 本次上传皆同一系列(弟弟)\n"
+					f"🔹 单品不可混传\n"
 					f"🔹 小众资源才用防剧透\n"
 					"\n"
-					"若正确，再「📤 确认送出」"
+					"若正确，再「📤 确认送出」\n\n"
+					"‼️ 已有多人混传而被踢"
 				)
 				await callback.answer(
 					confirm_text,

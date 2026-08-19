@@ -2107,6 +2107,7 @@ async def cmd_admin(message: Message) -> None:
 		"/inactive_cleanup — 清理长期不活跃用户",
 		"/backup — 将 SQLite 数据库备份发送给指定管理员",
 		"/restore — 回复 SQLite 备份文件以恢复数据库",
+		"/userinfo [用户id] — 查询用户时限及黑名单状态",
 		"/invite — 建立单人邀请（需先满足飞机场成员资格与通行证条件）",
 		"/rule — 查看机场规则与奖励机制",
 		"/about / /airport_access_request — 进入机场入场说明与申请入口",
@@ -2589,6 +2590,71 @@ def _format_blacklist_entry(entry: BlacklistEntry) -> str:
 		f"操作管理员：{entry.created_by}\n"
 		f"封禁时间：{_format_timestamp_utc8(entry.created_at)}"
 	)
+
+
+@dp.message(F.chat.type == "private", Command("userinfo"))
+async def cmd_userinfo(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
+	target_user_id = _parse_positive_user_id(str(command.args or ""))
+	if target_user_id is None:
+		await message.reply("用法：/userinfo [用户id]")
+		return
+
+	now_timestamp = int(datetime.now().timestamp())
+	user_expire = user_expire_cache.get(target_user_id)
+	lines = [
+		"👤 用户资料",
+		f"用户 ID：{target_user_id}",
+		"",
+		"🎫 飞行通行证",
+	]
+
+	if user_expire is None:
+		lines.extend([
+			"状态：无通行证记录",
+			"剩余时限：0 分钟",
+		])
+	else:
+		remaining_seconds = user_expire.expire_timestamp - now_timestamp
+		if remaining_seconds > 0:
+			remaining_minutes = remaining_seconds // 60
+			available_view_count = remaining_minutes // MEDIA_VIEW_COST_MINUTES
+			lines.extend([
+				"状态：✅ 有效",
+				f"剩余时限：{_format_duration(remaining_seconds)}",
+				f"目前可请求：{available_view_count} 个资源",
+			])
+		else:
+			lines.extend([
+				"状态：⌛ 已过期",
+				f"已过期：{_format_duration(abs(remaining_seconds))}",
+			])
+		lines.extend([
+			f"到期时间：{_format_timestamp_utc8(user_expire.expire_timestamp)}",
+			f"资料更新时间：{_format_timestamp_utc8(user_expire.update_timestamp)}",
+			(
+				f"最近有效发言：{_format_timestamp_utc8(user_expire.group_message_timestamp)}"
+				if user_expire.group_message_timestamp > 0
+				else "最近有效发言：无记录"
+			),
+		])
+
+	blacklist_entry = blacklist_store.get(target_user_id)
+	lines.extend(["", "🚫 黑名单"])
+	if blacklist_entry is None:
+		lines.append("状态：✅ 不在黑名单中")
+	else:
+		lines.extend([
+			"状态：⛔ 已列入黑名单",
+			f"封禁原因：{blacklist_entry.reason}",
+			f"操作管理员：{blacklist_entry.created_by}",
+			f"封禁时间：{_format_timestamp_utc8(blacklist_entry.created_at)}",
+		])
+
+	await message.reply("\n".join(lines))
 
 
 async def _ban_user(

@@ -4903,7 +4903,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 					"👎 不建议: (可能会被踢)\n"
 					"发问候语\n"
 					"述说需要发言\n"
-					"硬要发言\n"
+					"硬要发言(问已知的问题或不知所云)\n"
 				),
 				parse_mode="HTML",
 				show_alert=True,

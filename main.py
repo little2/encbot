@@ -679,10 +679,12 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 		parts.append(escape(file_name) if file_name else "未命名")
 		return_text += f"{parts[0]} {' | '.join(parts[1:])}\n"
 
-	return_text += f"<code>{"ㅤ"*25}</code>"
+
 	batch_content = str(data.get("batch_content", "") or "").strip()
 	if batch_content:
 		return_text += f"\n\n{escape(batch_content)}"
+	else:
+		return_text += f"<code>{"ㅤ"*25}</code>"
 	# return_text += (
 	# 	f"\n将取件码👇传给 🤖 <a href=\"https://b.oy/{encoded}\">🤖</a><code>{bot_name_lack}</code><code> t</code> (去空格) \n\n{start_char}<code>{encoded}</code>{end_char}"
 	# )
@@ -837,7 +839,11 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 		]
 	rows.append([
 		InlineKeyboardButton(
-			text="📝 内容介绍",
+			text=(
+				"✅ 内容介绍"
+				if 5 <= len(str(state.get("batch_content", "") or "").strip()) <= 250
+				else "⚠️ 内容介绍（必填）"
+			),
 			callback_data="enc:content:edit",
 		)
 	])
@@ -1641,6 +1647,7 @@ async def _send_encoded_snapshot(
 				)
 				base_timestamp = max(now_timestamp, previous_expire_timestamp)
 				requested_minutes = 0
+				content_bonus_applied = False
 
 				# if accepted_count <= 0:
 				# 	return  # 实际代码中应继续更新 UI，而非直接退出函数
@@ -1654,7 +1661,10 @@ async def _send_encoded_snapshot(
 							requested_minutes += VIDEO_UPLOAD_EXTEND_MINUTES
 						else:
 							requested_minutes += OTHERS_UPLOAD_EXTEND_MINUTES
-				
+					if len(str(batch_content or "").strip()) > 20:
+						requested_minutes *= 2
+						content_bonus_applied = True
+
 				user_expire = user_expire_cache.extend_minutes(
 					owner_user_id,
 					requested_minutes,
@@ -1672,8 +1682,14 @@ async def _send_encoded_snapshot(
 				remaining_text, remaining_view_count = minutes_to_day_hour(remaining_minutes)
 				expire_text = _format_timestamp_utc8(user_expire.expire_timestamp)
 
+				content_bonus_notice = (
+					"✨ 内容介绍超过 20 字，本批奖励已翻倍。\n"
+					if content_bonus_applied
+					else ""
+				)
 				notify_text = (
 					f"✅ 分享 {len(items)} 个资源成功，已为你延长 {actual_added_text} 的有效时间。\n"
+					f"{content_bonus_notice}"
 					f"🎫 飞行通行证到期时间为：{expire_text}。（相当于 {remaining_view_count} 个资源）\n\n"
 					f"🎈 请注意，通行证有效时间上限为 {minutes_to_day_hour(MAX_VALID_DURATION_MINUTES)[0]}，超过上限的部分将不会延长。"
 				)
@@ -4830,7 +4846,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		return
 
 	reader_user_id = int(callback.from_user.id)
-	print("2439 reader_user_id = {reader_user_id}")
+	print(f"2439 reader_user_id = {reader_user_id}")
 
 	is_admin  = False
 	if reader_user_id in ADMIN_USER_IDS:
@@ -4867,6 +4883,8 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 	async with user_lock:
 		now_timestamp = int(datetime.now().timestamp())
 		user_expire = user_expire_cache.get(reader_user_id)
+		# print(f"now_timestamp=>{now_timestamp}")
+		# print(f"user_expire=>{user_expire}")
 		if (
 			not user_expire
 			or now_timestamp - user_expire.group_message_timestamp > 24 * 60 * 60
@@ -5204,7 +5222,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			)
 			if value == "edit":
 				await callback.message.edit_text(
-					"📌 请输入标题（20–250 字），完成后送出：",
+					"📌 请输入内容介绍（5–250 字），完成后送出：",
 					reply_markup=InlineKeyboardMarkup(
 						inline_keyboard=[[
 							InlineKeyboardButton(
@@ -5235,6 +5253,14 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			return
 
 		if group == "send":
+			batch_content = str(state.get("batch_content", "") or "").strip()
+			if not 5 <= len(batch_content) <= 250:
+				state["send_confirm_pending"] = False
+				await callback.answer(
+					"❌ 内容介绍为必填，长度必须为 5–250 字。介绍超过 20 字，额外加奖励",
+					show_alert=True,
+				)
+				return
 			if not bool(state.get("send_confirm_pending", False)):
 				state["send_confirm_pending"] = True
 				try:
@@ -5417,8 +5443,6 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 @dp.message(F.chat.type == "private", F.text)
 async def on_text(message: Message) -> None:
 	text = (message.text or "").strip()
-	if not text:
-		return
 
 	if message.from_user:
 		content_input_key = (int(message.chat.id), int(message.from_user.id))
@@ -5428,8 +5452,8 @@ async def on_text(message: Message) -> None:
 			if not state or not bool(state.get("editing_content", False)):
 				ENCODER_CONTENT_INPUT_STATE.pop(content_input_key, None)
 			else:
-				if not 20 <= len(text) <= 250:
-					await message.reply("❌ 内容介绍必须为 20–250 字，请重新输入。")
+				if not 5 <= len(text) <= 250:
+					await message.reply("❌ 内容介绍为必填，长度必须为 5–250 字。")
 					return
 
 				state["batch_content"] = text
@@ -5457,6 +5481,9 @@ async def on_text(message: Message) -> None:
 				except Exception as exc:
 					print(f"[ENCODED_CONTENT] input message delete failed: {exc}", flush=True)
 				return
+
+	if not text:
+		return
 
 
 

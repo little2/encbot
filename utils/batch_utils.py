@@ -19,11 +19,20 @@ class BatchStore:
                 channel_message_id INTEGER NOT NULL,
                 discussion_chat_id INTEGER,
                 discussion_message_id INTEGER,
+                batch_content TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(channel_chat_id, channel_message_id)
             )
         """)
+        columns = {
+            str(row[1])
+            for row in self.connection.execute("PRAGMA table_info(batch)")
+        }
+        if "batch_content" not in columns:
+            self.connection.execute(
+                "ALTER TABLE batch ADD COLUMN batch_content TEXT"
+            )
         self.connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_batch_channel_message
             ON batch(channel_chat_id, channel_message_id)
@@ -35,6 +44,7 @@ class BatchStore:
         batch_id: str,
         channel_chat_id: int,
         channel_message_id: int,
+        batch_content: str = "",
     ) -> None:
         normalized_batch_id = str(batch_id or "").strip()
         if not normalized_batch_id:
@@ -50,10 +60,11 @@ class BatchStore:
                         channel_message_id,
                         discussion_chat_id,
                         discussion_message_id,
+                        batch_content,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, NULL, NULL, ?, ?)
+                    VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)
                     ON CONFLICT(batch_id) DO UPDATE SET
                         discussion_chat_id = CASE
                             WHEN batch.channel_chat_id = excluded.channel_chat_id
@@ -69,12 +80,14 @@ class BatchStore:
                         END,
                         channel_chat_id = excluded.channel_chat_id,
                         channel_message_id = excluded.channel_message_id,
+                        batch_content = excluded.batch_content,
                         updated_at = excluded.updated_at
                 """,
                 (
                     normalized_batch_id,
                     int(channel_chat_id),
                     int(channel_message_id),
+                    str(batch_content or "").strip(),
                     now,
                     now,
                 ),
@@ -117,6 +130,7 @@ class BatchStore:
                     channel_message_id,
                     discussion_chat_id,
                     discussion_message_id,
+                    batch_content,
                     created_at,
                     updated_at
                 FROM batch
@@ -132,8 +146,9 @@ class BatchStore:
             "channel_message_id": int(row[2]),
             "discussion_chat_id": int(row[3]) if row[3] is not None else None,
             "discussion_message_id": int(row[4]) if row[4] is not None else None,
-            "created_at": int(row[5]),
-            "updated_at": int(row[6]),
+            "batch_content": str(row[5] or ""),
+            "created_at": int(row[6]),
+            "updated_at": int(row[7]),
         }
 
     def get_discussion_location(

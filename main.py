@@ -139,6 +139,9 @@ bot = Bot(
 )
 dp = Dispatcher()
 ENCODER_UI_STATE: dict[tuple[int, int], dict[str, Any]] = {}
+ENCODER_CONTENT_INPUT_STATE: dict[
+	tuple[int, int], tuple[int, int]
+] = {}
 UPLOAD_SESSIONS: dict[tuple[int, int], dict[str, Any]] = {}
 USER_MEDIA_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 USER_MEDIA_PENDING: dict[tuple[int, int], int] = {}
@@ -677,6 +680,9 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 		return_text += f"{parts[0]} {' | '.join(parts[1:])}\n"
 
 	return_text += f"<code>{"ㅤ"*25}</code>"
+	batch_content = str(data.get("batch_content", "") or "").strip()
+	if batch_content:
+		return_text += f"\n\n{escape(batch_content)}"
 	# return_text += (
 	# 	f"\n将取件码👇传给 🤖 <a href=\"https://b.oy/{encoded}\">🤖</a><code>{bot_name_lack}</code><code> t</code> (去空格) \n\n{start_char}<code>{encoded}</code>{end_char}"
 	# )
@@ -829,6 +835,12 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 				)
 			],
 		]
+	rows.append([
+		InlineKeyboardButton(
+			text="📝 内容介绍",
+			callback_data="enc:content:edit",
+		)
+	])
 	# if len(encoded) <= 256:
 	# 	rows.append([
 	# 		InlineKeyboardButton(
@@ -880,6 +892,7 @@ def _build_token_and_encoded(state: dict[str, Any]) -> tuple[str, str, dict[str,
 	)
 	encoded = UtfConverter.telegram_to_unicode_cjk(token)
 	parsed = UtfConverter.parse_file_token(token)
+	parsed["batch_content"] = str(state.get("batch_content", "") or "").strip()
 	return token, encoded, parsed
 
 
@@ -1218,6 +1231,7 @@ async def _forward_encoded_if_whitelisted(
 	owner_user_id: int,
 	encoded: str,
 	items: list[dict[str, Any]],
+	batch_content: str = "",
 ) -> dict:
 	global DEFAULT_COVER_FILE_ID
 	if ENCODED_FORWARD_CHAT_ID == 0:
@@ -1240,6 +1254,7 @@ async def _forward_encoded_if_whitelisted(
 	try:
 		token = UtfConverter.unicode_cjk_to_telegram(encoded)
 		parsed = UtfConverter.parse_file_token(token)
+		parsed["batch_content"] = str(batch_content or "").strip()
 		parsed_items = list(parsed.get("items", []))
 		if not parsed_items:
 			raise ValueError("encoded 中没有媒体")
@@ -1535,6 +1550,7 @@ async def _record_batch_channel_location(
 	batch_id: str,
 	channel_chat_id: int,
 	channel_message_id: int,
+	batch_content: str = "",
 ) -> None:
 	channel_key = (int(channel_chat_id), int(channel_message_id))
 	async with BATCH_LOCATION_LOCK:
@@ -1542,6 +1558,7 @@ async def _record_batch_channel_location(
 			batch_id,
 			channel_key[0],
 			channel_key[1],
+			batch_content,
 		)
 		pending_discussion = PENDING_BATCH_DISCUSSION_LOCATIONS.pop(
 			channel_key,
@@ -1563,13 +1580,19 @@ async def _send_encoded_snapshot(
 	batch_id: str,
 	encoded: str,
 	items: list[dict[str, Any]],
+	batch_content: str,
 	is_first_send: bool,
 ) -> None:
 	success = False
 	accepted_count = 0
 	forward_status: dict[str, Any] = {}
 	try:
-		forward_status = await _forward_encoded_if_whitelisted(owner_user_id, encoded, items)
+		forward_status = await _forward_encoded_if_whitelisted(
+			owner_user_id,
+			encoded,
+			items,
+			batch_content,
+		)
 		success = bool(forward_status.get("ok", False))
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] background send failed: {exc}", flush=True)
@@ -1580,6 +1603,7 @@ async def _send_encoded_snapshot(
 				batch_id,
 				int(forward_status["channel_chat_id"]),
 				int(forward_status["channel_message_id"]),
+				batch_content,
 			)
 		except Exception as exc:
 			print(f"[BATCH] channel location save failed: {exc}", flush=True)
@@ -1722,6 +1746,7 @@ async def _handle_send_encoded(
 		await callback.answer("当前密文无效，请重新上传", show_alert=True)
 		return
 	items_snapshot = [dict(item) for item in state.get("items", [])]
+	batch_content_snapshot = str(state.get("batch_content", "") or "").strip()
 	if not items_snapshot:
 		await callback.answer("当前媒体列表为空", show_alert=True)
 		return
@@ -1774,6 +1799,7 @@ async def _handle_send_encoded(
 			batch_id=batch_id,
 			encoded=encoded_snapshot,
 			items=items_snapshot,
+			batch_content=batch_content_snapshot,
 			is_first_send=is_first_send,
 		)
 	)
@@ -1798,6 +1824,10 @@ async def _handle_cancel_encoded(
 	was_sent = int(state.get("sent_revision", 0)) > 0
 
 	ENCODER_UI_STATE.pop(state_key, None)
+	ENCODER_CONTENT_INPUT_STATE.pop(
+		(state_key[0], int(state.get("owner_user_id", 0))),
+		None,
+	)
 	text = "✅ 配置已关闭，已经送出的资源不受影响。" if was_sent else "✅ 已取消，本批媒体未送出。"
 	try:
 		await callback.message.edit_text(text, reply_markup=None)
@@ -1883,6 +1913,8 @@ async def _finish_upload(
 		"sent_revision": 0,
 		"send_status": "idle",
 		"send_confirm_pending": False,
+		"batch_content": "",
+		"editing_content": False,
 	}
 	token, encoded, parsed = _build_token_and_encoded(state)
 	state["token"] = token
@@ -5165,6 +5197,43 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			)
 			return
 
+		if group == "content":
+			content_input_key = (
+				int(callback.message.chat.id),
+				int(callback.from_user.id),
+			)
+			if value == "edit":
+				await callback.message.edit_text(
+					"📌 请输入标题（20–250 字），完成后送出：",
+					reply_markup=InlineKeyboardMarkup(
+						inline_keyboard=[[
+							InlineKeyboardButton(
+								text="返回",
+								callback_data="enc:content:back",
+							),
+						]],
+					),
+				)
+				state["editing_content"] = True
+				ENCODER_CONTENT_INPUT_STATE[content_input_key] = state_key
+				await callback.answer()
+				return
+			if value != "back":
+				raise ValueError("invalid content action")
+			state["editing_content"] = False
+			ENCODER_CONTENT_INPUT_STATE.pop(content_input_key, None)
+			state["send_confirm_pending"] = False
+			token, encoded, parsed = _build_token_and_encoded(state)
+			state["token"] = token
+			state["encoded"] = encoded
+			await callback.message.edit_text(
+				await _build_display(parsed, token, encoded),
+				reply_markup=_build_controls_keyboard(state, encoded),
+				parse_mode="HTML",
+			)
+			await callback.answer("已返回编辑菜单")
+			return
+
 		if group == "send":
 			if not bool(state.get("send_confirm_pending", False)):
 				state["send_confirm_pending"] = True
@@ -5350,6 +5419,44 @@ async def on_text(message: Message) -> None:
 	text = (message.text or "").strip()
 	if not text:
 		return
+
+	if message.from_user:
+		content_input_key = (int(message.chat.id), int(message.from_user.id))
+		state_key = ENCODER_CONTENT_INPUT_STATE.get(content_input_key)
+		if state_key:
+			state = ENCODER_UI_STATE.get(state_key)
+			if not state or not bool(state.get("editing_content", False)):
+				ENCODER_CONTENT_INPUT_STATE.pop(content_input_key, None)
+			else:
+				if not 20 <= len(text) <= 250:
+					await message.reply("❌ 内容介绍必须为 20–250 字，请重新输入。")
+					return
+
+				state["batch_content"] = text
+				state["editing_content"] = False
+				state["send_confirm_pending"] = False
+				ENCODER_CONTENT_INPUT_STATE.pop(content_input_key, None)
+				token, encoded, parsed = _build_token_and_encoded(state)
+				state["token"] = token
+				state["encoded"] = encoded
+				try:
+					await bot.edit_message_text(
+						chat_id=state_key[0],
+						message_id=state_key[1],
+						text=await _build_display(parsed, token, encoded),
+						reply_markup=_build_controls_keyboard(state, encoded),
+						parse_mode="HTML",
+					)
+				except Exception as exc:
+					state["editing_content"] = True
+					ENCODER_CONTENT_INPUT_STATE[content_input_key] = state_key
+					await message.reply(f"❌ 内容介绍保存失败，请重试：{exc}")
+					return
+				try:
+					await message.delete()
+				except Exception as exc:
+					print(f"[ENCODED_CONTENT] input message delete failed: {exc}", flush=True)
+				return
 
 
 

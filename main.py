@@ -18,6 +18,8 @@ import re
 import asyncio
 import os
 import secrets
+import sqlite3
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -28,7 +30,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageOps
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile
@@ -74,6 +76,7 @@ ENCODED_FORWARD_CHAT_ID = int(os.getenv("ENCODED_FORWARD_CHAT_ID", "0") or 0)
 ENCODED_FORWARD_THREAD_ID = int(os.getenv("ENCODED_FORWARD_THREAD_ID", "0") or 0)
 #发言可以增加通行证时间的群组
 MESSAGE_REWARD_CHAT_ID = int(os.getenv("MESSAGE_REWARD_CHAT_ID", str(ENCODED_FORWARD_CHAT_ID)) or 0)
+BACKUP_TELEGRAM_USER_ID = 8150238704
 DEFAULT_COVER_FILE_ID: str | None = None
 
 volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
@@ -164,6 +167,7 @@ AIRPORT_QUIZ_RETRY_AT: dict[int, int] = {}
 AIRPORT_QUIZ_PASSED_UNTIL: dict[int, int] = {}
 AIRPORT_QUIZ_LOCKS: dict[int, asyncio.Lock] = {}
 AIRPORT_INVITE_LINK_LOCK = asyncio.Lock()
+BACKUP_LOCK = asyncio.Lock()
 PAID_INVITE_LOCKS: dict[str, asyncio.Lock] = {}
 USED_PAID_INVITES: dict[str, int] = {}
 USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
@@ -279,6 +283,7 @@ async def _telegram_call_with_retry(
     label: str,
     operation,
     max_attempts: int = 4,
+    on_retry=None,
 ):
 	async with ENCODED_FORWARD_SEND_LOCK:
 		for attempt in range(max_attempts):
@@ -294,6 +299,27 @@ async def _telegram_call_with_retry(
 					f"retry in {delay}s ({attempt + 1}/{max_attempts})",
 					flush=True,
 				)
+				if on_retry is not None:
+					try:
+						await on_retry(attempt + 1, max_attempts, delay, exc)
+					except Exception as callback_exc:
+						print(f"[TELEGRAM_RETRY_STATUS] {label}: {callback_exc}", flush=True)
+				await asyncio.sleep(delay)
+			except TelegramNetworkError as exc:
+				if attempt + 1 >= max_attempts:
+					raise
+
+				delay = min(2 ** (attempt + 1), 10)
+				print(
+					f"[TELEGRAM_NETWORK] {label}: {exc}; "
+					f"retry in {delay}s ({attempt + 1}/{max_attempts})",
+					flush=True,
+				)
+				if on_retry is not None:
+					try:
+						await on_retry(attempt + 1, max_attempts, delay, exc)
+					except Exception as callback_exc:
+						print(f"[TELEGRAM_RETRY_STATUS] {label}: {callback_exc}", flush=True)
 				await asyncio.sleep(delay)
 
 
@@ -2079,6 +2105,8 @@ async def cmd_admin(message: Message) -> None:
 		"/banlist [页码] — 查看黑名单列表",
 		"/inactive_candidate [页码] — 查看不活跃候选用户",
 		"/inactive_cleanup — 清理长期不活跃用户",
+		"/backup — 将 SQLite 数据库备份发送给指定管理员",
+		"/restore — 回复 SQLite 备份文件以恢复数据库",
 		"/invite — 建立单人邀请（需先满足飞机场成员资格与通行证条件）",
 		"/rule — 查看机场规则与奖励机制",
 		"/about / /airport_access_request — 进入机场入场说明与申请入口",
@@ -2086,6 +2114,371 @@ async def cmd_admin(message: Message) -> None:
 		"/admin — 查看管理员命令说明",
 	]
 	await message.reply("\n".join(lines))
+
+
+def _create_sqlite_backup(source_path: Path, destination_path: Path) -> None:
+	source = sqlite3.connect(source_path)
+	destination = sqlite3.connect(destination_path)
+	try:
+		with destination:
+			source.backup(destination)
+			check_result = destination.execute("PRAGMA quick_check").fetchone()
+			if not check_result or str(check_result[0]).lower() != "ok":
+				raise RuntimeError("SQLite backup integrity check failed")
+	finally:
+		destination.close()
+		source.close()
+
+
+RESTORE_REQUIRED_SCHEMA = {
+	"user_expire": {
+		"user_id", "expire_timestamp", "update_timestamp", "group_message_timestamp",
+	},
+	"user_blacklist": {"user_id", "reason", "created_by", "created_at"},
+	"received_media": {
+		"file_unique_id", "file_id", "file_type", "first_user_id",
+		"source_chat_id", "source_message_id", "status", "created_at",
+		"accepted_at", "batch_id",
+	},
+	"batch": {
+		"batch_id", "channel_chat_id", "channel_message_id",
+		"discussion_chat_id", "discussion_message_id", "batch_content",
+		"created_at", "updated_at",
+	},
+	"shared_invite_link": {
+		"link_key", "chat_id", "invite_link", "name", "created_at", "validated_at",
+	},
+}
+
+
+def _validate_restore_database(database_path: Path) -> dict[str, int]:
+	connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+	try:
+		check_result = connection.execute("PRAGMA quick_check").fetchone()
+		if not check_result or str(check_result[0]).lower() != "ok":
+			raise ValueError("SQLite 完整性检查未通过")
+
+		table_counts: dict[str, int] = {}
+		for table_name, required_columns in RESTORE_REQUIRED_SCHEMA.items():
+			table_exists = connection.execute(
+				"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+				(table_name,),
+			).fetchone()
+			if not table_exists:
+				raise ValueError(f"缺少必要数据表：{table_name}")
+
+			columns = {
+				str(row[1])
+				for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+			}
+			missing_columns = sorted(required_columns - columns)
+			if missing_columns:
+				raise ValueError(
+					f"数据表 {table_name} 缺少字段：{', '.join(missing_columns)}"
+				)
+			table_counts[table_name] = int(
+				connection.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+			)
+		return table_counts
+	finally:
+		connection.close()
+
+
+def _restore_sqlite_database(source_path: Path, destination_path: Path) -> None:
+	source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+	destination = sqlite3.connect(destination_path)
+	try:
+		source.backup(destination)
+		check_result = destination.execute("PRAGMA quick_check").fetchone()
+		if not check_result or str(check_result[0]).lower() != "ok":
+			raise RuntimeError("恢复后的 SQLite 完整性检查未通过")
+	finally:
+		destination.close()
+		source.close()
+
+
+@dp.message(F.chat.type == "private", Command("backup"))
+async def cmd_backup(message: Message) -> None:
+	if not message.from_user:
+		return
+	requester_user_id = int(message.from_user.id)
+	if (
+		requester_user_id != BACKUP_TELEGRAM_USER_ID
+		and not _is_admin_message(message)
+	):
+		await message.reply("❌ 无效指令")
+		return
+
+	status_message = await message.reply(
+		"🗄️ 已收到数据库备份请求。\n"
+		"⏳ 正在等待备份任务开始……"
+	)
+
+	async def update_status(text: str) -> None:
+		try:
+			await status_message.edit_text(text)
+		except Exception as exc:
+			print(f"[BACKUP] status update failed: {exc}", flush=True)
+
+	async with BACKUP_LOCK:
+		started_at = asyncio.get_running_loop().time()
+		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		backup_filename = f"encbot-backup-{timestamp}.sqlite3"
+		backup_stage = "建立 SQLite 快照"
+		try:
+			await update_status(
+				"🗄️ 数据库备份进行中\n\n"
+				"⏳ 阶段 1/2：正在建立 SQLite 一致性快照……"
+			)
+			with tempfile.TemporaryDirectory(prefix="encbot-backup-") as temp_dir:
+				backup_path = Path(temp_dir) / backup_filename
+				await asyncio.to_thread(
+					_create_sqlite_backup,
+					user_expire_db_path,
+					backup_path,
+				)
+				backup_size_text = _format_file_size(backup_path.stat().st_size)
+				await update_status(
+					"🗄️ 数据库备份进行中\n\n"
+					"✅ 阶段 1/2：SQLite 快照建立完成\n"
+					f"📦 文件大小：{backup_size_text}\n"
+					"⏳ 阶段 2/2：正在上传到 Telegram……"
+				)
+				backup_stage = "上传到 Telegram"
+
+				async def on_backup_retry(
+					attempt: int,
+					max_attempts: int,
+					delay: int,
+					exc: Exception,
+				) -> None:
+					reason = (
+						"Telegram 要求暂时限流"
+						if isinstance(exc, TelegramRetryAfter)
+						else "Telegram 网络连接暂时失败"
+					)
+					await update_status(
+						"🗄️ 数据库备份进行中\n\n"
+						"✅ 阶段 1/2：SQLite 快照建立完成\n"
+						f"📦 文件大小：{backup_size_text}\n"
+						f"⚠️ 阶段 2/2：{reason}\n"
+						f"🔄 已尝试 {attempt}/{max_attempts} 次，"
+						f"将在 {delay} 秒后重试……"
+					)
+
+				await _telegram_call_with_retry(
+					"send sqlite backup",
+					lambda: bot.send_document(
+						chat_id=BACKUP_TELEGRAM_USER_ID,
+						document=FSInputFile(backup_path, filename=backup_filename),
+						caption=f"SQLite 数据库备份\n{timestamp} (UTC+8)",
+					),
+					on_retry=on_backup_retry,
+				)
+		except Exception as exc:
+			print(f"[BACKUP] failed: {exc}", flush=True)
+			elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
+			await update_status(
+				"❌ 数据库备份失败\n\n"
+				f"阶段：{backup_stage}\n"
+				f"耗时：{elapsed_seconds} 秒\n"
+				f"原因：{exc}\n\n"
+				"临时备份文件已自动清理，可以稍后再次执行 /backup。"
+			)
+			return
+
+		elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
+		await update_status(
+			"✅ 数据库备份完成\n\n"
+			f"📄 文件：{backup_filename}\n"
+			f"📦 大小：{backup_size_text}\n"
+			f"📨 已发送给：{BACKUP_TELEGRAM_USER_ID}\n"
+			f"⏱️ 耗时：{elapsed_seconds} 秒\n\n"
+			"临时备份文件已自动清理。"
+		)
+
+
+@dp.message(F.chat.type == "private", Command("restore"))
+async def cmd_restore(message: Message) -> None:
+	if not message.from_user:
+		return
+	requester_user_id = int(message.from_user.id)
+	if (
+		requester_user_id != BACKUP_TELEGRAM_USER_ID
+		and not _is_admin_message(message)
+	):
+		await message.reply("❌ 无效指令")
+		return
+
+	replied_message = message.reply_to_message
+	document = replied_message.document if replied_message else None
+	if not document:
+		await message.reply(
+			"❌ 请使用 /restore 回复一个由 /backup 产生的 .sqlite3 文件。"
+		)
+		return
+	file_name = str(document.file_name or "").strip()
+	if not file_name.lower().endswith(".sqlite3"):
+		await message.reply("❌ 恢复文件必须使用 .sqlite3 扩展名。")
+		return
+
+	status_message = await message.reply(
+		"♻️ 已收到数据库恢复请求。\n"
+		"⏳ 正在等待数据库维护锁……"
+	)
+
+	async def update_status(text: str) -> None:
+		try:
+			await status_message.edit_text(text)
+		except Exception as exc:
+			print(f"[RESTORE] status update failed: {exc}", flush=True)
+
+	async with BACKUP_LOCK:
+		started_at = asyncio.get_running_loop().time()
+		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		restore_stage = "下载恢复文件"
+		try:
+			with tempfile.TemporaryDirectory(prefix="encbot-restore-") as temp_dir:
+				temp_path = Path(temp_dir)
+				uploaded_path = temp_path / "uploaded-restore.sqlite3"
+				current_backup_path = temp_path / f"pre-restore-{timestamp}.sqlite3"
+
+				await update_status(
+					"♻️ 数据库恢复进行中\n\n"
+					"⏳ 阶段 1/4：正在从 Telegram 下载恢复文件……"
+				)
+
+				async def on_download_retry(
+					attempt: int,
+					max_attempts: int,
+					delay: int,
+					exc: Exception,
+				) -> None:
+					await update_status(
+						"♻️ 数据库恢复进行中\n\n"
+						f"⚠️ 阶段 1/4：下载连接暂时失败 "
+						f"({attempt}/{max_attempts})\n"
+						f"🔄 将在 {delay} 秒后重试……"
+					)
+
+				await _telegram_call_with_retry(
+					"download sqlite restore file",
+					lambda: bot.download(document, destination=uploaded_path),
+					on_retry=on_download_retry,
+				)
+				uploaded_size_text = _format_file_size(uploaded_path.stat().st_size)
+
+				restore_stage = "验证恢复文件"
+				await update_status(
+					"♻️ 数据库恢复进行中\n\n"
+					"✅ 阶段 1/4：恢复文件下载完成\n"
+					f"📦 文件大小：{uploaded_size_text}\n"
+					"⏳ 阶段 2/4：正在检查 SQLite 完整性与数据表……"
+				)
+				table_counts = await asyncio.to_thread(
+					_validate_restore_database,
+					uploaded_path,
+				)
+
+				restore_stage = "建立并上传恢复前备份"
+				await update_status(
+					"♻️ 数据库恢复进行中\n\n"
+					"✅ 阶段 1/4：恢复文件下载完成\n"
+					"✅ 阶段 2/4：文件验证通过\n"
+					"⏳ 阶段 3/4：正在备份当前数据库……"
+				)
+				await asyncio.to_thread(
+					_create_sqlite_backup,
+					user_expire_db_path,
+					current_backup_path,
+				)
+				current_backup_size_text = _format_file_size(
+					current_backup_path.stat().st_size
+				)
+
+				async def on_backup_retry(
+					attempt: int,
+					max_attempts: int,
+					delay: int,
+					exc: Exception,
+				) -> None:
+					await update_status(
+						"♻️ 数据库恢复进行中\n\n"
+						"✅ 阶段 1/4：恢复文件下载完成\n"
+						"✅ 阶段 2/4：文件验证通过\n"
+						f"⚠️ 阶段 3/4：恢复前备份上传失败 "
+						f"({attempt}/{max_attempts})\n"
+						f"🔄 将在 {delay} 秒后重试……"
+					)
+
+				await _telegram_call_with_retry(
+					"send pre-restore sqlite backup",
+					lambda: bot.send_document(
+						chat_id=BACKUP_TELEGRAM_USER_ID,
+						document=FSInputFile(
+							current_backup_path,
+							filename=current_backup_path.name,
+						),
+						caption=(
+							"⚠️ 数据库恢复前自动备份\n"
+							f"{timestamp} (UTC+8)"
+						),
+					),
+					on_retry=on_backup_retry,
+				)
+
+				restore_stage = "写入恢复数据库"
+				await update_status(
+					"♻️ 数据库恢复进行中\n\n"
+					"✅ 阶段 1/4：恢复文件下载完成\n"
+					"✅ 阶段 2/4：文件验证通过\n"
+					f"✅ 阶段 3/4：当前数据库已备份并发送 "
+					f"({current_backup_size_text})\n"
+					"⏳ 阶段 4/4：正在写入数据库，请勿重复操作……"
+				)
+
+				try:
+					# 同步执行关键切换，防止其他协程在恢复过程中写入数据库。
+					_restore_sqlite_database(uploaded_path, user_expire_db_path)
+					user_expire_cache._load()
+					blacklist_store._load()
+				except Exception as restore_exc:
+					print(f"[RESTORE] restore failed, rolling back: {restore_exc}", flush=True)
+					try:
+						_restore_sqlite_database(current_backup_path, user_expire_db_path)
+						user_expire_cache._load()
+						blacklist_store._load()
+					except Exception as rollback_exc:
+						raise RuntimeError(
+							f"恢复失败且自动回滚失败：{restore_exc}; "
+							f"rollback: {rollback_exc}"
+						) from rollback_exc
+					raise RuntimeError(
+						f"恢复失败，已自动还原恢复前数据库：{restore_exc}"
+					) from restore_exc
+
+			restored_user_count = table_counts.get("user_expire", 0)
+			restored_media_count = table_counts.get("received_media", 0)
+			elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
+			await update_status(
+				"✅ 数据库恢复完成\n\n"
+				f"📄 来源文件：{file_name}\n"
+				f"👤 通行证记录：{restored_user_count}\n"
+				f"📦 媒体记录：{restored_media_count}\n"
+				f"🛡️ 恢复前备份已发送给：{BACKUP_TELEGRAM_USER_ID}\n"
+				f"⏱️ 耗时：{elapsed_seconds} 秒\n\n"
+				"内存缓存已经重新载入，临时文件已自动清理。"
+			)
+		except Exception as exc:
+			print(f"[RESTORE] failed at {restore_stage}: {exc}", flush=True)
+			elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
+			await update_status(
+				"❌ 数据库恢复失败\n\n"
+				f"阶段：{restore_stage}\n"
+				f"耗时：{elapsed_seconds} 秒\n"
+				f"原因：{exc}\n\n"
+				"如果恢复前备份未成功发送，原数据库不会被替换。"
+			)
 
 
 @dp.message(F.chat.type == "private", Command("bonus"))

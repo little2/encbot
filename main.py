@@ -616,6 +616,13 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 
 	return_text=""
 
+
+	batch_content = str(data.get("batch_content", "") or "").strip()
+	if batch_content:
+		return_text += f"{escape(batch_content)}\n\n"
+	else:
+		return_text += f"<code>{"ㅤ"*25}</code>\n\n"
+
 	if bool(data.get("anonymous", False)):
 		user_url = "[匿名]"
 	else:
@@ -680,11 +687,7 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 		return_text += f"{parts[0]} {' | '.join(parts[1:])}\n"
 
 
-	batch_content = str(data.get("batch_content", "") or "").strip()
-	if batch_content:
-		return_text += f"\n\n{escape(batch_content)}"
-	else:
-		return_text += f"<code>{"ㅤ"*25}</code>"
+
 	# return_text += (
 	# 	f"\n将取件码👇传给 🤖 <a href=\"https://b.oy/{encoded}\">🤖</a><code>{bot_name_lack}</code><code> t</code> (去空格) \n\n{start_char}<code>{encoded}</code>{end_char}"
 	# )

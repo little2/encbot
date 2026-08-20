@@ -67,6 +67,14 @@ def _parse_whitelist_ids(raw: str) -> set[int]:
 	return ids
 
 
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+	try:
+		value = int(os.getenv(name, str(default)) or default)
+	except (TypeError, ValueError):
+		value = default
+	return min(maximum, max(minimum, value))
+
+
 load_dotenv(dotenv_path='.env')
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MEDIA_FORWARD_USER_ID = int(os.getenv("MEDIA_FORWARD_USER_ID", "0") or 0)
@@ -76,7 +84,9 @@ ENCODED_FORWARD_CHAT_ID = int(os.getenv("ENCODED_FORWARD_CHAT_ID", "0") or 0)
 ENCODED_FORWARD_THREAD_ID = int(os.getenv("ENCODED_FORWARD_THREAD_ID", "0") or 0)
 #发言可以增加通行证时间的群组
 MESSAGE_REWARD_CHAT_ID = int(os.getenv("MESSAGE_REWARD_CHAT_ID", str(ENCODED_FORWARD_CHAT_ID)) or 0)
-BACKUP_TELEGRAM_USER_ID = 8150238704
+BACKUP_TELEGRAM_USER_ID = int(os.getenv("BACKUP_TELEGRAM_USER_ID", "0") or 0)
+DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
+DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
 DEFAULT_COVER_FILE_ID: str | None = None
 
 volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
@@ -190,7 +200,7 @@ AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
 AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
 AIRPORT_REGISTRATION_MEMBER_LIMIT = 1
 PAID_INVITE_COST_MINUTES = 24 * 60
-PAID_INVITE_REWARD_MINUTES = 1.5 * 24 * 60
+PAID_INVITE_REWARD_MINUTES = 1.2 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
 PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
 INACTIVE_CANDIDATE_PAGE_SIZE = 20
@@ -3037,23 +3047,45 @@ async def cmd_inactive_candidate(message: Message, command: CommandObject) -> No
 async def cmd_inactive_cleanup(message: Message) -> None:
 	if not _is_admin_message(message):
 		return
+	await _execute_inactive_cleanup(message)
+
+
+async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
+	async def notify(text: str) -> None:
+		if message is not None:
+			await message.reply(text)
+			return
+		if BACKUP_TELEGRAM_USER_ID <= 0:
+			print(f"[INACTIVE_CLEANUP] {text}", flush=True)
+			return
+		try:
+			await _telegram_call_with_retry(
+				"send scheduled inactive cleanup status",
+				lambda: bot.send_message(
+					chat_id=BACKUP_TELEGRAM_USER_ID,
+					text=text,
+				),
+			)
+		except Exception as exc:
+			print(f"[INACTIVE_CLEANUP] scheduled status failed: {exc}", flush=True)
+
 	if INACTIVE_CLEANUP_LOCK.locked():
-		await message.reply("⏳ 不活跃用户清理正在执行，请稍后再试")
-		return
+		await notify("⏳ 不活跃用户清理正在执行，本次任务不重复执行")
+		return False
 	if ENCODED_FORWARD_CHAT_ID == 0 or MESSAGE_REWARD_CHAT_ID == 0:
-		await message.reply("❌ 飞机场或航站大厅尚未配置，无法执行清理")
-		return
+		await notify("❌ 飞机场或航站大厅尚未配置，无法执行清理")
+		return False
 
 	async with INACTIVE_CLEANUP_LOCK:
 		now_timestamp = int(datetime.now().timestamp())
 		candidates = _get_inactive_candidates(now_timestamp)
 		if not candidates:
-			await message.reply(
+			await notify(
 				f"目前没有通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天的用户"
 			)
-			return
+			return True
 
-		await message.reply(f"🧹 开始检查并清理 {len(candidates)} 名候选用户")
+		await notify(f"🧹 开始检查并清理 {len(candidates)} 名候选用户")
 		removed_user_ids: list[int] = []
 		skipped_user_ids: list[int] = []
 		failed_results: list[str] = []
@@ -3206,7 +3238,111 @@ async def cmd_inactive_cleanup(message: Message) -> None:
 			summary_lines.append(
 				"广播失败详情：\n" + "\n".join(broadcast_failed_results[:20])
 			)
-		await message.reply("\n".join(summary_lines))
+		await notify("\n".join(summary_lines))
+		return True
+
+
+async def _send_daily_maintenance_notice(text: str) -> None:
+	if BACKUP_TELEGRAM_USER_ID <= 0:
+		print(f"[DAILY_MAINTENANCE] {text}", flush=True)
+		return
+	try:
+		await _telegram_call_with_retry(
+			"send daily maintenance notice",
+			lambda: bot.send_message(
+				chat_id=BACKUP_TELEGRAM_USER_ID,
+				text=text,
+			),
+		)
+	except Exception as exc:
+		print(f"[DAILY_MAINTENANCE] notice failed: {exc}", flush=True)
+
+
+async def _run_scheduled_backup() -> bool:
+	if BACKUP_TELEGRAM_USER_ID <= 0:
+		print(
+			"[DAILY_MAINTENANCE] BACKUP_TELEGRAM_USER_ID is not configured",
+			flush=True,
+		)
+		return False
+
+	async with BACKUP_LOCK:
+		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		backup_filename = f"encbot-daily-backup-{timestamp}.sqlite3"
+		try:
+			with tempfile.TemporaryDirectory(prefix="encbot-daily-backup-") as temp_dir:
+				backup_path = Path(temp_dir) / backup_filename
+				await asyncio.to_thread(
+					_create_sqlite_backup,
+					user_expire_db_path,
+					backup_path,
+				)
+				backup_size_text = _format_file_size(backup_path.stat().st_size)
+				await _telegram_call_with_retry(
+					"send daily sqlite backup",
+					lambda: bot.send_document(
+						chat_id=BACKUP_TELEGRAM_USER_ID,
+						document=FSInputFile(
+							backup_path,
+							filename=backup_filename,
+						),
+						caption=(
+							"🗓️ 每日自动 SQLite 数据库备份\n"
+							f"{timestamp} (UTC+8)\n"
+							f"文件大小：{backup_size_text}"
+						),
+					),
+				)
+		except Exception as exc:
+			print(f"[DAILY_MAINTENANCE] backup failed: {exc}", flush=True)
+			await _send_daily_maintenance_notice(
+				"❌ 每日自动备份失败\n"
+				f"原因：{exc}\n"
+				"为保护数据，本次不活跃用户清理已取消。"
+			)
+			return False
+
+	print(f"[DAILY_MAINTENANCE] backup sent: {backup_filename}", flush=True)
+	return True
+
+
+def _next_daily_maintenance_time(now: datetime) -> datetime:
+	next_run = now.replace(
+		hour=DAILY_MAINTENANCE_HOUR,
+		minute=DAILY_MAINTENANCE_MINUTE,
+		second=0,
+		microsecond=0,
+	)
+	if next_run <= now:
+		next_run += timedelta(days=1)
+	return next_run
+
+
+async def _daily_maintenance_worker() -> None:
+	while True:
+		now = datetime.now(UTC8)
+		next_run = _next_daily_maintenance_time(now)
+		delay_seconds = max(1.0, (next_run - now).total_seconds())
+		print(
+			f"[DAILY_MAINTENANCE] next run at {next_run.isoformat()}",
+			flush=True,
+		)
+		await asyncio.sleep(delay_seconds)
+
+		try:
+			await _send_daily_maintenance_notice(
+				"🕓 每日维护任务开始\n"
+				"执行顺序：数据库备份 → 不活跃用户清理"
+			)
+			if await _run_scheduled_backup():
+				await _execute_inactive_cleanup()
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			print(f"[DAILY_MAINTENANCE] unexpected failure: {exc}", flush=True)
+			await _send_daily_maintenance_notice(
+				f"❌ 每日维护发生未预期错误：{exc}"
+			)
 
 
 def _base36_encode(value: int) -> str:
@@ -3351,7 +3487,7 @@ async def cmd_invite(message: Message) -> None:
 		"🔹 邀请连结有效 24 小时，仅限一位符合资格的申请者通过。\n"
 		"🔹 申请者仍须拥有超过 2 天的通行证 (透过分享资源)，并完成飞官考试。\n"
 		"🔹 连结建立后，过期、无人使用或申请遭拒均不退还通行证期限。\n"
-		"🎁 申请者进入机场后，邀请人可得 2 天通行证期限。",
+		"🎁 申请者进入机场后，邀请人可得 1 天通行证期限。",
 		reply_markup=_paid_invite_confirmation_keyboard(),
 	)
 
@@ -4259,25 +4395,30 @@ async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
 		f"{actual_added_seconds} seconds for applicant {context.user_id}",
 		flush=True,
 	)
-	invited_user_name = str(context.request.from_user.full_name or context.user_id)
+	invited_user_name = str(context.request.from_user.full_name or context.inviter_user_id)
+	inviter_user_id = (context.inviter_user_id)
+
+
 	try:
 		if actual_added_seconds > 0:
 			text = (
 				"🎉 推荐成功\n\n"
-				"你建立的单人邀请已有一位旅客通过审核。\n"
+				f"你 ({inviter_user_id}) 建立的单人邀请已有一位旅客通过审核。\n"
 				f"受邀旅客：{invited_user_name}。\n"
-				"飞行通行证奖励：2 天。\n"
+				f"飞行通行证奖励：。\n"
 				f"本次实际增加：{_format_duration(actual_added_seconds)}。\n"
 				f"当前剩余时间：{_format_duration(remaining_seconds)}。"
 			)
 		else:
 			text = (
 				"🎉 推荐成功\n\n"
-				"你建立的单人邀请已有一位旅客通过审核。\n"
+				f"你 ({inviter_user_id}) 建立的单人邀请已有一位旅客通过审核。\n"
 				f"受邀旅客：{invited_user_name}。\n"
 				"由于飞行通行证已达到 3 天上限，本次未再增加期限。"
 			)
 		await bot.send_message(chat_id=context.inviter_user_id, text=text)
+		if BACKUP_TELEGRAM_USER_ID is not None:
+			await bot.send_message(chat_id=BACKUP_TELEGRAM_USER_ID, text=text)
 	except Exception as exc:
 		print(
 			f"[PAID_INVITE] reward notice failed for inviter "
@@ -6031,13 +6172,20 @@ async def main() -> None:
 	)
 	workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
 	forward_worker = asyncio.create_task(_media_forward_worker())
+	maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
 	try:
 		await dp.start_polling(bot)
 	finally:
 		for worker in workers:
 			worker.cancel()
 		forward_worker.cancel()
-		await asyncio.gather(*workers, forward_worker, return_exceptions=True)
+		maintenance_worker.cancel()
+		await asyncio.gather(
+			*workers,
+			forward_worker,
+			maintenance_worker,
+			return_exceptions=True,
+		)
 		blacklist_store.close()
 		batch_store.close()
 		received_media_store.close()

@@ -5599,9 +5599,14 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			notify_keyboard_rows: list[list[InlineKeyboardButton]] = []
 			can_request_takeoff_clearance = (
 				bool(batch_id)
-				and str(parsed.get("valid_until", "")) == "99991231235959"
-				and not bool(parsed.get("no_forward", False))
-				and int(parsed.get("flash_seconds", 0) or 0) == 0
+				and (
+					is_admin
+					or (
+						str(parsed.get("valid_until", "")) == "99991231235959"
+						and not bool(parsed.get("no_forward", False))
+						and int(parsed.get("flash_seconds", 0) or 0) == 0
+					)
+				)
 			)
 			if can_request_takeoff_clearance:
 				notify_keyboard_rows.append([
@@ -5942,9 +5947,17 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	marked_flash_key: tuple[str, int] | None = None
 
 	print(f"2693 receiver_id={receiver_id}")
-	is_admin  = False
-	if receiver_id in ADMIN_USER_IDS:
-		is_admin = True
+	reader_user_id = (
+		int(receiver_id)
+		if receiver_id is not None
+		else int(message.from_user.id) if message.from_user else 0
+	)
+	is_admin = reader_user_id in ADMIN_USER_IDS
+	delivery_data = dict(data)
+	if is_admin:
+		# 管理员豁免只影响本次输出，不修改 token 中的原始设定。
+		delivery_data["no_forward"] = False
+		delivery_data["flash_seconds"] = 0
 
 	valid_until_dt = datetime.strptime(
 		str(data["valid_until"]),
@@ -5964,17 +5977,11 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 
 		return {"ok": False, "reason": "expired", "overdue_seconds": overdue_seconds}
 
-	flash_seconds = int(data.get("flash_seconds", 0))
+	flash_seconds = int(delivery_data.get("flash_seconds", 0))
 	nonce_key = str(data.get("nonce", ""))
 	if flash_seconds > 0:
-		if receiver_id is not None:
-			reader_user_id = int(receiver_id)
-		elif message.from_user:
-			reader_user_id = int(message.from_user.id)
-		else:
-			raise ValueError("无法确认闪读用户")
 		if reader_user_id <= 0:
-			raise ValueError("闪读用户 ID 无效")
+			raise ValueError("无法确认闪读用户")
 
 		flash_key = (nonce_key, reader_user_id)
 		expires_at = USED_FLASH_NONCES.get(flash_key)
@@ -5992,7 +5999,7 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	try:
 		sent_media_messages, skipped_items = await _send_all_media(
 			message,
-			data,
+			delivery_data,
 			receiver_id=receiver_id,
 		)
 		if not sent_media_messages and skipped_items:

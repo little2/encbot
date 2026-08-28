@@ -182,7 +182,7 @@ PAID_INVITE_LOCKS: dict[str, asyncio.Lock] = {}
 USED_PAID_INVITES: dict[str, int] = {}
 USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
 PENDING_AIRPORT_JOIN_INVITES: dict[int, tuple[str, int]] = {}
-MEDIA_QUEUE: asyncio.Queue[Message] = asyncio.Queue(maxsize=100)
+MEDIA_QUEUE: asyncio.Queue[tuple[Message, dict[str, Any]]] = asyncio.Queue(maxsize=100)
 MEDIA_FORWARD_QUEUE: asyncio.Queue[tuple[int, int]] = asyncio.Queue(maxsize=200)
 MEDIA_WORKER_COUNT = 3
 MAX_BATCH_MEDIA = 10
@@ -1894,9 +1894,20 @@ async def _handle_cancel_encoded(
 
 def _upload_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(
-		inline_keyboard=[[
-			InlineKeyboardButton(text="⚙️ 上传已完成，进入配置", callback_data="enc:upload:done"),
-		]]
+		inline_keyboard=[
+			[
+				InlineKeyboardButton(
+					text="⚙️ 上传已完成，进入配置",
+					callback_data="enc:upload:done",
+				),
+			],
+			[
+				InlineKeyboardButton(
+					text="❌ 取消上传",
+					callback_data="enc:upload:cancel",
+				),
+			],
+		]
 	)
 
 
@@ -1995,16 +2006,19 @@ async def _finish_upload(
 		UPLOAD_SESSIONS.pop(key, None)
 
 
-async def _process_queued_media(message: Message) -> None:
+async def _process_queued_media(
+	message: Message,
+	expected_session: dict[str, Any],
+) -> bool:
 	if not message.from_user:
-		return
+		return False
 	key = (message.chat.id, message.from_user.id)
 	lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())
 
 	async with lock:
 		session = UPLOAD_SESSIONS.get(key)
-		if not session:
-			return
+		if session is not expected_session:
+			return False
 		file_type, file_id = _extract_media_info(message)
 		file_unique_id = _extract_media_unique_id(message)
 		preview_info = _extract_preview_info(message, file_type, file_id)
@@ -2021,19 +2035,21 @@ async def _process_queued_media(message: Message) -> None:
 		session["processed_count"] = int(session.get("processed_count", 0)) + 1
 
 		await _update_upload_panel(message, session)
+		return True
 
 
 async def _media_worker(worker_id: int) -> None:
 	while True:
-		message = await MEDIA_QUEUE.get()
+		message, expected_session = await MEDIA_QUEUE.get()
 		key = (
 			(message.chat.id, message.from_user.id)
 			if message.from_user
 			else None
 		)
 		try:
-			await _process_queued_media(message)
-			_enqueue_media_forward(message)
+			was_processed = await _process_queued_media(message, expected_session)
+			if was_processed:
+				_enqueue_media_forward(message)
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:
@@ -2045,6 +2061,8 @@ async def _media_worker(worker_id: int) -> None:
 				except Exception:
 					pass
 				session = UPLOAD_SESSIONS.get(key)
+				if session is not expected_session:
+					session = None
 				was_added = bool(session and any(
 					str(item.get("file_unique_id", "")) == file_unique_id
 					for item in session.get("items", [])
@@ -2111,6 +2129,7 @@ async def cmd_admin(message: Message) -> None:
 		"/expire15 [用户id] — 直接设置指定用户 15 天通行证",
 		"/ban [用户id|回复用户] [原因] — 封禁用户并从群组移除",
 		"/unban [用户id] — 解除封禁",
+		"/unbanleft — 解除所有因主动离开产生的黑名单并通知用户",
 		"/baninfo [用户id] — 查看黑名单资料",
 		"/banlist [页码] — 查看黑名单列表",
 		"/inactive_candidate [页码] — 查看不活跃候选用户",
@@ -2594,12 +2613,17 @@ def _parse_positive_user_id(raw: str) -> int | None:
 
 
 def _format_blacklist_entry(entry: BlacklistEntry) -> str:
-	return (
+	text = (
 		f"用户 ID：{entry.user_id}\n"
 		f"封禁原因：{entry.reason}\n"
 		f"操作管理员：{entry.created_by}\n"
 		f"封禁时间：{_format_timestamp_utc8(entry.created_at)}"
 	)
+	if entry.expires_at > 0:
+		text += f"\n到期时间：{_format_timestamp_utc8(entry.expires_at)}"
+	else:
+		text += "\n到期时间：永久"
+	return text
 
 
 @dp.message(F.chat.type == "private", Command("userinfo"))
@@ -2662,6 +2686,11 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 			f"封禁原因：{blacklist_entry.reason}",
 			f"操作管理员：{blacklist_entry.created_by}",
 			f"封禁时间：{_format_timestamp_utc8(blacklist_entry.created_at)}",
+			(
+				f"到期时间：{_format_timestamp_utc8(blacklist_entry.expires_at)}"
+				if blacklist_entry.expires_at > 0
+				else "到期时间：永久"
+			),
 		])
 
 	await message.reply("\n".join(lines))
@@ -2671,8 +2700,9 @@ async def _ban_user(
 	user_id: int,
 	reason: str,
 	created_by: int,
+	expires_at: int = 0,
 ) -> tuple[BlacklistEntry, str]:
-	entry = blacklist_store.ban(user_id, reason, created_by)
+	entry = blacklist_store.ban(user_id, reason, created_by, expires_at)
 	user_expire_cache.remove(user_id)
 	if MESSAGE_REWARD_CHAT_ID == 0:
 		return entry, "MESSAGE_REWARD_CHAT_ID 尚未配置"
@@ -2681,6 +2711,7 @@ async def _ban_user(
 		await bot.ban_chat_member(
 			chat_id=MESSAGE_REWARD_CHAT_ID,
 			user_id=user_id,
+			until_date=expires_at or None,
 		)
 	except Exception as exc:
 		print(
@@ -2696,6 +2727,7 @@ async def _ban_user(
 			lambda: bot.ban_chat_member(
 				chat_id=ENCODED_FORWARD_CHAT_ID,
 				user_id=user_id,
+				until_date=expires_at or None,
 			),
 		)
 	except Exception as exc:
@@ -2757,6 +2789,33 @@ async def cmd_ban(message: Message, command: CommandObject) -> None:
 	await message.reply(reply_text)
 
 
+async def _unban_user_from_airport_groups(user_id: int) -> str:
+	errors: list[str] = []
+	for chat_name, chat_id in (
+		("航站大厅", MESSAGE_REWARD_CHAT_ID),
+		("镇泰飞机场", ENCODED_FORWARD_CHAT_ID),
+	):
+		if chat_id == 0:
+			continue
+		try:
+			await _telegram_call_with_retry(
+				f"unban {chat_name} member",
+				lambda chat_id=chat_id: bot.unban_chat_member(
+					chat_id=chat_id,
+					user_id=user_id,
+					only_if_banned=True,
+				),
+			)
+		except Exception as exc:
+			print(
+				f"[BLACKLIST] failed to unban user {user_id} "
+				f"from {chat_name} ({chat_id}): {exc}",
+				flush=True,
+			)
+			errors.append(f"{chat_name}：{exc}")
+	return "；".join(errors)
+
+
 @dp.message(Command("unban"))
 async def cmd_unban(message: Message, command: CommandObject) -> None:
 	if not _is_admin_message(message):
@@ -2770,50 +2829,75 @@ async def cmd_unban(message: Message, command: CommandObject) -> None:
 	if not blacklist_store.is_blocked(target_user_id):
 		await message.reply(f"ℹ️ 用户不在黑名单中：{target_user_id}")
 		return
-	if MESSAGE_REWARD_CHAT_ID == 0:
-		await message.reply(
-			"❌ 无法解除封禁：MESSAGE_REWARD_CHAT_ID 尚未配置"
-		)
+	group_unban_error = await _unban_user_from_airport_groups(target_user_id)
+	if group_unban_error:
+		await message.reply(f"❌ 群组解除封禁失败：{group_unban_error}")
 		return
-
-	try:
-		await bot.unban_chat_member(
-			chat_id=MESSAGE_REWARD_CHAT_ID,
-			user_id=target_user_id,
-			only_if_banned=True,
-		)
-	except Exception as exc:
-		print(
-			f"[BLACKLIST] failed to unban user {target_user_id} "
-			f"from chat {MESSAGE_REWARD_CHAT_ID}: {exc}",
-			flush=True,
-		)
-		await message.reply(f"❌ 群组解除封禁失败：{exc}")
-		return
-
-	try:
-		await _telegram_call_with_retry(
-			"unban encoded-forward member",
-			lambda: bot.unban_chat_member(
-				chat_id=ENCODED_FORWARD_CHAT_ID,
-				user_id=target_user_id,
-				only_if_banned=True,
-			),
-		)
-	except Exception as exc:
-		print(
-			f"[BLACKLIST] failed to unban user {target_user_id} "
-			f"from chat {ENCODED_FORWARD_CHAT_ID}: {exc}",
-			flush=True,
-		)
-		await message.reply(f"❌ 群组解除封禁失败：{exc}")
-		return
-
 
 	blacklist_store.unban(target_user_id)
 	await message.reply(
 		f"✅ 已从黑名单移除并解除群组封禁：{target_user_id}"
 	)
+
+
+@dp.message(Command("unbanleft"))
+async def cmd_unban_voluntary_leavers(message: Message) -> None:
+	if not _is_admin_message(message):
+		return
+
+	entries = blacklist_store.list_by_reason_prefix("主动离开")
+	if not entries:
+		await message.reply("ℹ️ 没有因主动离开而仍在黑名单中的用户")
+		return
+
+	status_message = await message.reply(
+		f"⏳ 正在解除因主动离开产生的黑名单，共 {len(entries)} 人……"
+	)
+	unbanned_user_ids: list[int] = []
+	failed_user_ids: list[int] = []
+	notice_failed_user_ids: list[int] = []
+
+	for entry in entries:
+		user_id = entry.user_id
+		group_unban_error = await _unban_user_from_airport_groups(user_id)
+		if group_unban_error:
+			failed_user_ids.append(user_id)
+			continue
+
+		blacklist_store.unban(user_id)
+		unbanned_user_ids.append(user_id)
+		try:
+			await bot.send_message(
+				chat_id=user_id,
+				text=(
+					"✅ 已解除拉黑\n\n"
+					"你因主动离开群组产生的黑名单记录已解除，"
+					"现在可以重新申请加入。"
+				),
+			)
+		except Exception as exc:
+			notice_failed_user_ids.append(user_id)
+			print(
+				f"[UNBAN_LEFT] notice failed for user {user_id}: {exc}",
+				flush=True,
+			)
+
+	lines = [
+		"✅ 主动离开黑名单批量解除完成",
+		"",
+		f"成功解除：{len(unbanned_user_ids)} 人",
+		f"解除失败：{len(failed_user_ids)} 人",
+		f"私信失败：{len(notice_failed_user_ids)} 人",
+	]
+	if failed_user_ids:
+		lines.append(
+			"解除失败用户：" + ", ".join(map(str, failed_user_ids[:30]))
+		)
+	if notice_failed_user_ids:
+		lines.append(
+			"私信失败用户：" + ", ".join(map(str, notice_failed_user_ids[:30]))
+		)
+	await status_message.edit_text("\n".join(lines))
 
 
 @dp.message(Command("baninfo"))
@@ -2857,9 +2941,14 @@ async def cmd_banlist(message: Message, command: CommandObject) -> None:
 
 	lines = [f"🚫 黑名单（第 {page}/{total_pages} 页，共 {total} 人）"]
 	for entry in entries:
+		expiry_text = (
+			_format_timestamp_utc8(entry.expires_at)
+			if entry.expires_at > 0
+			else "永久"
+		)
 		lines.append(
 			f"{entry.user_id}｜{entry.reason}｜"
-			f"{_format_timestamp_utc8(entry.created_at)}"
+			f"{_format_timestamp_utc8(entry.created_at)}｜到期：{expiry_text}"
 		)
 	await message.reply("\n".join(lines))
 
@@ -4585,7 +4674,7 @@ async def _send_lobby_welcome(user: User) -> None:
 		)
 
 
-@dp.chat_member(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
+@dp.chat_member(F.chat.id == MESSAGE_REWARD_CHAT_ID)
 async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 	target_user = update.new_chat_member.user
 	target_user_id = int(target_user.id)
@@ -4602,15 +4691,18 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 		and is_member
 	)
 	if is_new_lobby_member:
-		if (
-			target_user_id not in ADMIN_USER_IDS
-			and blacklist_store.is_blocked(target_user_id)
-		):
+		blacklist_entry = (
+			blacklist_store.get(target_user_id)
+			if target_user_id not in ADMIN_USER_IDS
+			else None
+		)
+		if blacklist_entry is not None:
 			try:
 				await _ban_user(
 					user_id=target_user_id,
 					reason="黑名单用户异常重新加入航站大厅",
 					created_by=int(bot.id),
+					expires_at=blacklist_entry.expires_at,
 				)
 			except Exception as exc:
 				print(
@@ -4640,18 +4732,16 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 	if actor_user_id != target_user_id:
 		return
 
-	chat_name = (
-		"航站大厅"
-		if int(update.chat.id) == MESSAGE_REWARD_CHAT_ID
-		else "镇泰飞机场"
-	)
-	reason = f"主动离开{chat_name}，系统自动加入黑名单"
+	chat_name = "航站大厅"
+	expires_at = int(datetime.now().timestamp()) + 24 * 60 * 60
+	reason = f"主动离开{chat_name}，系统自动加入黑名单一天"
 	PENDING_AIRPORT_JOIN_INVITES.pop(target_user_id, None)
 	try:
 		_, group_ban_error = await _ban_user(
 			user_id=target_user_id,
 			reason=reason,
 			created_by=int(bot.id),
+			expires_at=expires_at,
 		)
 	except Exception as exc:
 		print(
@@ -4670,9 +4760,9 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 		await bot.send_message(
 			chat_id=target_user_id,
 			text=(
-				"🚫 已列入黑名单\n\n"
+				"🚫 已列入黑名单一天\n\n"
 				f"系统检测到你主动离开{chat_name}。\n"
-				"根据机场规则，主动离群将自动失去再次申请资格。"
+				"24 小时后将自动恢复申请资格。"
 			),
 		)
 	except Exception as exc:
@@ -4835,7 +4925,7 @@ async def on_media(message: Message) -> None:
 	file_unique_ids.add(file_unique_id)
 
 	try:
-		MEDIA_QUEUE.put_nowait(message)
+		MEDIA_QUEUE.put_nowait((message, session))
 	except asyncio.QueueFull:
 		file_unique_ids.discard(file_unique_id)
 		if int(session["accepted_count"]) == 0:
@@ -5787,6 +5877,25 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				await callback.answer(f"完成上传失败: {exc}", show_alert=True)
 				return
 		await callback.answer("已进入编辑菜单")
+		return
+	if callback.data == "enc:upload:cancel":
+		key = (callback.message.chat.id, callback.from_user.id)
+		lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())
+		async with lock:
+			session = UPLOAD_SESSIONS.get(key)
+			if not session or session.get("panel_message_id") != callback.message.message_id:
+				await callback.answer("此上传批次已结束", show_alert=True)
+				return
+			UPLOAD_SESSIONS.pop(key, None)
+		try:
+			await callback.message.edit_text(
+				"✅ 已取消上传，本批媒体不会送出。",
+				reply_markup=None,
+			)
+		except Exception as exc:
+			print(f"[UPLOAD_CANCEL] panel update failed: {exc}", flush=True)
+			await callback.message.edit_reply_markup(reply_markup=None)
+		await callback.answer("已取消上传")
 		return
 
 	state_key = (callback.message.chat.id, callback.message.message_id)

@@ -2382,6 +2382,7 @@ async def cmd_admin(message: Message) -> None:
 		"/inactive_candidate [页码] — 查看不活跃候选用户",
 		"/inactive_cleanup — 清理长期不活跃用户",
 		"/backup — 将 SQLite 数据库备份发送给指定管理员",
+		"/clear_media — 备份数据库后清空 received_media 与 batch",
 		"/restore — 回复 SQLite 备份文件以恢复数据库",
 		"/userinfo [用户id] — 查询用户时限及黑名单状态",
 		"/invite — 建立单人邀请（需先满足飞机场成员资格与通行证条件）",
@@ -2405,6 +2406,28 @@ def _create_sqlite_backup(source_path: Path, destination_path: Path) -> None:
 	finally:
 		destination.close()
 		source.close()
+
+
+def _clear_media_tables(database_path: Path) -> tuple[int, int]:
+	connection = sqlite3.connect(database_path)
+	connection.execute("PRAGMA busy_timeout=5000")
+	try:
+		connection.execute("BEGIN IMMEDIATE")
+		received_media_count = int(
+			connection.execute("SELECT COUNT(*) FROM received_media").fetchone()[0]
+		)
+		batch_count = int(
+			connection.execute("SELECT COUNT(*) FROM batch").fetchone()[0]
+		)
+		connection.execute("DELETE FROM received_media")
+		connection.execute("DELETE FROM batch")
+		connection.commit()
+		return received_media_count, batch_count
+	except Exception:
+		connection.rollback()
+		raise
+	finally:
+		connection.close()
 
 
 RESTORE_REQUIRED_SCHEMA = {
@@ -2572,6 +2595,80 @@ async def cmd_backup(message: Message) -> None:
 			f"📨 已发送给：{KEY_MAN_ID}\n"
 			f"⏱️ 耗时：{elapsed_seconds} 秒\n\n"
 			"临时备份文件已自动清理。"
+		)
+
+
+@dp.message(F.chat.type == "private", Command("clear_media"))
+async def cmd_clear_media(message: Message) -> None:
+	if not message.from_user:
+		return
+	requester_user_id = int(message.from_user.id)
+	if requester_user_id != KEY_MAN_ID and not _is_admin_message(message):
+		await message.reply("❌ 無權限")
+		return
+
+	status_message = await message.reply(
+		"🗄️ 正在備份資料庫；備份成功送出後才會清空媒體資料……"
+	)
+
+	async def update_status(text: str) -> None:
+		try:
+			await status_message.edit_text(text)
+		except Exception as exc:
+			print(f"[CLEAR_MEDIA] status update failed: {exc}", flush=True)
+
+	async with BACKUP_LOCK:
+		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		backup_filename = f"encbot-before-clear-media-{timestamp}.sqlite3"
+		try:
+			with tempfile.TemporaryDirectory(prefix="encbot-clear-media-") as temp_dir:
+				backup_path = Path(temp_dir) / backup_filename
+				await asyncio.to_thread(
+					_create_sqlite_backup,
+					user_expire_db_path,
+					backup_path,
+				)
+				backup_size_text = _format_file_size(backup_path.stat().st_size)
+				await update_status(
+					"🗄️ 備份已建立，正在傳送給 KEY_MAN……"
+				)
+				await _telegram_call_with_retry(
+					"send pre-clear-media sqlite backup",
+					lambda: bot.send_document(
+						chat_id=KEY_MAN_ID,
+						document=FSInputFile(
+							backup_path,
+							filename=backup_filename,
+						),
+						caption=(
+							"清空 received_media、batch 前的完整資料庫備份\n"
+							f"{timestamp} (UTC+8)"
+						),
+					),
+				)
+
+				await update_status(
+					"✅ 備份已送出，正在清空 received_media 和 batch……"
+				)
+				received_media_count, batch_count = await asyncio.to_thread(
+					_clear_media_tables,
+					user_expire_db_path,
+				)
+		except Exception as exc:
+			print(f"[CLEAR_MEDIA] failed: {exc}", flush=True)
+			await update_status(
+				"❌ 清空失敗\n\n"
+				f"原因：{exc}\n"
+				"若備份未成功送出，資料表不會被清空。"
+			)
+			return
+
+		await update_status(
+			"✅ 媒體資料已清空\n\n"
+			f"備份：{backup_filename}\n"
+			f"大小：{backup_size_text}\n"
+			f"received_media：刪除 {received_media_count} 筆\n"
+			f"batch：刪除 {batch_count} 筆"
 		)
 
 

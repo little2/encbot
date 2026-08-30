@@ -25,6 +25,9 @@ class ReceivedMediaStore:
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'accepted')),
                 batch_id TEXT,
+                thumb_file_id TEXT,
+                thumb_file_unique_id TEXT,
+                thumb_phash TEXT,
                 created_at INTEGER NOT NULL,
                 accepted_at INTEGER
             )
@@ -47,6 +50,18 @@ class ReceivedMediaStore:
         if "accepted_at" not in columns:
             self.connection.execute(
                 "ALTER TABLE received_media ADD COLUMN accepted_at INTEGER"
+            )
+        if "thumb_file_id" not in columns:
+            self.connection.execute(
+                "ALTER TABLE received_media ADD COLUMN thumb_file_id TEXT"
+            )
+        if "thumb_file_unique_id" not in columns:
+            self.connection.execute(
+                "ALTER TABLE received_media ADD COLUMN thumb_file_unique_id TEXT"
+            )
+        if "thumb_phash" not in columns:
+            self.connection.execute(
+                "ALTER TABLE received_media ADD COLUMN thumb_phash TEXT"
             )
         self.connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_received_media_batch_id
@@ -132,7 +147,10 @@ class ReceivedMediaStore:
         if len(normalized_batch_id) > 64:
             raise ValueError("batch_id cannot exceed 64 characters")
 
-        rows: list[tuple[str, str, str, int, int, int, str, int]] = []
+        rows: list[tuple[
+            str, str, str, int, int, int, str,
+            str | None, str | None, str | None, int,
+        ]] = []
         seen: set[str] = set()
         for item in items:
             file_unique_id = str(item.get("file_unique_id", "")).strip()
@@ -147,6 +165,9 @@ class ReceivedMediaStore:
                 int(item.get("source_chat_id", 0)),
                 int(item.get("source_message_id", 0)),
                 normalized_batch_id,
+                str(item.get("thumb_file_id", "") or "") or None,
+                str(item.get("thumb_file_unique_id", "") or "") or None,
+                str(item.get("thumb_phash", "") or "") or None,
                 int(time.time()),
             ))
         if not rows:
@@ -188,10 +209,13 @@ class ReceivedMediaStore:
                     source_message_id,
                     status,
                     batch_id,
+                    thumb_file_id,
+                    thumb_file_unique_id,
+                    thumb_phash,
                     created_at,
                     accepted_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL)
             """, rows)
         return []
 

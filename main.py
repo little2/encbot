@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageOps
+import imagehash
 from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
@@ -56,15 +58,7 @@ from dotenv import load_dotenv
 
 
 
-def _parse_whitelist_ids(raw: str) -> set[int]:
-	ids: set[int] = set()
-	for item in str(raw or "").split(","):
-		text = item.strip()
-		if not text:
-			continue
-		if text.lstrip("-").isdigit():
-			ids.add(int(text))
-	return ids
+
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -74,17 +68,62 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
 		value = default
 	return min(maximum, max(minimum, value))
 
+def _parse_user_ids(value) -> set[int]:
+    """将 SharedConfig 中的用户 ID 列表规范化为整数集合。"""
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = str(value or "").split(",")
 
-load_dotenv(dotenv_path='.env')
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MEDIA_FORWARD_USER_ID = int(os.getenv("MEDIA_FORWARD_USER_ID", "0") or 0)
-ADMIN_USER_IDS = _parse_whitelist_ids(os.getenv("ADMIN_USER_IDS", ""))
+    user_ids: set[int] = set()
+    for item in values:
+        try:
+            user_id = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        if user_id > 0:
+            user_ids.add(user_id)
+    return user_ids
+
+load_dotenv(
+	dotenv_path=Path(__file__).resolve().parent / ".env",
+	override=True,
+)
+
+from config import (
+	MAX_VALID_DURATION_MINUTES,
+	INACTIVE_EXPIRE_DAYS,
+	MEDIA_UPLOAD_EXTEND_MINUTES,
+	OTHERS_UPLOAD_EXTEND_MINUTES,
+	PHOTO_UPLOAD_EXTEND_MINUTES,
+	MEDIA_VIEW_COST_MINUTES,
+	MESSAGE_EXTEND_MINUTES,
+	REWARD_HOURS_PER_MEDIA,
+	VIDEO_UPLOAD_EXTEND_MINUTES,
+)
+
+
+from shared_config import SharedConfig
+SharedConfig.load(True)
+
+BACKUP_TOKEN = os.getenv("BACKUP_TOKEN", "")
+
+SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
+X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
+KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
+BOT_TOKEN = SharedConfig.get("my_bot_token", "")
+
+ADMIN_USER_IDS = _parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
+# 主要用户始终保留访问权限，避免共享配置遗漏时意外将其排除。
+ADMIN_USER_IDS.update(_parse_user_ids([KEY_MAN_ID]))
+
 #取件码及预览发送群组
-ENCODED_FORWARD_CHAT_ID = int(os.getenv("ENCODED_FORWARD_CHAT_ID", "0") or 0)
-ENCODED_FORWARD_THREAD_ID = int(os.getenv("ENCODED_FORWARD_THREAD_ID", "0") or 0)
+TERMINAL_CHANNEL_ID = int(os.getenv("TERMINAL_CHANNEL_ID", "0") or 0)
+TERMINAL_CHANNEL_THREAD_ID = int(os.getenv("TERMINAL_CHANNEL_THREAD_ID", "0") or 0)
 #发言可以增加通行证时间的群组
-MESSAGE_REWARD_CHAT_ID = int(os.getenv("MESSAGE_REWARD_CHAT_ID", str(ENCODED_FORWARD_CHAT_ID)) or 0)
-BACKUP_TELEGRAM_USER_ID = int(os.getenv("BACKUP_TELEGRAM_USER_ID", "0") or 0)
+AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(TERMINAL_CHANNEL_ID)) or 0)
+APRON_CHANNEL_ID = int(os.getenv("APRON_CHANNEL_ID", "0") or 0)
+
 DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
 DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
 DEFAULT_COVER_FILE_ID: str | None = None
@@ -104,17 +143,7 @@ batch_store = BatchStore(db_path=user_expire_db_path)
 received_media_store = ReceivedMediaStore(db_path=user_expire_db_path)
 shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 
-from config import (
-	MAX_VALID_DURATION_MINUTES,
-	INACTIVE_EXPIRE_DAYS,
-	MEDIA_UPLOAD_EXTEND_MINUTES,
-	OTHERS_UPLOAD_EXTEND_MINUTES,
-	PHOTO_UPLOAD_EXTEND_MINUTES,
-	MEDIA_VIEW_COST_MINUTES,
-	MESSAGE_EXTEND_MINUTES,
-	REWARD_HOURS_PER_MEDIA,
-	VIDEO_UPLOAD_EXTEND_MINUTES,
-)
+
 from textwrap import dedent
 
 UTC8 = timezone(timedelta(hours=8))
@@ -182,9 +211,24 @@ PAID_INVITE_LOCKS: dict[str, asyncio.Lock] = {}
 USED_PAID_INVITES: dict[str, int] = {}
 USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
 PENDING_AIRPORT_JOIN_INVITES: dict[int, tuple[str, int]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class MediaForwardTask:
+	from_chat_id: int
+	message_id: int
+	file_id: str
+	file_type: str
+	file_unique_id: str
+	thumb_bytes: bytes | None = None
+	thumb_phash: str | None = None
+
+
 MEDIA_QUEUE: asyncio.Queue[tuple[Message, dict[str, Any]]] = asyncio.Queue(maxsize=100)
-MEDIA_FORWARD_QUEUE: asyncio.Queue[tuple[int, int]] = asyncio.Queue(maxsize=200)
+MEDIA_FORWARD_QUEUE: asyncio.Queue[MediaForwardTask] = asyncio.Queue(maxsize=200)
 MEDIA_WORKER_COUNT = 3
+MEDIA_FORWARD_INTERVAL_SECONDS = 1.1
+MEDIA_FORWARD_MAX_ATTEMPTS = 3
 MAX_BATCH_MEDIA = 10
 MAX_USER_PENDING = 15
 PREVIEW_DOWNLOAD_LIMIT = asyncio.Semaphore(4)
@@ -539,9 +583,6 @@ def _extract_media_unique_id(message: Message) -> str:
 
 def _extract_preview_info(message: Message, file_type: str, file_id: str) -> dict[str, str]:
 	"""提取转发预览所需的缩略图标识，不把它写入取件码。"""
-	if file_type == "document":
-		return {}
-
 	preview = None
 
 	if file_type == "photo" and message.photo:
@@ -570,11 +611,51 @@ def _extract_preview_info(message: Message, file_type: str, file_id: str) -> dic
 		preview = message.audio.thumbnail
 	elif file_type == "sticker" and message.sticker:
 		preview = message.sticker.thumbnail
+	elif file_type == "document" and message.document:
+		preview = message.document.thumbnail
 
+	thumb_file_id = str(
+		getattr(preview, "file_id", "")
+		or (file_id if file_type == "photo" else "")
+	)
+	thumb_file_unique_id = str(
+		getattr(preview, "file_unique_id", "") or ""
+	)
 	return {
-		"preview_file_id": str(getattr(preview, "file_id", "") or (file_id if file_type == "photo" else "")),
-		"preview_unique_id": str(getattr(preview, "file_unique_id", "") or file_id),
+		"preview_file_id": thumb_file_id,
+		"preview_unique_id": thumb_file_unique_id or file_id,
+		"thumb_file_id": thumb_file_id,
+		"thumb_file_unique_id": thumb_file_unique_id,
 	}
+
+
+def _process_thumbnail(image_bytes: bytes) -> tuple[str, bytes]:
+	with Image.open(BytesIO(image_bytes)) as source:
+		image = ImageOps.exif_transpose(source).convert("RGB")
+		thumb_phash = str(imagehash.phash(image))
+		if max(image.size) > 480:
+			image.thumbnail((480, 480), Image.Resampling.LANCZOS)
+
+		output = BytesIO()
+		image.save(output, format="JPEG", quality=85, optimize=True)
+		return thumb_phash, output.getvalue()
+
+
+async def _prepare_thumbnail(thumb_file_id: str) -> tuple[str, bytes | None]:
+	if not thumb_file_id:
+		return "", None
+	try:
+		async with PREVIEW_DOWNLOAD_LIMIT:
+			buffer = BytesIO()
+			await bot.download(thumb_file_id, destination=buffer)
+		return await asyncio.to_thread(_process_thumbnail, buffer.getvalue())
+	except Exception as exc:
+		print(
+			f"[THUMB_PHASH] 缩略图下载或 pHash 计算失败 "
+			f"(file_id={thumb_file_id}): {exc}",
+			flush=True,
+		)
+		return "", None
 
 
 def _extract_media_metadata(message: Message, file_type: str) -> dict[str, Any]:
@@ -657,7 +738,7 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 	if batch_content:
 		return_text += f"{escape(batch_content)}\n\n"
 	else:
-		return_text += f"<code>{"ㅤ"*25}</code>\n\n"
+		return_text += f"<code>{'ㅤ' * 25}</code>\n\n"
 
 	if bool(data.get("anonymous", False)):
 		user_url = "[匿名]"
@@ -1157,40 +1238,194 @@ async def _delete_message_later(sent_message: Message, delay_seconds: int) -> No
 		pass
 
 
-def _enqueue_media_forward(message: Message) -> None:
-	if MEDIA_FORWARD_USER_ID <= 0:
+def _enqueue_media_forward(task: MediaForwardTask) -> None:
+	if X_MAN_BOT_ID == 0 and APRON_CHANNEL_ID == 0:
 		return
 
 	try:
-		MEDIA_FORWARD_QUEUE.put_nowait((message.chat.id, message.message_id))
+		MEDIA_FORWARD_QUEUE.put_nowait(task)
+		print(
+			f"[MEDIA_FORWARD] queued file_unique_id={task.file_unique_id} "
+			f"queue_size={MEDIA_FORWARD_QUEUE.qsize()}",
+			flush=True,
+		)
 	except asyncio.QueueFull:
 		print("[MEDIA_FORWARD] queue full, skipped", flush=True)
 
 
-async def _forward_media_in_background(from_chat_id: int, message_id: int) -> None:
-	if MEDIA_FORWARD_USER_ID <= 0:
-		return
+async def _forward_media_in_background(task: MediaForwardTask) -> None:
+	destinations = (
+		("APRON_CHANNEL_ID", APRON_CHANNEL_ID),
+		("X_MAN_BOT_ID", X_MAN_BOT_ID),
+	)
+	seen_destination_ids: set[int] = set()
+	for destination_name, destination_id in destinations:
+		if destination_id == 0 or destination_id in seen_destination_ids:
+			continue
+		seen_destination_ids.add(destination_id)
+		await _send_media_forward_to_destination(
+			task,
+			destination_name,
+			destination_id,
+		)
 
+
+async def _run_media_forward_operation(
+	operation: Any,
+	description: str,
+) -> Any | None:
+	for attempt in range(1, MEDIA_FORWARD_MAX_ATTEMPTS + 1):
+		try:
+			result = await asyncio.wait_for(operation(), timeout=30)
+		except TelegramRetryAfter as exc:
+			wait_seconds = float(exc.retry_after) + 1.0
+			print(
+				f"[MEDIA_FORWARD] {description} 触发 Flood Control，"
+				f"Telegram 要求等待 {wait_seconds:.1f} 秒 "
+				f"({attempt}/{MEDIA_FORWARD_MAX_ATTEMPTS})",
+				flush=True,
+			)
+			if attempt >= MEDIA_FORWARD_MAX_ATTEMPTS:
+				break
+			await asyncio.sleep(wait_seconds)
+		except Exception as exc:
+			print(f"[MEDIA_FORWARD] {description} 失败: {exc}", flush=True)
+			return None
+		else:
+			print(f"[MEDIA_FORWARD] {description} 成功", flush=True)
+			await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
+			return result
+
+	print(
+		f"[MEDIA_FORWARD] {description} 已达到最大重试次数",
+		flush=True,
+	)
+	return None
+
+
+async def _send_file_id_with_switchbot(
+	task: MediaForwardTask,
+	*,
+	file_id: str | None = None,
+	file_type: str | None = None,
+) -> Message | None:
+	if not BACKUP_TOKEN or int(KEY_MAN_ID or 0) == 0:
+		print(
+			"[MEDIA_FORWARD] BACKUP_TOKEN or KEY_MAN_ID is not configured",
+			flush=True,
+		)
+		return None
+
+	media_file_id = file_id or task.file_id
+	media_type = file_type or task.file_type
+	switchbot = Bot(token=BACKUP_TOKEN)
 	try:
-		await asyncio.wait_for(
-			bot.copy_message(
-				chat_id=MEDIA_FORWARD_USER_ID,
-				from_chat_id=from_chat_id,
-				message_id=message_id,
-			),
-			timeout=30,
+		send_method = {
+			"document": switchbot.send_document,
+			"photo": switchbot.send_photo,
+			"video": switchbot.send_video,
+			"audio": switchbot.send_audio,
+			"voice": switchbot.send_voice,
+			"animation": switchbot.send_animation,
+			"sticker": switchbot.send_sticker,
+		}.get(media_type)
+		if send_method is None:
+			raise ValueError(f"Unsupported media type: {media_type}")
+		media_argument = {
+			"document": "document",
+			"photo": "photo",
+			"video": "video",
+			"audio": "audio",
+			"voice": "voice",
+			"animation": "animation",
+			"sticker": "sticker",
+		}[media_type]
+		return await send_method(
+			chat_id=int(KEY_MAN_ID),
+			**{media_argument: media_file_id},
 		)
 	except Exception as exc:
-		print(f"[MEDIA_FORWARD] forward failed: {exc}", flush=True)
+		print(f"[MEDIA_FORWARD] switchbot send failed: {exc}", flush=True)
+		return None
+	finally:
+		await switchbot.session.close()
+
+
+async def _send_media_forward_to_destination(
+	task: MediaForwardTask,
+	destination_name: str,
+	destination_id: int,
+) -> None:
+	print(
+		f"[MEDIA_FORWARD] 开始发送至 {destination_name}={destination_id}",
+		flush=True,
+	)
+	copy_result = await _run_media_forward_operation(
+		lambda: bot.copy_message(
+			chat_id=destination_id,
+			from_chat_id=task.from_chat_id,
+			message_id=task.message_id,
+		),
+		f"原媒体发送至 {destination_name}",
+	)
+	if destination_id == APRON_CHANNEL_ID and copy_result is not None:
+		# print(task.file_id, flush=True)
+		# print(f"copy_result={copy_result}", flush=True)
+		await bot.delete_message(
+			chat_id=destination_id,
+			message_id=copy_result.message_id,
+		)
+		await _send_file_id_with_switchbot(task)
+
+	if not task.thumb_bytes:
+		return
+
+	thumb_message = await _run_media_forward_operation(
+		lambda: bot.send_photo(
+			chat_id=destination_id,
+			photo=BufferedInputFile(
+				task.thumb_bytes or b"",
+				filename=f"{task.file_unique_id}.jpg",
+			),
+			caption=(
+				f"file_unique_id: <code>{escape(task.file_unique_id)}</code>\n"
+				f"thumb_phash: <code>{escape(task.thumb_phash or '')}</code>"
+			),
+			parse_mode="HTML"
+		),
+		f"缩略图发送至 {destination_name}",
+	)
+	if (
+		destination_id == APRON_CHANNEL_ID
+		and isinstance(thumb_message, Message)
+		and thumb_message.photo
+	):
+		thumb_file_id = thumb_message.photo[-1].file_id
+		# print(thumb_file_id, flush=True)
+		await bot.delete_message(
+			chat_id=destination_id,
+			message_id=thumb_message.message_id,
+		)
+		await _send_file_id_with_switchbot(
+			task,
+			file_id=thumb_file_id,
+			file_type="photo",
+		)
 
 
 async def _media_forward_worker() -> None:
 	while True:
-		from_chat_id, message_id = await MEDIA_FORWARD_QUEUE.get()
+		task = await MEDIA_FORWARD_QUEUE.get()
 		try:
-			await _forward_media_in_background(from_chat_id, message_id)
+			await _forward_media_in_background(task)
 		except asyncio.CancelledError:
 			raise
+		except Exception as exc:
+			print(
+				f"[MEDIA_FORWARD] worker 处理任务失败 "
+				f"(file_unique_id={task.file_unique_id}): {exc}",
+				flush=True,
+			)
 		finally:
 			MEDIA_FORWARD_QUEUE.task_done()
 
@@ -1279,8 +1514,8 @@ async def _forward_encoded_if_whitelisted(
 	batch_content: str = "",
 ) -> dict:
 	global DEFAULT_COVER_FILE_ID
-	if ENCODED_FORWARD_CHAT_ID == 0:
-		return {"ok":False,"error_msg":"ENCODED_FORWARD_CHAT_ID is 0"}
+	if TERMINAL_CHANNEL_ID == 0:
+		return {"ok":False,"error_msg":"TERMINAL_CHANNEL_ID is 0"}
 
 	def success_result(published_message: Message, mode: str) -> dict[str, Any]:
 		return {
@@ -1366,7 +1601,7 @@ async def _forward_encoded_if_whitelisted(
 					content = processed[cache_key][0]
 				preview_payloads.append((content, filename))
 
-		thread_id = ENCODED_FORWARD_THREAD_ID if ENCODED_FORWARD_THREAD_ID > 0 else None
+		thread_id = TERMINAL_CHANNEL_THREAD_ID if TERMINAL_CHANNEL_THREAD_ID > 0 else None
 		caption = display_text if len(display_text) <= 1024 else None
 
 	except Exception as exc:
@@ -1393,7 +1628,7 @@ async def _forward_encoded_if_whitelisted(
 				published_message = await _telegram_call_with_retry(
 					"send preview photo",
 					lambda: bot.send_photo(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
+						chat_id=TERMINAL_CHANNEL_ID,
 						message_thread_id=thread_id,
 						photo=BufferedInputFile(content, filename=filename),
 						caption=caption,
@@ -1406,7 +1641,7 @@ async def _forward_encoded_if_whitelisted(
 					published_message = await _telegram_call_with_retry(
 						"send encoded text",
 						lambda: bot.send_message(
-							chat_id=ENCODED_FORWARD_CHAT_ID,
+							chat_id=TERMINAL_CHANNEL_ID,
 							message_thread_id=thread_id,
 							text=display_text,
 							reply_markup=display_keyboard,
@@ -1419,7 +1654,7 @@ async def _forward_encoded_if_whitelisted(
 				album = await _telegram_call_with_retry(
 					"send preview album",
 					lambda: bot.send_media_group(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
+						chat_id=TERMINAL_CHANNEL_ID,
 						message_thread_id=thread_id,
 						media=media,
 					),
@@ -1428,7 +1663,7 @@ async def _forward_encoded_if_whitelisted(
 				published_message = await _telegram_call_with_retry(
 					"send encoded text",
 					lambda: bot.send_message(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
+						chat_id=TERMINAL_CHANNEL_ID,
 						message_thread_id=thread_id,
 						text=display_text,
 						reply_markup=display_keyboard,
@@ -1442,7 +1677,7 @@ async def _forward_encoded_if_whitelisted(
 
 				# if DEFAULT_COVER_FILE_ID is None:
 				# 	send_result = await bot.send_photo(
-				# 		chat_id=ENCODED_FORWARD_CHAT_ID,
+				# 		chat_id=TERMINAL_CHANNEL_ID,
 				# 		message_thread_id=thread_id,
 				# 		photo=BufferedInputFile(
 				# 			_get_seline_image_bytes(),
@@ -1456,7 +1691,7 @@ async def _forward_encoded_if_whitelisted(
 				# 	DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
 				# else:
 				# 	await bot.send_photo(
-				# 		chat_id=ENCODED_FORWARD_CHAT_ID,
+				# 		chat_id=TERMINAL_CHANNEL_ID,
 				# 		message_thread_id=thread_id,
 				# 		photo=DEFAULT_COVER_FILE_ID,
 				# 		caption=caption,
@@ -1467,7 +1702,7 @@ async def _forward_encoded_if_whitelisted(
 
 				# if caption is None:
 				# 	await bot.send_message(
-				# 		chat_id=ENCODED_FORWARD_CHAT_ID,
+				# 		chat_id=TERMINAL_CHANNEL_ID,
 				# 		message_thread_id=thread_id,
 				# 		text=display_text,
 				# 		parse_mode="HTML",
@@ -1478,7 +1713,7 @@ async def _forward_encoded_if_whitelisted(
 			fallback_message = await _telegram_call_with_retry(
 				"send text fallback",
 				lambda: bot.send_message(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
+					chat_id=TERMINAL_CHANNEL_ID,
 					message_thread_id=thread_id,
 					text=display_text,
 					parse_mode="HTML",
@@ -1494,7 +1729,7 @@ async def _forward_encoded_if_whitelisted(
 				published_message = await _telegram_call_with_retry(
 					"send default cover",
 					lambda: bot.send_photo(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
+						chat_id=TERMINAL_CHANNEL_ID,
 						message_thread_id=thread_id,
 						photo=BufferedInputFile(
 							_get_seline_image_bytes(),
@@ -1514,7 +1749,7 @@ async def _forward_encoded_if_whitelisted(
 				published_message = await _telegram_call_with_retry(
 					"send cached default cover",
 					lambda: bot.send_photo(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
+						chat_id=TERMINAL_CHANNEL_ID,
 						message_thread_id=thread_id,
 						photo=DEFAULT_COVER_FILE_ID,
 						caption=caption,
@@ -1527,7 +1762,7 @@ async def _forward_encoded_if_whitelisted(
 				published_message = await _telegram_call_with_retry(
 					"send encoded text",
 					lambda: bot.send_message(
-						chat_id=ENCODED_FORWARD_CHAT_ID,
+						chat_id=TERMINAL_CHANNEL_ID,
 						message_thread_id=thread_id,
 						text=display_text,
 						reply_markup=display_keyboard,
@@ -1558,8 +1793,8 @@ async def _forward_encoded_if_whitelisted(
 			fallback_message = await _telegram_call_with_retry(
 				"send encoded fallback text",
 				lambda: bot.send_message(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
-					message_thread_id=ENCODED_FORWARD_THREAD_ID if ENCODED_FORWARD_THREAD_ID > 0 else None,
+					chat_id=TERMINAL_CHANNEL_ID,
+					message_thread_id=TERMINAL_CHANNEL_THREAD_ID if TERMINAL_CHANNEL_THREAD_ID > 0 else None,
 					text=display_text,
 					reply_markup=display_keyboard,
 					parse_mode="HTML",
@@ -2009,19 +2244,23 @@ async def _finish_upload(
 async def _process_queued_media(
 	message: Message,
 	expected_session: dict[str, Any],
-) -> bool:
+) -> MediaForwardTask | None:
 	if not message.from_user:
-		return False
+		return None
 	key = (message.chat.id, message.from_user.id)
 	lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())
 
 	async with lock:
 		session = UPLOAD_SESSIONS.get(key)
 		if session is not expected_session:
-			return False
+			return None
 		file_type, file_id = _extract_media_info(message)
 		file_unique_id = _extract_media_unique_id(message)
 		preview_info = _extract_preview_info(message, file_type, file_id)
+		thumb_phash, thumb_bytes = await _prepare_thumbnail(
+			str(preview_info.get("thumb_file_id", "")),
+		)
+		preview_info["thumb_phash"] = thumb_phash
 		media_metadata = _extract_media_metadata(message, file_type)
 		session["items"].append({
 			"file_id": file_id,
@@ -2035,7 +2274,15 @@ async def _process_queued_media(
 		session["processed_count"] = int(session.get("processed_count", 0)) + 1
 
 		await _update_upload_panel(message, session)
-		return True
+		return MediaForwardTask(
+			from_chat_id=int(message.chat.id),
+			message_id=int(message.message_id),
+			file_id=file_id,
+			file_type=file_type,
+			file_unique_id=file_unique_id,
+			thumb_bytes=thumb_bytes,
+			thumb_phash=thumb_phash or None,
+		)
 
 
 async def _media_worker(worker_id: int) -> None:
@@ -2047,9 +2294,9 @@ async def _media_worker(worker_id: int) -> None:
 			else None
 		)
 		try:
-			was_processed = await _process_queued_media(message, expected_session)
-			if was_processed:
-				_enqueue_media_forward(message)
+			forward_task = await _process_queued_media(message, expected_session)
+			if forward_task is not None:
+				_enqueue_media_forward(forward_task)
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:
@@ -2233,7 +2480,7 @@ async def cmd_backup(message: Message) -> None:
 		return
 	requester_user_id = int(message.from_user.id)
 	if (
-		requester_user_id != BACKUP_TELEGRAM_USER_ID
+		requester_user_id != KEY_MAN_ID
 		and not _is_admin_message(message)
 	):
 		await message.reply("❌ 无效指令")
@@ -2299,7 +2546,7 @@ async def cmd_backup(message: Message) -> None:
 				await _telegram_call_with_retry(
 					"send sqlite backup",
 					lambda: bot.send_document(
-						chat_id=BACKUP_TELEGRAM_USER_ID,
+						chat_id=KEY_MAN_ID,
 						document=FSInputFile(backup_path, filename=backup_filename),
 						caption=f"SQLite 数据库备份\n{timestamp} (UTC+8)",
 					),
@@ -2322,7 +2569,7 @@ async def cmd_backup(message: Message) -> None:
 			"✅ 数据库备份完成\n\n"
 			f"📄 文件：{backup_filename}\n"
 			f"📦 大小：{backup_size_text}\n"
-			f"📨 已发送给：{BACKUP_TELEGRAM_USER_ID}\n"
+			f"📨 已发送给：{KEY_MAN_ID}\n"
 			f"⏱️ 耗时：{elapsed_seconds} 秒\n\n"
 			"临时备份文件已自动清理。"
 		)
@@ -2334,7 +2581,7 @@ async def cmd_restore(message: Message) -> None:
 		return
 	requester_user_id = int(message.from_user.id)
 	if (
-		requester_user_id != BACKUP_TELEGRAM_USER_ID
+		requester_user_id != KEY_MAN_ID
 		and not _is_admin_message(message)
 	):
 		await message.reply("❌ 无效指令")
@@ -2444,7 +2691,7 @@ async def cmd_restore(message: Message) -> None:
 				await _telegram_call_with_retry(
 					"send pre-restore sqlite backup",
 					lambda: bot.send_document(
-						chat_id=BACKUP_TELEGRAM_USER_ID,
+						chat_id=KEY_MAN_ID,
 						document=FSInputFile(
 							current_backup_path,
 							filename=current_backup_path.name,
@@ -2495,7 +2742,7 @@ async def cmd_restore(message: Message) -> None:
 				f"📄 来源文件：{file_name}\n"
 				f"👤 通行证记录：{restored_user_count}\n"
 				f"📦 媒体记录：{restored_media_count}\n"
-				f"🛡️ 恢复前备份已发送给：{BACKUP_TELEGRAM_USER_ID}\n"
+				f"🛡️ 恢复前备份已发送给：{KEY_MAN_ID}\n"
 				f"⏱️ 耗时：{elapsed_seconds} 秒\n\n"
 				"内存缓存已经重新载入，临时文件已自动清理。"
 			)
@@ -2704,19 +2951,19 @@ async def _ban_user(
 ) -> tuple[BlacklistEntry, str]:
 	entry = blacklist_store.ban(user_id, reason, created_by, expires_at)
 	user_expire_cache.remove(user_id)
-	if MESSAGE_REWARD_CHAT_ID == 0:
-		return entry, "MESSAGE_REWARD_CHAT_ID 尚未配置"
+	if AIRPORT_LOBBY_GROUP_ID == 0:
+		return entry, "AIRPORT_LOBBY_GROUP_ID 尚未配置"
 
 	try:
 		await bot.ban_chat_member(
-			chat_id=MESSAGE_REWARD_CHAT_ID,
+			chat_id=AIRPORT_LOBBY_GROUP_ID,
 			user_id=user_id,
 			until_date=expires_at or None,
 		)
 	except Exception as exc:
 		print(
 			f"[BLACKLIST] failed to ban user {user_id} "
-			f"from chat {MESSAGE_REWARD_CHAT_ID}: {exc}",
+			f"from chat {AIRPORT_LOBBY_GROUP_ID}: {exc}",
 			flush=True,
 		)
 		return entry, str(exc)
@@ -2725,7 +2972,7 @@ async def _ban_user(
 		await _telegram_call_with_retry(
 			"ban encoded-forward member",
 			lambda: bot.ban_chat_member(
-				chat_id=ENCODED_FORWARD_CHAT_ID,
+				chat_id=TERMINAL_CHANNEL_ID,
 				user_id=user_id,
 				until_date=expires_at or None,
 			),
@@ -2733,7 +2980,7 @@ async def _ban_user(
 	except Exception as exc:
 		print(
 			f"[BLACKLIST] failed to ban user {user_id} "
-			f"from chat {ENCODED_FORWARD_CHAT_ID}: {exc}",
+			f"from chat {TERMINAL_CHANNEL_ID}: {exc}",
 			flush=True,
 		)
 		return entry, str(exc)	
@@ -2792,8 +3039,8 @@ async def cmd_ban(message: Message, command: CommandObject) -> None:
 async def _unban_user_from_airport_groups(user_id: int) -> str:
 	errors: list[str] = []
 	for chat_name, chat_id in (
-		("航站大厅", MESSAGE_REWARD_CHAT_ID),
-		("镇泰飞机场", ENCODED_FORWARD_CHAT_ID),
+		("航站大厅", AIRPORT_LOBBY_GROUP_ID),
+		("镇泰飞机场", TERMINAL_CHANNEL_ID),
 	):
 		if chat_id == 0:
 			continue
@@ -3113,11 +3360,11 @@ async def cmd_inactive_candidate(message: Message, command: CommandObject) -> No
 	]
 	for user_id, user_expire in page_candidates:
 		airport_status = await _lookup_inactive_chat_status(
-			ENCODED_FORWARD_CHAT_ID,
+			TERMINAL_CHANNEL_ID,
 			user_id,
 		)
 		lobby_status = await _lookup_inactive_chat_status(
-			MESSAGE_REWARD_CHAT_ID,
+			AIRPORT_LOBBY_GROUP_ID,
 			user_id,
 		)
 		expired_days = max(
@@ -3144,14 +3391,14 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 		if message is not None:
 			await message.reply(text)
 			return
-		if BACKUP_TELEGRAM_USER_ID <= 0:
+		if KEY_MAN_ID <= 0:
 			print(f"[INACTIVE_CLEANUP] {text}", flush=True)
 			return
 		try:
 			await _telegram_call_with_retry(
 				"send scheduled inactive cleanup status",
 				lambda: bot.send_message(
-					chat_id=BACKUP_TELEGRAM_USER_ID,
+					chat_id=KEY_MAN_ID,
 					text=text,
 				),
 			)
@@ -3161,7 +3408,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 	if INACTIVE_CLEANUP_LOCK.locked():
 		await notify("⏳ 不活跃用户清理正在执行，本次任务不重复执行")
 		return False
-	if ENCODED_FORWARD_CHAT_ID == 0 or MESSAGE_REWARD_CHAT_ID == 0:
+	if TERMINAL_CHANNEL_ID == 0 or AIRPORT_LOBBY_GROUP_ID == 0:
 		await notify("❌ 飞机场或航站大厅尚未配置，无法执行清理")
 		return False
 
@@ -3219,7 +3466,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 
 			airport_ok, airport_result, airport_participant_error = (
 				await _remove_inactive_user_from_chat(
-					ENCODED_FORWARD_CHAT_ID,
+					TERMINAL_CHANNEL_ID,
 					user_id,
 					"飞机场",
 				)
@@ -3241,7 +3488,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 
 			lobby_ok, lobby_result, lobby_participant_error = (
 				await _remove_inactive_user_from_chat(
-					MESSAGE_REWARD_CHAT_ID,
+					AIRPORT_LOBBY_GROUP_ID,
 					user_id,
 					"航站大厅",
 				)
@@ -3271,7 +3518,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				await _telegram_call_with_retry(
 					f"broadcast inactive cleanup for {user_id}",
 					lambda: bot.send_message(
-						chat_id=MESSAGE_REWARD_CHAT_ID,
+						chat_id=AIRPORT_LOBBY_GROUP_ID,
 						text=(
 							"🧹 长期不活跃成员清理\n\n"
 							f'<a href="tg://user?id={user_id}">旅客 {user_id}</a> '
@@ -3332,25 +3579,25 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 
 
 async def _send_daily_maintenance_notice(text: str) -> None:
-	if BACKUP_TELEGRAM_USER_ID <= 0:
-		print(f"[DAILY_MAINTENANCE] {text}", flush=True)
+	if KEY_MAN_ID <= 0:
+		print(f"ℹ️[DAILY_MAINTENANCE] {text}", flush=True)
 		return
 	try:
 		await _telegram_call_with_retry(
 			"send daily maintenance notice",
 			lambda: bot.send_message(
-				chat_id=BACKUP_TELEGRAM_USER_ID,
+				chat_id=KEY_MAN_ID,
 				text=text,
 			),
 		)
 	except Exception as exc:
-		print(f"[DAILY_MAINTENANCE] notice failed: {exc}", flush=True)
+		print(f"❌[DAILY_MAINTENANCE] notice failed: {exc}", flush=True)
 
 
 async def _run_scheduled_backup() -> bool:
-	if BACKUP_TELEGRAM_USER_ID <= 0:
+	if KEY_MAN_ID <= 0:
 		print(
-			"[DAILY_MAINTENANCE] BACKUP_TELEGRAM_USER_ID is not configured",
+			"ℹ️[DAILY_MAINTENANCE] KEY_MAN_ID is not configured",
 			flush=True,
 		)
 		return False
@@ -3370,7 +3617,7 @@ async def _run_scheduled_backup() -> bool:
 				await _telegram_call_with_retry(
 					"send daily sqlite backup",
 					lambda: bot.send_document(
-						chat_id=BACKUP_TELEGRAM_USER_ID,
+						chat_id=KEY_MAN_ID,
 						document=FSInputFile(
 							backup_path,
 							filename=backup_filename,
@@ -3413,7 +3660,7 @@ async def _daily_maintenance_worker() -> None:
 		next_run = _next_daily_maintenance_time(now)
 		delay_seconds = max(1.0, (next_run - now).total_seconds())
 		print(
-			f"[DAILY_MAINTENANCE] next run at {next_run.isoformat()}",
+			f"ℹ️ [DAILY_MAINTENANCE] next run at {next_run.isoformat()}",
 			flush=True,
 		)
 		await asyncio.sleep(delay_seconds)
@@ -3511,7 +3758,7 @@ def _is_current_chat_member(status: Any) -> bool:
 
 
 async def _is_airport_member(user_id: int) -> bool:
-	for chat_id in (MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID):
+	for chat_id in (AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID):
 		if chat_id == 0:
 			continue
 		try:
@@ -3551,7 +3798,7 @@ async def cmd_invite(message: Message) -> None:
 	if blacklist_store.is_blocked(user_id):
 		# await message.reply("❌ 你目前无法建立邀请连结。")
 		return
-	if MESSAGE_REWARD_CHAT_ID == 0:
+	if AIRPORT_LOBBY_GROUP_ID == 0:
 		await message.reply("❌ 航站大厅尚未配置，请联系塔台。")
 		return
 	if not await _is_airport_member(user_id):
@@ -3614,7 +3861,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 	except Exception:
 		pass
 
-	if MESSAGE_REWARD_CHAT_ID == 0:
+	if AIRPORT_LOBBY_GROUP_ID == 0:
 		await callback.message.edit_text("❌ 航站大厅尚未配置，请联系塔台。")
 		return
 	if blacklist_store.is_blocked(user_id):
@@ -3645,7 +3892,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 		consumed = False
 		try:
 			invite = await bot.create_chat_invite_link(
-				chat_id=MESSAGE_REWARD_CHAT_ID,
+				chat_id=AIRPORT_LOBBY_GROUP_ID,
 				name=_build_paid_invite_name(user_id),
 				expire_date=datetime.now(timezone.utc) + timedelta(
 					hours=PAID_INVITE_LIFETIME_HOURS
@@ -3683,7 +3930,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 			if invite is not None:
 				try:
 					await bot.revoke_chat_invite_link(
-						chat_id=MESSAGE_REWARD_CHAT_ID,
+						chat_id=AIRPORT_LOBBY_GROUP_ID,
 						invite_link=invite.invite_link,
 					)
 				except Exception as revoke_exc:
@@ -3762,12 +4009,12 @@ def _airport_access_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _airport_registration_error() -> str | None:
-	if MESSAGE_REWARD_CHAT_ID == 0:
+	if AIRPORT_LOBBY_GROUP_ID == 0:
 		return "❌ 航站大厅尚未配置，请联系塔台。"
 
 	try:
 		member_count = await bot.get_chat_member_count(
-			chat_id=MESSAGE_REWARD_CHAT_ID,
+			chat_id=AIRPORT_LOBBY_GROUP_ID,
 		)
 	except Exception as exc:
 		print(
@@ -3829,19 +4076,19 @@ def _airport_quiz_keyboard(question_index: int) -> InlineKeyboardMarkup:
 
 
 async def _get_or_create_airport_invite_link() -> str:
-	if ENCODED_FORWARD_CHAT_ID == 0:
+	if TERMINAL_CHANNEL_ID == 0:
 		raise RuntimeError("镇泰飞机场尚未配置")
 
 	async with AIRPORT_INVITE_LINK_LOCK:
 		stored_link = shared_invite_link_store.get(AIRPORT_INVITE_LINK_KEY)
-		if stored_link and stored_link.chat_id != ENCODED_FORWARD_CHAT_ID:
+		if stored_link and stored_link.chat_id != TERMINAL_CHANNEL_ID:
 			shared_invite_link_store.delete(AIRPORT_INVITE_LINK_KEY)
 			stored_link = None
 
 		if stored_link:
 			try:
 				validated_link = await bot.edit_chat_invite_link(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
+					chat_id=TERMINAL_CHANNEL_ID,
 					invite_link=stored_link.invite_link,
 					name=AIRPORT_INVITE_LINK_NAME,
 					creates_join_request=True,
@@ -3862,7 +4109,7 @@ async def _get_or_create_airport_invite_link() -> str:
 				if not bool(validated_link.is_revoked):
 					shared_invite_link_store.save(
 						AIRPORT_INVITE_LINK_KEY,
-						ENCODED_FORWARD_CHAT_ID,
+						TERMINAL_CHANNEL_ID,
 						str(validated_link.invite_link),
 						AIRPORT_INVITE_LINK_NAME,
 						created_at=stored_link.created_at,
@@ -3871,7 +4118,7 @@ async def _get_or_create_airport_invite_link() -> str:
 				shared_invite_link_store.delete(AIRPORT_INVITE_LINK_KEY)
 
 		invite = await bot.create_chat_invite_link(
-			chat_id=ENCODED_FORWARD_CHAT_ID,
+			chat_id=TERMINAL_CHANNEL_ID,
 			name=AIRPORT_INVITE_LINK_NAME,
 			creates_join_request=True,
 		)
@@ -3879,14 +4126,14 @@ async def _get_or_create_airport_invite_link() -> str:
 		try:
 			shared_invite_link_store.save(
 				AIRPORT_INVITE_LINK_KEY,
-				ENCODED_FORWARD_CHAT_ID,
+				TERMINAL_CHANNEL_ID,
 				invite_link,
 				AIRPORT_INVITE_LINK_NAME,
 			)
 		except Exception:
 			try:
 				await bot.revoke_chat_invite_link(
-					chat_id=ENCODED_FORWARD_CHAT_ID,
+					chat_id=TERMINAL_CHANNEL_ID,
 					invite_link=invite_link,
 				)
 			except Exception as revoke_exc:
@@ -3899,10 +4146,10 @@ async def _get_or_create_airport_invite_link() -> str:
 
 
 async def _send_airport_join_request_invite(user_id: int, request_plant_channel: int = 0) -> None:
-	if MESSAGE_REWARD_CHAT_ID == 0 or ENCODED_FORWARD_CHAT_ID == 0:
+	if AIRPORT_LOBBY_GROUP_ID == 0 or TERMINAL_CHANNEL_ID == 0:
 		raise RuntimeError("航站大厅尚未配置")
 
-	status = await bot.get_chat_member(chat_id=MESSAGE_REWARD_CHAT_ID, user_id=user_id)
+	status = await bot.get_chat_member(chat_id=AIRPORT_LOBBY_GROUP_ID, user_id=user_id)
 	airport_invitation = ""
 	create_chat_id = 0
 	chat_title = ""
@@ -3918,7 +4165,7 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 		)
 
 	if request_plant_channel ==1 or is_current_member:
-		create_chat_id = ENCODED_FORWARD_CHAT_ID
+		create_chat_id = TERMINAL_CHANNEL_ID
 		chat_title = "🛫 镇泰飞机场 "
 
 		airport_invitation = (
@@ -3934,7 +4181,7 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 
 
 	else:
-		create_chat_id = MESSAGE_REWARD_CHAT_ID
+		create_chat_id = AIRPORT_LOBBY_GROUP_ID
 		airport_invitation = (
 			"亲爱的旅客，诚邀您进入「镇泰飞机场航站大厅」。\n\n"
 			"航站大厅是所有旅客起飞前必须加入的候机区域，"
@@ -3945,10 +4192,10 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 
 	invite_link = ""
 	invite_expire_timestamp = 0
-	is_shared_airport_invite = create_chat_id == ENCODED_FORWARD_CHAT_ID
+	is_shared_airport_invite = create_chat_id == TERMINAL_CHANNEL_ID
 	if is_shared_airport_invite:
 		invite_link = await _get_or_create_airport_invite_link()
-	elif create_chat_id == MESSAGE_REWARD_CHAT_ID:
+	elif create_chat_id == AIRPORT_LOBBY_GROUP_ID:
 		remembered_invite = PENDING_AIRPORT_JOIN_INVITES.get(user_id)
 		if remembered_invite is not None:
 			remembered_link, remembered_expire_timestamp = remembered_invite
@@ -4033,13 +4280,13 @@ async def cmd_rule(message: Message) -> None:
 @dp.message(F.chat.type == "private", Command("airport_access_request"))
 async def cmd_airport_access_request(message: Message) -> None:
 
-	if MESSAGE_REWARD_CHAT_ID == 0:
+	if AIRPORT_LOBBY_GROUP_ID == 0:
 		await message.reply("❌ 航站大厅尚未配置，请联系塔台。")
 		return
 
 	user_id = int(message.from_user.id)
 	if not await _is_member_of_chat(
-		MESSAGE_REWARD_CHAT_ID,
+		AIRPORT_LOBBY_GROUP_ID,
 		user_id,
 	):
 		registration_error = await _airport_registration_error()
@@ -4131,7 +4378,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 		)
 		return
 
-	if MESSAGE_REWARD_CHAT_ID == 0:
+	if AIRPORT_LOBBY_GROUP_ID == 0:
 		await callback.answer("机场群组尚未配置，请联系塔台", show_alert=True, cache_time=0)
 		return
 
@@ -4288,7 +4535,7 @@ def _build_join_context(join_request: ChatJoinRequest) -> AirportJoinContext:
 	)
 	inviter_user_id = (
 		_parse_paid_invite_name(invite.name)
-		if invite is not None and chat_id == MESSAGE_REWARD_CHAT_ID
+		if invite is not None and chat_id == AIRPORT_LOBBY_GROUP_ID
 		else None
 	)
 	return AirportJoinContext(
@@ -4303,8 +4550,68 @@ def _build_join_context(join_request: ChatJoinRequest) -> AirportJoinContext:
 
 
 async def _is_member_of_chat(chat_id: int, user_id: int) -> bool:
-	status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+	try:
+		status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+	except TelegramBadRequest as exc:
+		if "chat not found" in str(exc).lower():
+			print(
+				f"[群組查詢失敗] 找不到群組 {chat_id}，請檢查啟動時的群組權限提示。",
+				flush=True,
+			)
+			return False
+		raise
+
 	return _is_current_chat_member(status)
+
+
+async def _check_bot_group_admin_permissions() -> None:
+	groups = (
+		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
+		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
+		("APRON_CHANNEL_ID", APRON_CHANNEL_ID),
+	)
+	for setting_name, chat_id in groups:
+		if chat_id == 0:
+			print(
+				f"❌[群組設定錯誤] {setting_name} 尚未配置。",
+				flush=True,
+			)
+			continue
+
+		try:
+			bot_status = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+		except TelegramBadRequest as exc:
+			if "chat not found" in str(exc).lower():
+				print(
+					f"❌[群組設定錯誤] {setting_name}={chat_id} 找不到群組。"
+					"請確認群組 ID 正確，並將機器人加入群組及設為管理員。",
+					flush=True,
+				)
+				continue
+			print(
+				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}",
+				flush=True,
+			)
+			continue
+		except Exception as exc:
+			print(
+				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}",
+				flush=True,
+			)
+			continue
+
+		if bot_status.status not in ("administrator", "creator"):
+			print(
+				f"❌[群組權限不足] 機器人在 {setting_name}={chat_id} 中的身分為 "
+				f"{bot_status.status}，請將機器人設為管理員。",
+				flush=True,
+			)
+			continue
+
+		print(
+			f"✅[群組檢查成功] 機器人已在 {setting_name}={chat_id} 中並具有管理員權限。",
+			flush=True,
+		)
 
 
 async def _get_join_rejection_reason(
@@ -4339,9 +4646,9 @@ async def _get_join_rejection_reason(
 			),
 		)
 
-	if context.chat_id == ENCODED_FORWARD_CHAT_ID:
+	if context.chat_id == TERMINAL_CHANNEL_ID:
 		if not await _is_member_of_chat(
-			MESSAGE_REWARD_CHAT_ID,
+			AIRPORT_LOBBY_GROUP_ID,
 			context.user_id,
 		):
 			return JoinRejection(
@@ -4403,7 +4710,7 @@ async def _notify_join_retry(context: AirportJoinContext) -> None:
 
 
 def _remember_failed_join_invite(context: AirportJoinContext) -> None:
-	if context.chat_id != MESSAGE_REWARD_CHAT_ID or not context.invite_link:
+	if context.chat_id != AIRPORT_LOBBY_GROUP_ID or not context.invite_link:
 		return
 	now_timestamp = int(datetime.now().timestamp())
 	if (
@@ -4506,8 +4813,8 @@ async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
 				"由于飞行通行证已达到 3 天上限，本次未再增加期限。"
 			)
 		await bot.send_message(chat_id=context.inviter_user_id, text=text)
-		if BACKUP_TELEGRAM_USER_ID is not None:
-			await bot.send_message(chat_id=BACKUP_TELEGRAM_USER_ID, text=text)
+		if KEY_MAN_ID is not None:
+			await bot.send_message(chat_id=KEY_MAN_ID, text=text)
 	except Exception as exc:
 		print(
 			f"[PAID_INVITE] reward notice failed for inviter "
@@ -4541,7 +4848,7 @@ async def _after_join_approved(context: AirportJoinContext) -> None:
 				flush=True,
 			)
 
-	if context.chat_id == MESSAGE_REWARD_CHAT_ID:
+	if context.chat_id == AIRPORT_LOBBY_GROUP_ID:
 		PENDING_AIRPORT_JOIN_INVITES.pop(context.user_id, None)
 		try:
 			await _send_airport_join_request_invite(
@@ -4566,7 +4873,7 @@ async def _after_join_approved(context: AirportJoinContext) -> None:
 				pass
 		return
 
-	if context.chat_id == ENCODED_FORWARD_CHAT_ID:
+	if context.chat_id == TERMINAL_CHANNEL_ID:
 		AIRPORT_QUIZ_PASSED_UNTIL.pop(context.user_id, None)
 		try:
 			await _send_airport_welcome(context.user_id)
@@ -4617,7 +4924,7 @@ async def _process_join_request(context: AirportJoinContext) -> None:
 	await _after_join_approved(context)
 
 
-@dp.chat_join_request(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}))
+@dp.chat_join_request(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID}))
 async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 	context = _build_join_context(join_request)
 	if context.is_paid_invite:
@@ -4659,7 +4966,7 @@ async def _send_lobby_welcome(user: User) -> None:
 
 	if TRADE_IMAGE_PATHS[0].is_file():
 		await bot.send_photo(
-			chat_id=MESSAGE_REWARD_CHAT_ID,
+			chat_id=AIRPORT_LOBBY_GROUP_ID,
 			photo=FSInputFile(TRADE_IMAGE_PATHS[0]),
 			caption=welcome_text,
 			parse_mode="HTML",
@@ -4667,14 +4974,14 @@ async def _send_lobby_welcome(user: User) -> None:
 		)
 	else:
 		await bot.send_message(
-			chat_id=MESSAGE_REWARD_CHAT_ID,
+			chat_id=AIRPORT_LOBBY_GROUP_ID,
 			text=welcome_text,
 			parse_mode="HTML",
 			reply_markup=welcome_keyboard,
 		)
 
 
-@dp.chat_member(F.chat.id == MESSAGE_REWARD_CHAT_ID)
+@dp.chat_member(F.chat.id == AIRPORT_LOBBY_GROUP_ID)
 async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 	target_user = update.new_chat_member.user
 	target_user_id = int(target_user.id)
@@ -4686,7 +4993,7 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 	was_member = _is_current_chat_member(update.old_chat_member)
 	is_member = _is_current_chat_member(update.new_chat_member)
 	is_new_lobby_member = (
-		int(update.chat.id) == MESSAGE_REWARD_CHAT_ID
+		int(update.chat.id) == AIRPORT_LOBBY_GROUP_ID
 		and not was_member
 		and is_member
 	)
@@ -4791,14 +5098,14 @@ def _extract_automatic_forward_source(message: Message) -> tuple[int, int] | Non
 
 
 @dp.message(
-	F.chat.id == MESSAGE_REWARD_CHAT_ID,
+	F.chat.id == AIRPORT_LOBBY_GROUP_ID,
 	F.is_automatic_forward == True,
 )
 async def on_lobby_channel_auto_forward(message: Message) -> None:
 	source_location = _extract_automatic_forward_source(message)
 	if not source_location:
 		return
-	if source_location[0] != ENCODED_FORWARD_CHAT_ID:
+	if source_location[0] != TERMINAL_CHANNEL_ID:
 		return
 
 	discussion_location = (int(message.chat.id), int(message.message_id))
@@ -4829,7 +5136,7 @@ async def on_lobby_channel_auto_forward(message: Message) -> None:
 	)
 
 
-@dp.message(F.chat.id.in_({MESSAGE_REWARD_CHAT_ID, ENCODED_FORWARD_CHAT_ID}), F.text)
+@dp.message(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID}), F.text)
 async def on_reward_group_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
 		return
@@ -4869,6 +5176,21 @@ async def on_reward_group_message(message: Message) -> None:
 		f"{actual_added_minutes}/{MESSAGE_EXTEND_MINUTES} minutes",
 		flush=True,
 	)
+
+
+@dp.channel_post(
+	F.chat.id == APRON_CHANNEL_ID,
+	F.document | F.photo | F.video | F.audio | F.voice | F.animation | F.sticker,
+)
+async def on_apron_channel_media(message: Message) -> None:
+	"""Print the reusable Telegram file_id of media posted to the apron channel."""
+	try:
+		print(f"[APRON_MEDIA] received media in apron channel {APRON_CHANNEL_ID}", flush=True)
+		_, file_id = _extract_media_info(message)
+	except ValueError as exc:
+		print(f"[APRON_MEDIA] failed to extract media info: {exc}", flush=True)
+		return
+	print(file_id, flush=True)
 
 
 @dp.message(
@@ -5129,7 +5451,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 	if blacklist_store.is_blocked(uploader_id):
 		await callback.answer("该用户已在黑名单中，不能执行普通踢出", show_alert=True)
 		return
-	if ENCODED_FORWARD_CHAT_ID == 0 or MESSAGE_REWARD_CHAT_ID == 0:
+	if TERMINAL_CHANNEL_ID == 0 or AIRPORT_LOBBY_GROUP_ID == 0:
 		await callback.answer("飞机场或航站大厅尚未配置", show_alert=True)
 		return
 
@@ -5178,7 +5500,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 			await _telegram_call_with_retry(
 				f"broadcast kicked uploader {uploader_id}",
 				lambda: bot.send_message(
-					chat_id=MESSAGE_REWARD_CHAT_ID,
+					chat_id=AIRPORT_LOBBY_GROUP_ID,
 					text=(
 						"🦶 成员移除公告\n\n"
 						f'<a href="tg://user?id={uploader_id}">旅客 {uploader_id}</a> '
@@ -5197,14 +5519,14 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 
 		airport_ok, airport_result, airport_participant_error = (
 			await _remove_inactive_user_from_chat(
-				ENCODED_FORWARD_CHAT_ID,
+				TERMINAL_CHANNEL_ID,
 				uploader_id,
 				"飞机场",
 			)
 		)
 		lobby_ok, lobby_result, lobby_participant_error = (
 			await _remove_inactive_user_from_chat(
-				MESSAGE_REWARD_CHAT_ID,
+				AIRPORT_LOBBY_GROUP_ID,
 				uploader_id,
 				"航站大厅",
 			)
@@ -5831,13 +6153,13 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			reply_parameters: dict[str, int] = {}
 			if (
 				discussion_location
-				and discussion_location[0] == MESSAGE_REWARD_CHAT_ID
+				and discussion_location[0] == AIRPORT_LOBBY_GROUP_ID
 				and discussion_location[1] is not None
 			):
 				reply_parameters["reply_to_message_id"] = discussion_location[1]
 
 			await bot.send_message(
-				chat_id=MESSAGE_REWARD_CHAT_ID,
+				chat_id=AIRPORT_LOBBY_GROUP_ID,
 				text=text.strip(),
 				parse_mode="HTML",
 				**reply_parameters,
@@ -6268,12 +6590,31 @@ async def on_text(message: Message) -> None:
 	except Exception as exc:
 		await message.reply(f"❌ 解码或解析失败: {exc}")
 
+async def say_hello_to_x_man(bot_name):
+
+	if SWITCHBOT_TOKEN:
+		switchbot = Bot(
+			token=SWITCHBOT_TOKEN,
+			default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+		)
+		try:
+			await switchbot.send_message(X_MAN_BOT_ID, f"|_kick_|@{bot_name}")
+			print("✅ Sent hello to X-Man bot", flush=True)
+		finally:
+			await switchbot.session.close()
+	else:
+		print("❌ No SWITCHBOT_TOKEN found, skipping hello to X-Man bot.", flush=True)
 
 async def main() -> None:
 	global bot_name
 	me = await bot.get_me()
 	bot_name = str(getattr(me, "username", "") or "")
-	print(f"Bot started as @{bot_name}", flush=True)
+	print(f"🤖 Bot started as @{bot_name}", flush=True)
+
+	await _check_bot_group_admin_permissions()
+	await say_hello_to_x_man(bot_name)
+
+
 	await bot.set_my_commands(
 		[
 			# BotCommand(command="start", description="开始"),

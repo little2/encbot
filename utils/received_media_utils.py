@@ -350,7 +350,7 @@ class ReceivedMediaStore:
                     thumb_file_unique_id
                 FROM received_media
                 WHERE batch_id = ?
-                  AND status = 'accepted'
+                  AND status IN ('pending', 'accepted')
                   AND file_id <> ''
                 ORDER BY source_message_id, file_unique_id
             """,

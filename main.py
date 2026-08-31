@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 import base64
+from email.mime import message
 import hashlib
 import hmac
 import re
@@ -1645,6 +1646,14 @@ async def _get_batch_preview_message_settings(
 	if not normalized_batch_id:
 		raise ValueError("batch_id is required")
 
+	print(f"normalized_batch_id=>{normalized_batch_id}", flush=True)
+
+	batch_record = batch_store.get(normalized_batch_id)
+	if not batch_record:
+		raise ValueError("找不到此批次。")
+
+	print(f"batch_record=>{batch_record}", flush=True)
+
 	items = received_media_store.get_media_by_batch_id(normalized_batch_id)
 	if not items:
 		raise ValueError("找不到此批次的媒體。")
@@ -1653,7 +1662,6 @@ async def _get_batch_preview_message_settings(
 	if not preview_payloads:
 		raise ValueError("此批次沒有可用的媒體縮圖。")
 
-	batch_record = batch_store.get(normalized_batch_id) or {}
 	batch_content = str(batch_record.get("batch_content", "") or "").strip()
 	token = UtfConverter.build_media_token(
 		user_id=int(batch_record.get("uploader_user_id", 0) or 0),
@@ -2060,11 +2068,6 @@ async def _send_encoded_snapshot(
 			batch_saved = True
 		except Exception as exc:
 			print(f"[BATCH] channel location save failed: {exc}", flush=True)
-		if batch_saved and is_first_send:
-			await _notify_duty_free_new_batch(
-				batch_id=batch_id,
-				batch_content=batch_content,
-			)
 		try:
 			accepted_count = received_media_store.accept_batch(
 				[
@@ -2075,6 +2078,16 @@ async def _send_encoded_snapshot(
 			)
 		except Exception as exc:
 			print(f"[RECEIVED_MEDIA] accept failed: {exc}", flush=True)
+		if accepted_count <= 0:
+			print(
+				f"[RECEIVED_MEDIA] no media accepted (batch_id={batch_id})",
+				flush=True,
+			)
+		if batch_saved and accepted_count > 0 and is_first_send:
+			await _notify_duty_free_new_batch(
+				batch_id=batch_id,
+				batch_content=batch_content,
+			)
 	else:
 		try:
 			received_media_store.release_pending_batch(batch_id)
@@ -4590,11 +4603,16 @@ async def cmd_airport_access_request(message: Message) -> None:
 @dp.message(F.chat.type == "private", Command("start"))
 async def cmd_start(message: Message, command: CommandObject) -> None:
 	batch_id = str(command.args or "").strip()
-	if batch_id:
-		try:
-			await message.delete()
-		except Exception as exc:
-			print(f"[START] failed to delete parameterized command: {exc}", flush=True)
+
+	try:
+		await message.delete()
+	except Exception as exc:
+		print(f"[START] failed to delete parameterized command: {exc}", flush=True)
+
+	if "fly_" in batch_id:
+		return
+	elif batch_id:
+		
 
 		try:
 			preview_settings = await _get_batch_preview_message_settings(batch_id)

@@ -123,6 +123,7 @@ TERMINAL_CHANNEL_THREAD_ID = int(os.getenv("TERMINAL_CHANNEL_THREAD_ID", "0") or
 #发言可以增加通行证时间的群组
 AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(TERMINAL_CHANNEL_ID)) or 0)
 APRON_CHANNEL_ID = int(os.getenv("APRON_CHANNEL_ID", "0") or 0)
+AIRPORT_DUTY_FREE_GROUP_ID = int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", "0") or 0)
 
 DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
 DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
@@ -227,7 +228,7 @@ class MediaForwardTask:
 MEDIA_QUEUE: asyncio.Queue[tuple[Message, dict[str, Any]]] = asyncio.Queue(maxsize=100)
 MEDIA_FORWARD_QUEUE: asyncio.Queue[MediaForwardTask] = asyncio.Queue(maxsize=200)
 MEDIA_WORKER_COUNT = 3
-MEDIA_FORWARD_INTERVAL_SECONDS = 1.1
+MEDIA_FORWARD_INTERVAL_SECONDS = 2.0
 MEDIA_FORWARD_MAX_ATTEMPTS = 3
 MAX_BATCH_MEDIA = 10
 MAX_USER_PENDING = 15
@@ -715,7 +716,7 @@ def _format_media_duration(seconds: int) -> str:
 	return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
+async def _build_display(data: dict[str, Any], encoded: str) -> str:
 	valid_until = str(data.get("valid_until", ""))
 	if valid_until == "99991231235959":
 		valid_until_display = "永久有效"
@@ -813,7 +814,7 @@ async def _build_display(data: dict[str, Any], token: str, encoded: str) -> str:
 
 	return return_text
 
-def _build_keyboard(data: dict[str, Any], token: str, encoded: str) -> InlineKeyboardMarkup:
+def _build_keyboard() -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(
 		inline_keyboard=[[
 			InlineKeyboardButton(
@@ -1263,11 +1264,15 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 		if destination_id == 0 or destination_id in seen_destination_ids:
 			continue
 		seen_destination_ids.add(destination_id)
-		await _send_media_forward_to_destination(
-			task,
-			destination_name,
-			destination_id,
-		)
+		try:
+			await _send_media_forward_to_destination(
+				task,
+				destination_name,
+				destination_id,
+			)
+		finally:
+			#每完成一個「目的地」的發送後，都等待 MEDIA_FORWARD_INTERVAL_SECONDS
+			await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 
 
 async def _run_media_forward_operation(
@@ -1380,37 +1385,37 @@ async def _send_media_forward_to_destination(
 	if not task.thumb_bytes:
 		return
 
-	thumb_message = await _run_media_forward_operation(
-		lambda: bot.send_photo(
-			chat_id=destination_id,
-			photo=BufferedInputFile(
-				task.thumb_bytes or b"",
-				filename=f"{task.file_unique_id}.jpg",
-			),
-			caption=(
-				f"file_unique_id: <code>{escape(task.file_unique_id)}</code>\n"
-				f"thumb_phash: <code>{escape(task.thumb_phash or '')}</code>"
-			),
-			parse_mode="HTML"
-		),
-		f"缩略图发送至 {destination_name}",
-	)
-	if (
-		destination_id == APRON_CHANNEL_ID
-		and isinstance(thumb_message, Message)
-		and thumb_message.photo
-	):
-		thumb_file_id = thumb_message.photo[-1].file_id
-		# print(thumb_file_id, flush=True)
-		await bot.delete_message(
-			chat_id=destination_id,
-			message_id=thumb_message.message_id,
-		)
-		await _send_file_id_with_switchbot(
-			task,
-			file_id=thumb_file_id,
-			file_type="photo",
-		)
+	# thumb_message = await _run_media_forward_operation(
+	# 	lambda: bot.send_photo(
+	# 		chat_id=destination_id,
+	# 		photo=BufferedInputFile(
+	# 			task.thumb_bytes or b"",
+	# 			filename=f"{task.file_unique_id}.jpg",
+	# 		),
+	# 		caption=(
+	# 			f"file_unique_id: <code>{escape(task.file_unique_id)}</code>\n"
+	# 			f"thumb_phash: <code>{escape(task.thumb_phash or '')}</code>"
+	# 		),
+	# 		parse_mode="HTML"
+	# 	),
+	# 	f"缩略图发送至 {destination_name}",
+	# )
+	# if (
+	# 	destination_id == APRON_CHANNEL_ID
+	# 	and isinstance(thumb_message, Message)
+	# 	and thumb_message.photo
+	# ):
+	# 	thumb_file_id = thumb_message.photo[-1].file_id
+	# 	# print(thumb_file_id, flush=True)
+	# 	await bot.delete_message(
+	# 		chat_id=destination_id,
+	# 		message_id=thumb_message.message_id,
+	# 	)
+	# 	await _send_file_id_with_switchbot(
+	# 		task,
+	# 		file_id=thumb_file_id,
+	# 		file_type="photo",
+	# 	)
 
 
 async def _media_forward_worker() -> None:
@@ -1507,6 +1512,174 @@ async def _download_preview(cache_key: tuple[str, str], file_id: str) -> tuple[t
 		return cache_key, None
 
 
+async def _prepare_batch_preview_payloads(
+	items: list[dict[str, Any]],
+) -> list[tuple[bytes, str]]:
+	preview_entries: list[tuple[tuple[str, str], str]] = []
+	download_requests: dict[tuple[str, str], str] = {}
+	job_video_types: dict[tuple[str, str], bool] = {}
+
+	for index, item in enumerate(items):
+		file_type = str(item.get("file_type", ""))
+		if file_type == "document":
+			continue
+		preview_file_id = str(
+			item.get("thumb_file_id", "")
+			or item.get("preview_file_id", "")
+		)
+		if not preview_file_id:
+			continue
+		preview_unique_id = str(
+			item.get("thumb_file_unique_id", "")
+			or item.get("preview_unique_id", "")
+			or item.get("file_unique_id", "")
+			or item.get("file_id", index)
+		)
+		style = PREVIEW_STYLE_VIDEO if file_type == "video" else PREVIEW_STYLE_ORIGINAL
+		cache_key = (preview_unique_id, style)
+		preview_entries.append((cache_key, f"preview_{index + 1}.jpg"))
+		job_video_types.setdefault(cache_key, file_type == "video")
+		if _preview_cache_get(cache_key) is None:
+			download_requests.setdefault(cache_key, preview_file_id)
+
+	downloaded = dict(await asyncio.gather(*[
+		_download_preview(cache_key, file_id)
+		for cache_key, file_id in download_requests.items()
+	])) if download_requests else {}
+	jobs = [
+		(cache_key, downloaded.get(cache_key), is_video)
+		for cache_key, is_video in job_video_types.items()
+		if _preview_cache_get(cache_key) is None
+	]
+	processed = await asyncio.to_thread(_process_preview_batch, jobs) if jobs else {}
+	for cache_key, (content, cacheable) in processed.items():
+		if cacheable:
+			_preview_cache_set(cache_key, content)
+
+	preview_payloads: list[tuple[bytes, str]] = []
+	for cache_key, filename in preview_entries:
+		content = _preview_cache_get(cache_key)
+		if content is None and cache_key in processed:
+			content = processed[cache_key][0]
+		if content is not None:
+			preview_payloads.append((content, filename))
+	return preview_payloads
+
+
+async def _send_encoded_preview_message(
+	batch_settings: dict[str, Any],
+) -> Message:
+	preview_payloads = list(batch_settings.get("preview_payloads", []))
+	if not preview_payloads:
+		raise ValueError("preview_payloads is required")
+
+	display_text = str(batch_settings.get("display_text", ""))
+	display_keyboard = batch_settings.get("display_keyboard")
+	thread_id = batch_settings.get("thread_id")
+	chat_id = int(batch_settings.get("chat_id", TERMINAL_CHANNEL_ID) or 0)
+	if chat_id == 0:
+		raise ValueError("chat_id is required")
+	if_spoiler = bool(batch_settings.get("if_spoiler", False))
+	caption = display_text if len(display_text) <= 1024 else None
+
+	media = [
+		InputMediaPhoto(
+			media=BufferedInputFile(content, filename=filename),
+			has_spoiler=if_spoiler,
+		)
+		for content, filename in preview_payloads
+	]
+
+	if len(media) == 1:
+		content, filename = preview_payloads[0]
+		photo_message = await _telegram_call_with_retry(
+			"send preview photo",
+			lambda: bot.send_photo(
+				chat_id=chat_id,
+				message_thread_id=thread_id,
+				photo=BufferedInputFile(content, filename=filename),
+				caption=caption,
+				reply_markup=display_keyboard if caption else None,
+				parse_mode="HTML" if caption else None,
+				has_spoiler=if_spoiler,
+			),
+		)
+		if caption is not None:
+			return photo_message
+		return await _telegram_call_with_retry(
+			"send encoded text",
+			lambda: bot.send_message(
+				chat_id=chat_id,
+				message_thread_id=thread_id,
+				text=display_text,
+				reply_markup=display_keyboard,
+				parse_mode="HTML",
+			),
+		)
+
+	album = await _telegram_call_with_retry(
+		"send preview album",
+		lambda: bot.send_media_group(
+			chat_id=chat_id,
+			message_thread_id=thread_id,
+			media=media,
+		),
+	)
+	return await _telegram_call_with_retry(
+		"send encoded text",
+		lambda: bot.send_message(
+			chat_id=chat_id,
+			message_thread_id=thread_id,
+			text=display_text,
+			reply_markup=display_keyboard,
+			parse_mode="HTML",
+			reply_to_message_id=album[-1].message_id,
+		),
+	)
+
+
+async def _get_batch_preview_message_settings(
+	batch_id: str,
+) -> dict[str, Any]:
+	normalized_batch_id = str(batch_id or "").strip()
+	if not normalized_batch_id:
+		raise ValueError("batch_id is required")
+
+	items = received_media_store.get_media_by_batch_id(normalized_batch_id)
+	if not items:
+		raise ValueError("找不到此批次的媒體。")
+
+	preview_payloads = await _prepare_batch_preview_payloads(items)
+	if not preview_payloads:
+		raise ValueError("此批次沒有可用的媒體縮圖。")
+
+	batch_record = batch_store.get(normalized_batch_id) or {}
+	batch_content = str(batch_record.get("batch_content", "") or "").strip()
+	token = UtfConverter.build_media_token(
+		user_id=int(batch_record.get("uploader_user_id", 0) or 0),
+		items=items,
+		no_forward=bool(batch_record.get("no_forward", False)),
+		flash_seconds=int(batch_record.get("flash_seconds", 0) or 0),
+		valid_until=str(
+			batch_record.get("valid_until", "99991231235959")
+			or "99991231235959"
+		),
+		if_spoiler=bool(batch_record.get("if_spoiler", False)),
+		anonymous=bool(batch_record.get("anonymous", True)),
+	)
+	encoded = UtfConverter.telegram_to_unicode_cjk(token)
+	parsed = UtfConverter.parse_file_token(token)
+	parsed["batch_content"] = batch_content
+
+	return {
+		"thread_id": None,
+		"preview_payloads": preview_payloads,
+		"display_text": await _build_display(parsed, encoded),
+		"display_keyboard": _build_keyboard(),
+		"if_spoiler": bool(batch_record.get("if_spoiler", False)),
+	}
+
+
 async def _forward_encoded_if_whitelisted(
 	owner_user_id: int,
 	encoded: str,
@@ -1517,12 +1690,15 @@ async def _forward_encoded_if_whitelisted(
 	if TERMINAL_CHANNEL_ID == 0:
 		return {"ok":False,"error_msg":"TERMINAL_CHANNEL_ID is 0"}
 
+	batch_settings: dict[str, Any] = {}
+
 	def success_result(published_message: Message, mode: str) -> dict[str, Any]:
 		return {
 			"ok": True,
 			"mode": mode,
 			"channel_chat_id": int(published_message.chat.id),
 			"channel_message_id": int(published_message.message_id),
+			"batch_settings": dict(batch_settings),
 		}
 
 
@@ -1534,12 +1710,29 @@ async def _forward_encoded_if_whitelisted(
 	try:
 		token = UtfConverter.unicode_cjk_to_telegram(encoded)
 		parsed = UtfConverter.parse_file_token(token)
+		batch_settings = {
+			"no_forward": bool(parsed.get("no_forward", False)),
+			"if_spoiler": bool(parsed.get("if_spoiler", False)),
+			"anonymous": bool(parsed.get("anonymous", True)),
+			"flash_seconds": int(parsed.get("flash_seconds", 0) or 0),
+			"valid_until": str(
+				parsed.get("valid_until", "99991231235959")
+				or "99991231235959"
+			),
+		}
+		token_user_id = int(parsed.get("user_id", 0) or 0)
+		if token_user_id and token_user_id != int(owner_user_id):
+			print(
+				f"[BATCH] uploader mismatch: owner={owner_user_id}, "
+				f"token={token_user_id}",
+				flush=True,
+			)
 		parsed["batch_content"] = str(batch_content or "").strip()
 		parsed_items = list(parsed.get("items", []))
 		if not parsed_items:
 			raise ValueError("encoded 中没有媒体")
-		display_text = await _build_display(parsed, token, encoded)
-		display_keyboard = _build_keyboard(parsed, token, encoded)
+		display_text = await _build_display(parsed, encoded)
+		display_keyboard = _build_keyboard()
 		if_spoiler = bool(parsed.get("if_spoiler", False))
 
 		flash_seconds = parsed.get("flash_seconds", 0)
@@ -1613,100 +1806,16 @@ async def _forward_encoded_if_whitelisted(
 	try:
 
 		if preview_show and preview_payloads:
-			media = [
-				InputMediaPhoto(
-					media=BufferedInputFile(content, filename=filename),
-					has_spoiler=if_spoiler,
-					# caption=caption if index == 0 else None,
-					# parse_mode="HTML" if index == 0 and caption else None,
-				)
-				for index, (content, filename) in enumerate(preview_payloads)
-			]
-
-			if len(media) == 1:
-				content, filename = preview_payloads[0]
-				published_message = await _telegram_call_with_retry(
-					"send preview photo",
-					lambda: bot.send_photo(
-						chat_id=TERMINAL_CHANNEL_ID,
-						message_thread_id=thread_id,
-						photo=BufferedInputFile(content, filename=filename),
-						caption=caption,
-						reply_markup=display_keyboard if caption else None,
-						parse_mode="HTML" if caption else None,
-						has_spoiler=if_spoiler,
-					),
-				)
-				if caption is None:
-					published_message = await _telegram_call_with_retry(
-						"send encoded text",
-						lambda: bot.send_message(
-							chat_id=TERMINAL_CHANNEL_ID,
-							message_thread_id=thread_id,
-							text=display_text,
-							reply_markup=display_keyboard,
-							parse_mode="HTML",
-						),
-					)
-
-			else:
-
-				album = await _telegram_call_with_retry(
-					"send preview album",
-					lambda: bot.send_media_group(
-						chat_id=TERMINAL_CHANNEL_ID,
-						message_thread_id=thread_id,
-						media=media,
-					),
-				)
-
-				published_message = await _telegram_call_with_retry(
-					"send encoded text",
-					lambda: bot.send_message(
-						chat_id=TERMINAL_CHANNEL_ID,
-						message_thread_id=thread_id,
-						text=display_text,
-						reply_markup=display_keyboard,
-						parse_mode="HTML",
-						reply_to_message_id=album[-1].message_id,
-					),
-				)
-
-
-
-
-				# if DEFAULT_COVER_FILE_ID is None:
-				# 	send_result = await bot.send_photo(
-				# 		chat_id=TERMINAL_CHANNEL_ID,
-				# 		message_thread_id=thread_id,
-				# 		photo=BufferedInputFile(
-				# 			_get_seline_image_bytes(),
-				# 			filename="seline.jpeg",
-				# 		),
-				# 		caption=caption,
-				# 		reply_markup=display_keyboard,
-				# 		parse_mode="HTML" if caption else None,
-				# 		reply_to_message_id=album[-1].message_id
-				# 	)
-				# 	DEFAULT_COVER_FILE_ID = send_result.photo[-1].file_id if send_result.photo else None
-				# else:
-				# 	await bot.send_photo(
-				# 		chat_id=TERMINAL_CHANNEL_ID,
-				# 		message_thread_id=thread_id,
-				# 		photo=DEFAULT_COVER_FILE_ID,
-				# 		caption=caption,
-				# 		reply_markup=display_keyboard,
-				# 		parse_mode="HTML" if caption else None,
-				# 		reply_to_message_id=album[-1].message_id
-				# 	)
-
-				# if caption is None:
-				# 	await bot.send_message(
-				# 		chat_id=TERMINAL_CHANNEL_ID,
-				# 		message_thread_id=thread_id,
-				# 		text=display_text,
-				# 		parse_mode="HTML",
-				# 	)
+			preview_batch_settings = {
+				"preview_payloads": preview_payloads,
+				"display_text": display_text,
+				"display_keyboard": display_keyboard,
+				"thread_id": thread_id,
+				"if_spoiler": if_spoiler,
+			}
+			published_message = await _send_encoded_preview_message(
+				preview_batch_settings,
+			)
 			return success_result(published_message, "preview")
 		elif preview_show:
 
@@ -1831,14 +1940,26 @@ async def _record_batch_channel_location(
 	channel_chat_id: int,
 	channel_message_id: int,
 	batch_content: str = "",
+	uploader_user_id: int = 0,
+	batch_settings: dict[str, Any] | None = None,
 ) -> None:
+	settings = dict(batch_settings or {})
 	channel_key = (int(channel_chat_id), int(channel_message_id))
 	async with BATCH_LOCATION_LOCK:
 		batch_store.upsert_channel_location(
-			batch_id,
-			channel_key[0],
-			channel_key[1],
-			batch_content,
+			batch_id=batch_id,
+			channel_chat_id=channel_key[0],
+			channel_message_id=channel_key[1],
+			batch_content=batch_content,
+			uploader_user_id=int(uploader_user_id),
+			no_forward=bool(settings.get("no_forward", False)),
+			if_spoiler=bool(settings.get("if_spoiler", False)),
+			anonymous=bool(settings.get("anonymous", True)),
+			flash_seconds=int(settings.get("flash_seconds", 0) or 0),
+			valid_until=str(
+				settings.get("valid_until", "99991231235959")
+				or "99991231235959"
+			),
 		)
 		pending_discussion = PENDING_BATCH_DISCUSSION_LOCATIONS.pop(
 			channel_key,
@@ -1851,6 +1972,54 @@ async def _record_batch_channel_location(
 				pending_discussion[0],
 				pending_discussion[1],
 			)
+
+
+async def _notify_duty_free_new_batch(
+	batch_id: str,
+	batch_content: str,
+) -> None:
+	normalized_batch_id = str(batch_id or "").strip()
+	if AIRPORT_DUTY_FREE_GROUP_ID == 0:
+		print(
+			"[DUTY_FREE] AIRPORT_DUTY_FREE_GROUP_ID is 0, notification skipped",
+			flush=True,
+		)
+		return
+	if not normalized_batch_id:
+		print("[DUTY_FREE] empty batch_id, notification skipped", flush=True)
+		return
+
+	
+	tower_bot_name = str(bot_name or "ztTowerRobot").strip().lstrip("@")
+	new_flight_keyboard = InlineKeyboardMarkup(
+		inline_keyboard=[[
+			InlineKeyboardButton(
+				text="🛫 新航班",
+				url=(
+					f"https://t.me/{tower_bot_name}"
+					f"?start={normalized_batch_id}"
+				),
+			),
+		]],
+	)
+	try:
+		await _telegram_call_with_retry(
+			"send new batch to airport duty free group",
+			lambda: bot.send_message(
+				chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
+				text=(
+					f"<code>{tower_bot_name}_{escape(normalized_batch_id)}</code>"
+				),
+				parse_mode="HTML",
+				reply_markup=new_flight_keyboard,
+			),
+		)
+	except Exception as exc:
+		print(
+			f"[DUTY_FREE] new batch notification failed "
+			f"(batch_id={normalized_batch_id}): {exc}",
+			flush=True,
+		)
 
 
 async def _send_encoded_snapshot(
@@ -1878,15 +2047,24 @@ async def _send_encoded_snapshot(
 		print(f"[ENCODED_FORWARD] background send failed: {exc}", flush=True)
 		success = False
 	if success:
+		batch_saved = False
 		try:
 			await _record_batch_channel_location(
-				batch_id,
-				int(forward_status["channel_chat_id"]),
-				int(forward_status["channel_message_id"]),
-				batch_content,
+				batch_id=batch_id,
+				channel_chat_id=int(forward_status["channel_chat_id"]),
+				channel_message_id=int(forward_status["channel_message_id"]),
+				batch_content=batch_content,
+				uploader_user_id=owner_user_id,
+				batch_settings=dict(forward_status.get("batch_settings", {})),
 			)
+			batch_saved = True
 		except Exception as exc:
 			print(f"[BATCH] channel location save failed: {exc}", flush=True)
+		if batch_saved and is_first_send:
+			await _notify_duty_free_new_batch(
+				batch_id=batch_id,
+				batch_content=batch_content,
+			)
 		try:
 			accepted_count = received_media_store.accept_batch(
 				[
@@ -2220,7 +2398,7 @@ async def _finish_upload(
 	token, encoded, parsed = _build_token_and_encoded(state)
 	state["token"] = token
 	state["encoded"] = encoded
-	display_text = await _build_display(parsed, token, encoded)
+	display_text = await _build_display(parsed, encoded)
 	markup = _build_controls_keyboard(state, encoded)
 	panel_message_id = session.get("panel_message_id")
 
@@ -4411,11 +4589,32 @@ async def cmd_airport_access_request(message: Message) -> None:
 
 @dp.message(F.chat.type == "private", Command("start"))
 async def cmd_start(message: Message, command: CommandObject) -> None:
-	if (command.args or "").strip():
+	batch_id = str(command.args or "").strip()
+	if batch_id:
 		try:
 			await message.delete()
 		except Exception as exc:
 			print(f"[START] failed to delete parameterized command: {exc}", flush=True)
+
+		try:
+			preview_settings = await _get_batch_preview_message_settings(batch_id)
+			preview_settings["chat_id"] = int(message.chat.id)
+			await _send_encoded_preview_message(preview_settings)
+		except ValueError as exc:
+			await bot.send_message(
+				chat_id=message.chat.id,
+				text=escape(str(exc)),
+				parse_mode="HTML",
+			)
+		except Exception as exc:
+			print(
+				f"[START] batch preview delivery failed (batch_id={batch_id}): {exc}",
+				flush=True,
+			)
+			await bot.send_message(
+				chat_id=message.chat.id,
+				text="批次縮圖傳送失敗，請稍後再試。",
+			)
 		return
 
 	await cmd_airport_access_request(message)
@@ -4666,6 +4865,7 @@ async def _check_bot_group_admin_permissions() -> None:
 		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
 		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
 		("APRON_CHANNEL_ID", APRON_CHANNEL_ID),
+		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
 	)
 	for setting_name, chat_id in groups:
 		if chat_id == 0:
@@ -5930,7 +6130,8 @@ async def on_takeoff_batch_id(callback: CallbackQuery) -> None:
 	tower_bot = f"{bot_name}" if bot_name else "ztTowerRobot"
 	text = f"""
 🎫 <code>{tower_bot}_{batch_id}</code>
-<i>请发送至塔台 <code>{tower_bot}</code>，即可起飞 ✈️</i>。
+
+<i>请发送至塔台 <code>@{tower_bot}</code>，即可起飞 ✈️</i>。
 """
 	try:
 		await bot.send_message(
@@ -6381,7 +6582,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			state["token"] = token
 			state["encoded"] = encoded
 			await callback.message.edit_text(
-				await _build_display(parsed, token, encoded),
+				await _build_display(parsed, encoded),
 				reply_markup=_build_controls_keyboard(state, encoded),
 				parse_mode="HTML",
 			)
@@ -6463,7 +6664,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 		if str(state.get("send_status", "idle")) != "sending":
 			state["send_status"] = "idle"
 		markup = _build_controls_keyboard(state, encoded)
-		await callback.message.edit_text(await _build_display(parsed, token, encoded), reply_markup=markup, parse_mode="HTML")
+		await callback.message.edit_text(await _build_display(parsed, encoded), reply_markup=markup, parse_mode="HTML")
 		await callback.answer("已更新密文")
 	except Exception as exc:
 		await callback.answer(f"更新失败: {exc}", show_alert=True)
@@ -6605,7 +6806,7 @@ async def on_text(message: Message) -> None:
 					await bot.edit_message_text(
 						chat_id=state_key[0],
 						message_id=state_key[1],
-						text=await _build_display(parsed, token, encoded),
+						text=await _build_display(parsed, encoded),
 						reply_markup=_build_controls_keyboard(state, encoded),
 						parse_mode="HTML",
 					)
@@ -6629,43 +6830,14 @@ async def on_text(message: Message) -> None:
 	if batch_id:
 		print(f"batch_id={batch_id}", flush=True)
 		try:
-			items = received_media_store.get_media_by_batch_id(batch_id)
+			preview_settings = await _get_batch_preview_message_settings(batch_id)
+			preview_settings["chat_id"] = int(message.chat.id)
+			await _send_encoded_preview_message(preview_settings)
+		except ValueError as exc:
+			await message.reply(str(exc))
 		except Exception as exc:
-			print(f"[TAKEOFF] batch media lookup failed: {exc}", flush=True)
-			await message.reply("❌ 起飞许可查询失败，请稍后重试")
-			return
-
-		if not items:
-			await message.reply("❌ 找不到此起飞许可对应的媒体")
-			return
-
-		data = {
-			"items": items,
-			"file_id": items[0]["file_id"],
-			"file_type": items[0]["file_type"],
-			"no_forward": False,
-			"if_spoiler": False,
-		}
-		try:
-			sent_messages, skipped_items = await _send_all_media(
-				message,
-				data,
-				receiver_id=int(message.from_user.id),
-			)
-		except Exception as exc:
-			print(f"[TAKEOFF] batch media delivery failed: {exc}", flush=True)
-			await message.reply("❌ 此批次的媒体发送失败，请稍后重试")
-			return
-
-		if not sent_messages:
-			await message.reply("❌ 此批次的媒体目前都无法发送")
-			return
-
-		if skipped_items:
-			await message.reply(
-				f"⚠️ 已送出 {len(sent_messages)} 个媒体，"
-				f"另有 {len(skipped_items)} 个媒体暂时无法取得。"
-			)
+			print(f"[TAKEOFF] batch preview delivery failed: {exc}", flush=True)
+			await message.reply("批次縮圖傳送失敗，請稍後再試。")
 		return
 
 	if len(text) < 15:

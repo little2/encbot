@@ -20,6 +20,12 @@ class BatchStore:
                 discussion_chat_id INTEGER,
                 discussion_message_id INTEGER,
                 batch_content TEXT,
+                uploader_user_id INTEGER NOT NULL DEFAULT 0,
+                no_forward INTEGER NOT NULL DEFAULT 0,
+                if_spoiler INTEGER NOT NULL DEFAULT 0,
+                anonymous INTEGER NOT NULL DEFAULT 1,
+                flash_seconds INTEGER NOT NULL DEFAULT 0,
+                valid_until TEXT NOT NULL DEFAULT '99991231235959',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(channel_chat_id, channel_message_id)
@@ -33,6 +39,35 @@ class BatchStore:
             self.connection.execute(
                 "ALTER TABLE batch ADD COLUMN batch_content TEXT"
             )
+        migrations = {
+            "uploader_user_id": (
+                "ALTER TABLE batch ADD COLUMN "
+                "uploader_user_id INTEGER NOT NULL DEFAULT 0"
+            ),
+            "no_forward": (
+                "ALTER TABLE batch ADD COLUMN "
+                "no_forward INTEGER NOT NULL DEFAULT 0"
+            ),
+            "if_spoiler": (
+                "ALTER TABLE batch ADD COLUMN "
+                "if_spoiler INTEGER NOT NULL DEFAULT 0"
+            ),
+            "anonymous": (
+                "ALTER TABLE batch ADD COLUMN "
+                "anonymous INTEGER NOT NULL DEFAULT 1"
+            ),
+            "flash_seconds": (
+                "ALTER TABLE batch ADD COLUMN "
+                "flash_seconds INTEGER NOT NULL DEFAULT 0"
+            ),
+            "valid_until": (
+                "ALTER TABLE batch ADD COLUMN valid_until TEXT NOT NULL "
+                "DEFAULT '99991231235959'"
+            ),
+        }
+        for column_name, statement in migrations.items():
+            if column_name not in columns:
+                self.connection.execute(statement)
         self.connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_batch_channel_message
             ON batch(channel_chat_id, channel_message_id)
@@ -45,6 +80,12 @@ class BatchStore:
         channel_chat_id: int,
         channel_message_id: int,
         batch_content: str = "",
+        uploader_user_id: int = 0,
+        no_forward: bool = False,
+        if_spoiler: bool = False,
+        anonymous: bool = True,
+        flash_seconds: int = 0,
+        valid_until: str = "99991231235959",
     ) -> None:
         normalized_batch_id = str(batch_id or "").strip()
         if not normalized_batch_id:
@@ -61,10 +102,16 @@ class BatchStore:
                         discussion_chat_id,
                         discussion_message_id,
                         batch_content,
+                        uploader_user_id,
+                        no_forward,
+                        if_spoiler,
+                        anonymous,
+                        flash_seconds,
+                        valid_until,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)
+                    VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(batch_id) DO UPDATE SET
                         discussion_chat_id = CASE
                             WHEN batch.channel_chat_id = excluded.channel_chat_id
@@ -81,6 +128,12 @@ class BatchStore:
                         channel_chat_id = excluded.channel_chat_id,
                         channel_message_id = excluded.channel_message_id,
                         batch_content = excluded.batch_content,
+                        uploader_user_id = excluded.uploader_user_id,
+                        no_forward = excluded.no_forward,
+                        if_spoiler = excluded.if_spoiler,
+                        anonymous = excluded.anonymous,
+                        flash_seconds = excluded.flash_seconds,
+                        valid_until = excluded.valid_until,
                         updated_at = excluded.updated_at
                 """,
                 (
@@ -88,6 +141,12 @@ class BatchStore:
                     int(channel_chat_id),
                     int(channel_message_id),
                     str(batch_content or "").strip(),
+                    int(uploader_user_id),
+                    int(bool(no_forward)),
+                    int(bool(if_spoiler)),
+                    int(bool(anonymous)),
+                    max(0, int(flash_seconds)),
+                    str(valid_until or "99991231235959"),
                     now,
                     now,
                 ),
@@ -131,6 +190,12 @@ class BatchStore:
                     discussion_chat_id,
                     discussion_message_id,
                     batch_content,
+                    uploader_user_id,
+                    no_forward,
+                    if_spoiler,
+                    anonymous,
+                    flash_seconds,
+                    valid_until,
                     created_at,
                     updated_at
                 FROM batch
@@ -147,8 +212,14 @@ class BatchStore:
             "discussion_chat_id": int(row[3]) if row[3] is not None else None,
             "discussion_message_id": int(row[4]) if row[4] is not None else None,
             "batch_content": str(row[5] or ""),
-            "created_at": int(row[6]),
-            "updated_at": int(row[7]),
+            "uploader_user_id": int(row[6]),
+            "no_forward": bool(row[7]),
+            "if_spoiler": bool(row[8]),
+            "anonymous": bool(row[9]),
+            "flash_seconds": int(row[10]),
+            "valid_until": str(row[11]),
+            "created_at": int(row[12]),
+            "updated_at": int(row[13]),
         }
 
     def get_discussion_location(

@@ -342,7 +342,12 @@ class ReceivedMediaStore:
 
         rows = self.connection.execute(
             """
-                SELECT file_id, file_type
+                SELECT
+                    file_id,
+                    file_unique_id,
+                    file_type,
+                    thumb_file_id,
+                    thumb_file_unique_id
                 FROM received_media
                 WHERE batch_id = ?
                   AND status = 'accepted'
@@ -354,9 +359,18 @@ class ReceivedMediaStore:
         return [
             {
                 "file_id": str(file_id),
+                "file_unique_id": str(file_unique_id),
                 "file_type": str(file_type),
+                "thumb_file_id": str(thumb_file_id or ""),
+                "thumb_file_unique_id": str(thumb_file_unique_id or ""),
             }
-            for file_id, file_type in rows
+            for (
+                file_id,
+                file_unique_id,
+                file_type,
+                thumb_file_id,
+                thumb_file_unique_id,
+            ) in rows
         ]
 
     def close(self) -> None:

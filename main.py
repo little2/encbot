@@ -4604,38 +4604,40 @@ async def cmd_airport_access_request(message: Message) -> None:
 async def cmd_start(message: Message, command: CommandObject) -> None:
 	batch_id = str(command.args or "").strip()
 
-	try:
-		await message.delete()
-	except Exception as exc:
-		print(f"[START] failed to delete parameterized command: {exc}", flush=True)
-
-	if "fly_" in batch_id:
-		return
-	elif batch_id:
-		
-
+	if batch_id:
 		try:
-			preview_settings = await _get_batch_preview_message_settings(batch_id)
-			preview_settings["chat_id"] = int(message.chat.id)
-			await _send_encoded_preview_message(preview_settings)
-		except ValueError as exc:
-			await bot.send_message(
-				chat_id=message.chat.id,
-				text=escape(str(exc)),
-				parse_mode="HTML",
-			)
+			await message.delete()
 		except Exception as exc:
-			print(
-				f"[START] batch preview delivery failed (batch_id={batch_id}): {exc}",
-				flush=True,
-			)
-			await bot.send_message(
-				chat_id=message.chat.id,
-				text="批次縮圖傳送失敗，請稍後再試。",
-			)
-		return
+			print(f"[START] failed to delete parameterized command: {exc}", flush=True)
 
-	await cmd_airport_access_request(message)
+		if "fly_" in batch_id:
+			return
+
+		else:
+
+
+			try:
+				preview_settings = await _get_batch_preview_message_settings(batch_id)
+				preview_settings["chat_id"] = int(message.chat.id)
+				await _send_encoded_preview_message(preview_settings)
+			except ValueError as exc:
+				await bot.send_message(
+					chat_id=message.chat.id,
+					text=escape(str(exc)),
+					parse_mode="HTML",
+				)
+			except Exception as exc:
+				print(
+					f"[START] batch preview delivery failed (batch_id={batch_id}): {exc}",
+					flush=True,
+				)
+				await bot.send_message(
+					chat_id=message.chat.id,
+					text="批次縮圖傳送失敗，請稍後再試。",
+				)
+			return
+	else:
+		await cmd_airport_access_request(message)
 
 
 @dp.callback_query(F.data.startswith("airport:access:request"))

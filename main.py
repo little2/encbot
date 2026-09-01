@@ -125,6 +125,7 @@ TERMINAL_CHANNEL_THREAD_ID = int(os.getenv("TERMINAL_CHANNEL_THREAD_ID", "0") or
 AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(TERMINAL_CHANNEL_ID)) or 0)
 APRON_CHANNEL_ID = int(os.getenv("APRON_CHANNEL_ID", "0") or 0)
 AIRPORT_DUTY_FREE_GROUP_ID = int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", "0") or 0)
+AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", "0") or 0)
 
 DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
 DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
@@ -3239,39 +3240,35 @@ async def _ban_user(
 ) -> tuple[BlacklistEntry, str]:
 	entry = blacklist_store.ban(user_id, reason, created_by, expires_at)
 	user_expire_cache.remove(user_id)
-	if AIRPORT_LOBBY_GROUP_ID == 0:
-		return entry, "AIRPORT_LOBBY_GROUP_ID 尚未配置"
+	target_chats = [
+		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
+		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
+		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+		("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
+	]
+	configured_chat_ids = [chat_id for _, chat_id in target_chats if chat_id != 0]
+	if not configured_chat_ids:
+		return entry, "机场群组尚未配置"
 
-	try:
-		await bot.ban_chat_member(
-			chat_id=AIRPORT_LOBBY_GROUP_ID,
-			user_id=user_id,
-			until_date=expires_at or None,
-		)
-	except Exception as exc:
-		print(
-			f"[BLACKLIST] failed to ban user {user_id} "
-			f"from chat {AIRPORT_LOBBY_GROUP_ID}: {exc}",
-			flush=True,
-		)
-		return entry, str(exc)
-	
-	try:
-		await _telegram_call_with_retry(
-			"ban encoded-forward member",
-			lambda: bot.ban_chat_member(
-				chat_id=TERMINAL_CHANNEL_ID,
-				user_id=user_id,
-				until_date=expires_at or None,
-			),
-		)
-	except Exception as exc:
-		print(
-			f"[BLACKLIST] failed to ban user {user_id} "
-			f"from chat {TERMINAL_CHANNEL_ID}: {exc}",
-			flush=True,
-		)
-		return entry, str(exc)	
+	for chat_name, chat_id in target_chats:
+		if chat_id == 0:
+			continue
+		try:
+			await _telegram_call_with_retry(
+				f"ban member from {chat_name}",
+				lambda chat_id=chat_id: bot.ban_chat_member(
+					chat_id=chat_id,
+					user_id=user_id,
+					until_date=expires_at or None,
+				),
+			)
+		except Exception as exc:
+			print(
+				f"[BLACKLIST] failed to ban user {user_id} "
+				f"from {chat_name} ({chat_id}): {exc}",
+				flush=True,
+			)
+			return entry, str(exc)
 
 	return entry, ""
 
@@ -3329,6 +3326,8 @@ async def _unban_user_from_airport_groups(user_id: int) -> str:
 	for chat_name, chat_id in (
 		("航站大厅", AIRPORT_LOBBY_GROUP_ID),
 		("镇泰飞机场", TERMINAL_CHANNEL_ID),
+		("机场免税店", AIRPORT_DUTY_FREE_GROUP_ID),
+		("机场航班看板", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
 	):
 		if chat_id == 0:
 			continue
@@ -4318,7 +4317,7 @@ async def _airport_registration_error() -> str | None:
 			"<blockquote>📢 航站广播</blockquote>\n"
 			"亲爱的旅客您好，很抱歉通知您：\n"
 			"\n"
-			"目前「镇泰飞机场」航站大厅旅客人数已达运行容量上限，为确保航站秩序与飞行服务品质，现已暂停开放自助入场通道。"
+			"目前「镇泰飞机场」和「航站大厅」旅客人数已达运行容量上限，为确保航站秩序与飞行服务品质，现已暂停开放自助入场通道。"
 			"如需进入「镇泰飞机场」，请取得现有旅客提供的专属邀请连结，并通过审核后方可入场。\n"
 			"\n"
 			"<blockquote>✈️ 关于镇泰飞机场</blockquote>\n"
@@ -4330,7 +4329,10 @@ async def _airport_registration_error() -> str | None:
 			"若您希望进入「镇泰飞机场」搭乘航班，请联系已在航站内的旅客，请对方通过塔台机器人：「建立单人审核邀请」功能生成专属登机邀请连结。持该邀请连结完成入场审核后，即可获准进入「镇泰飞机场」。\n"
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
-			"您可以前往熟悉的正太群组或免税店，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
+			"有想法想进来的，三个途径："
+			"1.要么找已经在机场群内的熟人，机场群里成员可以生成邀请链接直接入群；"
+			"2.要么去找你平时待的正太社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。"
+			"3.最后您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
 			"\n"
 			"\n"
 			"感谢您的理解与配合，祝您旅途愉快，顺利起飞 ✈️\n"
@@ -4585,8 +4587,8 @@ async def cmd_airport_access_request(message: Message) -> None:
 				reply_markup=InlineKeyboardMarkup(
 					inline_keyboard=[[
 						InlineKeyboardButton(
-							text="免税店",
-							url="https://t.me/+M-F0o940gX1hYmNl",
+							text="✈️ 机场频道",
+							url="https://t.me/+FABeNW-I7p9iMjZl",
 						),
 					]],
 				),
@@ -4963,7 +4965,7 @@ async def _get_join_rejection_reason(
 			),
 		)
 
-	if context.chat_id == TERMINAL_CHANNEL_ID:
+	if context.chat_id == TERMINAL_CHANNEL_ID or context.chat_id == AIRPORT_DUTY_FREE_GROUP_ID:
 		if not await _is_member_of_chat(
 			AIRPORT_LOBBY_GROUP_ID,
 			context.user_id,
@@ -5241,7 +5243,7 @@ async def _process_join_request(context: AirportJoinContext) -> None:
 	await _after_join_approved(context)
 
 
-@dp.chat_join_request(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID}))
+@dp.chat_join_request(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID, AIRPORT_DUTY_FREE_GROUP_ID}))
 async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
 	context = _build_join_context(join_request)
 	if context.is_paid_invite:
@@ -5453,7 +5455,7 @@ async def on_lobby_channel_auto_forward(message: Message) -> None:
 	)
 
 
-@dp.message(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID}), F.text)
+@dp.message(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID, AIRPORT_DUTY_FREE_GROUP_ID}), F.text)
 async def on_reward_group_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
 		return
@@ -6911,7 +6913,7 @@ async def main() -> None:
 			BotCommand(command="me", description="查询飞行通行证"),
 			# BotCommand(command="bonus", description="塔台发放 10 天时限"),
 			BotCommand(command="rule", description="查看飞行通行证规则"),
-			BotCommand(command="airport_access_request", description="请求进入机场"),
+			BotCommand(command="airport_access_request", description="请求进入机场或大厅"),
 			BotCommand(command="invite", description="建立单人审核邀请"),
 		],
 		scope=BotCommandScopeAllPrivateChats(),

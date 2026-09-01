@@ -4329,9 +4329,9 @@ async def _airport_registration_error() -> str | None:
 			"若您希望进入「镇泰飞机场」搭乘航班，请联系已在航站内的旅客，请对方通过塔台机器人：「建立单人审核邀请」功能生成专属登机邀请连结。持该邀请连结完成入场审核后，即可获准进入「镇泰飞机场」。\n"
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
-			"有想法想进来的，三个途径："
-			"1.要么找已经在机场群内的熟人，机场群里成员可以生成邀请链接直接入群；"
-			"2.要么去找你平时待的正太社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。"
+			"有想法想进来的，三个途径：\n"
+			"1.要么找已经在机场群内的熟人，机场群里成员可以生成邀请链接直接入群；\n"
+			"2.要么去找你平时待的正太社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。\n"
 			"3.最后您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
 			"\n"
 			"\n"
@@ -4604,22 +4604,23 @@ async def cmd_airport_access_request(message: Message) -> None:
 
 @dp.message(F.chat.type == "private", Command("start"))
 async def cmd_start(message: Message, command: CommandObject) -> None:
-	batch_id = str(command.args or "").strip()
+	args = str(command.args or "").strip()
 
-	if batch_id:
+	if args and not args == "request":
 		try:
 			await message.delete()
 		except Exception as exc:
 			print(f"[START] failed to delete parameterized command: {exc}", flush=True)
 
-		if "fly_" in batch_id:
+
+		if "fly_" in args:
 			return
 
 		else:
 
 
 			try:
-				preview_settings = await _get_batch_preview_message_settings(batch_id)
+				preview_settings = await _get_batch_preview_message_settings(args)
 				preview_settings["chat_id"] = int(message.chat.id)
 				await _send_encoded_preview_message(preview_settings)
 			except ValueError as exc:
@@ -4630,7 +4631,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 				)
 			except Exception as exc:
 				print(
-					f"[START] batch preview delivery failed (batch_id={batch_id}): {exc}",
+					f"[START] batch preview delivery failed (batch_id={args}): {exc}",
 					flush=True,
 				)
 				await bot.send_message(

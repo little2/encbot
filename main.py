@@ -209,6 +209,7 @@ AIRPORT_QUIZ_RETRY_AT: dict[int, int] = {}
 AIRPORT_QUIZ_PASSED_UNTIL: dict[int, int] = {}
 AIRPORT_QUIZ_LOCKS: dict[int, asyncio.Lock] = {}
 AIRPORT_INVITE_LINK_LOCK = asyncio.Lock()
+INVITE_LINK_LOCKS: dict[str, asyncio.Lock] = {}
 BACKUP_LOCK = asyncio.Lock()
 PAID_INVITE_LOCKS: dict[str, asyncio.Lock] = {}
 USED_PAID_INVITES: dict[str, int] = {}
@@ -4366,69 +4367,105 @@ def _airport_quiz_keyboard(question_index: int) -> InlineKeyboardMarkup:
 
 
 async def _get_or_create_airport_invite_link() -> str:
-	if TERMINAL_CHANNEL_ID == 0:
-		raise RuntimeError("镇泰飞机场尚未配置")
+	return await _get_or_create_chat_invite_link(
+		chat_id=TERMINAL_CHANNEL_ID,
+		link_key=AIRPORT_INVITE_LINK_KEY,
+		link_name=AIRPORT_INVITE_LINK_NAME,
+		creates_join_request=True,
+	)
 
-	async with AIRPORT_INVITE_LINK_LOCK:
-		stored_link = shared_invite_link_store.get(AIRPORT_INVITE_LINK_KEY)
-		if stored_link and stored_link.chat_id != TERMINAL_CHANNEL_ID:
-			shared_invite_link_store.delete(AIRPORT_INVITE_LINK_KEY)
+
+def _build_default_invite_link_key(chat_id: int, creates_join_request: bool) -> str:
+	mode = "request" if creates_join_request else "join"
+	return f"chat:{int(chat_id)}:{mode}"
+
+
+def _build_default_invite_link_name(chat_id: int, creates_join_request: bool) -> str:
+	mode = "request" if creates_join_request else "join"
+	return f"invite-{abs(int(chat_id))}-{mode}"
+
+
+async def _get_or_create_chat_invite_link(
+	chat_id: int,
+	*,
+	link_key: str | None = None,
+	link_name: str | None = None,
+	creates_join_request: bool = True,
+) -> str:
+	chat_id = int(chat_id)
+	if chat_id == 0:
+		raise RuntimeError("群组尚未配置")
+
+	resolved_link_key = str(link_key or "").strip() or _build_default_invite_link_key(
+		chat_id,
+		creates_join_request,
+	)
+	resolved_link_name = str(link_name or "").strip() or _build_default_invite_link_name(
+		chat_id,
+		creates_join_request,
+	)
+
+	link_lock = INVITE_LINK_LOCKS.setdefault(resolved_link_key, asyncio.Lock())
+	async with link_lock:
+		stored_link = shared_invite_link_store.get(resolved_link_key)
+		if stored_link and stored_link.chat_id != chat_id:
+			shared_invite_link_store.delete(resolved_link_key)
 			stored_link = None
 
 		if stored_link:
 			try:
 				validated_link = await bot.edit_chat_invite_link(
-					chat_id=TERMINAL_CHANNEL_ID,
+					chat_id=chat_id,
 					invite_link=stored_link.invite_link,
-					name=AIRPORT_INVITE_LINK_NAME,
-					creates_join_request=True,
+					name=resolved_link_name,
+					creates_join_request=creates_join_request,
 				)
 			except TelegramBadRequest as exc:
 				print(
-					f"[AIRPORT_INVITE] stored link is invalid, replacing it: {exc}",
+					f"[INVITE_LINK] stored link is invalid, replacing it: {exc}",
 					flush=True,
 				)
-				shared_invite_link_store.delete(AIRPORT_INVITE_LINK_KEY)
+				shared_invite_link_store.delete(resolved_link_key)
 			except Exception as exc:
 				print(
-					f"[AIRPORT_INVITE] validation unavailable, using stored link: {exc}",
+					f"[INVITE_LINK] validation unavailable, using stored link: {exc}",
 					flush=True,
 				)
 				return stored_link.invite_link
 			else:
 				if not bool(validated_link.is_revoked):
 					shared_invite_link_store.save(
-						AIRPORT_INVITE_LINK_KEY,
-						TERMINAL_CHANNEL_ID,
+						resolved_link_key,
+						chat_id,
 						str(validated_link.invite_link),
-						AIRPORT_INVITE_LINK_NAME,
+						resolved_link_name,
 						created_at=stored_link.created_at,
 					)
 					return str(validated_link.invite_link)
-				shared_invite_link_store.delete(AIRPORT_INVITE_LINK_KEY)
+				shared_invite_link_store.delete(resolved_link_key)
 
 		invite = await bot.create_chat_invite_link(
-			chat_id=TERMINAL_CHANNEL_ID,
-			name=AIRPORT_INVITE_LINK_NAME,
-			creates_join_request=True,
+			chat_id=chat_id,
+			name=resolved_link_name,
+			creates_join_request=creates_join_request,
 		)
 		invite_link = str(invite.invite_link)
 		try:
 			shared_invite_link_store.save(
-				AIRPORT_INVITE_LINK_KEY,
-				TERMINAL_CHANNEL_ID,
+				resolved_link_key,
+				chat_id,
 				invite_link,
-				AIRPORT_INVITE_LINK_NAME,
+				resolved_link_name,
 			)
 		except Exception:
 			try:
 				await bot.revoke_chat_invite_link(
-					chat_id=TERMINAL_CHANNEL_ID,
+					chat_id=chat_id,
 					invite_link=invite_link,
 				)
 			except Exception as revoke_exc:
 				print(
-					f"[AIRPORT_INVITE] rollback revoke failed: {revoke_exc}",
+					f"[INVITE_LINK] rollback revoke failed: {revoke_exc}",
 					flush=True,
 				)
 			raise
@@ -4581,14 +4618,28 @@ async def cmd_airport_access_request(message: Message) -> None:
 	):
 		registration_error = await _airport_registration_error()
 		if registration_error:
+			flight_board_url = "https://t.me/+FABeNW-I7p9iMjZl"
+			if AIRPORT_FLIGHT_BOARD_CHANNEL_ID != 0:
+				try:
+					flight_board_url = await _get_or_create_chat_invite_link(
+						chat_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,
+						link_key="airport-flight-board-approved",
+						link_name="airport-flight-board-approved-url",
+						creates_join_request=False,
+					)
+				except Exception as exc:
+					print(
+						f"[AIRPORT_INVITE] flight board invite creation failed: {exc}",
+						flush=True,
+					)
 			await message.reply(
 				registration_error,
 				parse_mode="HTML",
 				reply_markup=InlineKeyboardMarkup(
 					inline_keyboard=[[
 						InlineKeyboardButton(
-							text="✈️ 机场频道",
-							url="https://t.me/+FABeNW-I7p9iMjZl",
+							text="✈️ 机场航班表频道",
+							url=flight_board_url,
 						),
 					]],
 				),
@@ -5263,8 +5314,9 @@ async def _send_lobby_welcome(user: User) -> None:
 	welcome_text = (
 		f"🎉 欢迎抵达航站大厅，{mention}！\n\n"
 		"🏢 航站大厅(本群)：与其他旅客交流，发言可延长飞行通行证。\n"
-		"🗼 镇泰塔台：提交、分享资源与邀请他人。\n"
-		"🛫 镇泰飞机场：查看航班并获取资源。\n\n"
+		"🛫 飞机场：查看航班并获取资源。\n\n"
+		"🛍️ 免税店：不会直接展示预览图，也可与其他旅客交流，发言也可延长飞行通行证。\n"
+		"🗼 塔台：提交、分享资源与邀请他人。\n"
 		"请先和其他旅客进行有内容的交流。问候语、刷屏或为了取得时数而发送的无意义内容不会获得奖励。\n\n"
 		"祝你候机愉快，航程顺利。"
 	)
@@ -5276,12 +5328,31 @@ async def _send_lobby_welcome(user: User) -> None:
 		if bot_name
 		else "https://t.me/ztTowerRobot"
 	)
+	duty_free_url = tower_url
+	if AIRPORT_DUTY_FREE_GROUP_ID != 0:
+		try:
+			duty_free_url = await _get_or_create_chat_invite_link(
+				chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
+				link_key="airport-duty-free-approved",
+				link_name="airport-duty-free-approved-url",
+				creates_join_request=True,
+			)
+		except Exception as exc:
+			print(
+				f"[AIRPORT_INVITE] duty free invite creation failed: {exc}",
+				flush=True,
+			)
 	welcome_keyboard = InlineKeyboardMarkup(
-		inline_keyboard=[[
-			InlineKeyboardButton(text="🛫 飞机场", url=airport_url),
-			InlineKeyboardButton(text="🗼 塔台", url=tower_url),
-			InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztTowerRobot")
-		]],
+		inline_keyboard=[
+			[
+				InlineKeyboardButton(text="🛫 飞机场", url=airport_url),
+				InlineKeyboardButton(text="🛍️ 免税店", url=duty_free_url),
+			],
+			[
+				InlineKeyboardButton(text="🗼 塔台", url=tower_url),
+				InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztTowerRobot"),
+			],
+		],
 	)
 
 	if TRADE_IMAGE_PATHS[0].is_file():

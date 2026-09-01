@@ -52,6 +52,7 @@ from typing import Union
 from utils.utf_utils import UtfConverter
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
 from utils.batch_utils import BatchStore
+from utils.batch_view_utils import BatchViewStore
 from utils.invite_link_utils import SharedInviteLinkStore
 from utils.received_media_utils import ReceivedMediaStore
 from utils.user_utils import UserExpireCache, UserExpire
@@ -143,6 +144,7 @@ user_expire_db_path = Path(
 user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
 blacklist_store = BlacklistStore(db_path=user_expire_db_path)
 batch_store = BatchStore(db_path=user_expire_db_path)
+batch_view_store = BatchViewStore(db_path=user_expire_db_path)
 received_media_store = ReceivedMediaStore(db_path=user_expire_db_path)
 shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 
@@ -1583,6 +1585,12 @@ async def _send_encoded_preview_message(
 	if chat_id == 0:
 		raise ValueError("chat_id is required")
 	if_spoiler = bool(batch_settings.get("if_spoiler", False))
+	batch_id = str(batch_settings.get("batch_id", "") or "").strip()
+	user_id = int(batch_settings.get("user_id", 0) or 0)
+	if not batch_id:
+		raise ValueError("batch_id is required")
+	if user_id <= 0:
+		raise ValueError("user_id is required")
 	caption = display_text if len(display_text) <= 1024 else None
 
 	media = [
@@ -1607,6 +1615,7 @@ async def _send_encoded_preview_message(
 				has_spoiler=if_spoiler,
 			),
 		)
+		batch_view_store.record(batch_id, user_id)
 		if caption is not None:
 			return photo_message
 		return await _telegram_call_with_retry(
@@ -1628,6 +1637,7 @@ async def _send_encoded_preview_message(
 			media=media,
 		),
 	)
+	batch_view_store.record(batch_id, user_id)
 	return await _telegram_call_with_retry(
 		"send encoded text",
 		lambda: bot.send_message(
@@ -1682,6 +1692,7 @@ async def _get_batch_preview_message_settings(
 	parsed["batch_content"] = batch_content
 
 	return {
+		"batch_id": normalized_batch_id,
 		"thread_id": None,
 		"preview_payloads": preview_payloads,
 		"display_text": await _build_display(parsed, encoded),
@@ -1692,6 +1703,7 @@ async def _get_batch_preview_message_settings(
 
 async def _forward_encoded_if_whitelisted(
 	owner_user_id: int,
+	batch_id: str,
 	encoded: str,
 	items: list[dict[str, Any]],
 	batch_content: str = "",
@@ -1817,6 +1829,8 @@ async def _forward_encoded_if_whitelisted(
 
 		if preview_show and preview_payloads:
 			preview_batch_settings = {
+				"batch_id": batch_id,
+				"user_id": owner_user_id,
 				"preview_payloads": preview_payloads,
 				"display_text": display_text,
 				"display_keyboard": display_keyboard,
@@ -2048,6 +2062,7 @@ async def _send_encoded_snapshot(
 	try:
 		forward_status = await _forward_encoded_if_whitelisted(
 			owner_user_id,
+			batch_id,
 			encoded,
 			items,
 			batch_content,
@@ -4330,10 +4345,11 @@ async def _airport_registration_error() -> str | None:
 			"若您希望进入「镇泰飞机场」搭乘航班，请联系已在航站内的旅客，请对方通过塔台机器人：「建立单人审核邀请」功能生成专属登机邀请连结。持该邀请连结完成入场审核后，即可获准进入「镇泰飞机场」。\n"
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
-			"有想法想进来的，三个途径：\n"
-			"1.要么找已经在机场群内的熟人，机场群里成员可以生成邀请链接直接入群；\n"
-			"2.要么去找你平时待的正太社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。\n"
-			"3.最后您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
+			"有想法想进来的，四个途径：\n"
+			"1.将你喜欢的视频资源发送给「<a href='https://t.me/shuttle67bot'>摆渡车机器人</a>」，获取对应密文后，再到你平时活跃的正太群中，将密文分享给群友。当你分享的资源累计有 100 人查看 后，即可通过<a href='https://t.me/shuttle67bot'>摆渡车机器人</a>的私信指令，获取 入群邀请链接。\n"
+			"2.要么找已经在机场群内的熟人，机场群里成员可以生成邀请链接直接入群；\n"
+			"3.要么去找你平时待的正太社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。\n"
+			"4.最后您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
 			"\n"
 			"\n"
 			"感谢您的理解与配合，祝您旅途愉快，顺利起飞 ✈️\n"
@@ -4673,6 +4689,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 			try:
 				preview_settings = await _get_batch_preview_message_settings(args)
 				preview_settings["chat_id"] = int(message.chat.id)
+				preview_settings["user_id"] = int(message.from_user.id)
 				await _send_encoded_preview_message(preview_settings)
 			except ValueError as exc:
 				await bot.send_message(
@@ -6926,6 +6943,7 @@ async def on_text(message: Message) -> None:
 		try:
 			preview_settings = await _get_batch_preview_message_settings(batch_id)
 			preview_settings["chat_id"] = int(message.chat.id)
+			preview_settings["user_id"] = int(message.from_user.id)
 			await _send_encoded_preview_message(preview_settings)
 		except ValueError as exc:
 			await message.reply(str(exc))
@@ -6993,6 +7011,27 @@ async def main() -> None:
 	workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
 	forward_worker = asyncio.create_task(_media_forward_worker())
 	maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
+	video_bot_task: asyncio.Task[None] | None = None
+	video_bot_enabled = str(
+		os.getenv("VIDEO_BOT_ENABLED", "false") or "false"
+	).strip().lower() in {"1", "true", "yes", "on"}
+	if video_bot_enabled:
+		from video_bot import start_video_bot
+
+		video_bot_task = asyncio.create_task(
+			start_video_bot(
+				AIRPORT_LOBBY_GROUP_ID,
+				PAID_INVITE_LIFETIME_HOURS,
+			)
+		)
+		def report_video_bot_result(task: asyncio.Task[None]) -> None:
+			if task.cancelled():
+				return
+			exception = task.exception()
+			if exception is not None:
+				print(f"[VIDEO_BOT] stopped with error: {exception}", flush=True)
+
+		video_bot_task.add_done_callback(report_video_bot_result)
 	try:
 		await dp.start_polling(bot)
 	finally:
@@ -7000,14 +7039,18 @@ async def main() -> None:
 			worker.cancel()
 		forward_worker.cancel()
 		maintenance_worker.cancel()
+		if video_bot_task is not None:
+			video_bot_task.cancel()
 		await asyncio.gather(
 			*workers,
 			forward_worker,
 			maintenance_worker,
+			*([video_bot_task] if video_bot_task is not None else []),
 			return_exceptions=True,
 		)
 		blacklist_store.close()
 		batch_store.close()
+		batch_view_store.close()
 		received_media_store.close()
 		shared_invite_link_store.close()
 		user_expire_cache.close()

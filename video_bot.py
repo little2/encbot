@@ -23,7 +23,7 @@ from utils.video_store import VideoStore
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-VIDEO_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{16}$")
+VIDEO_ID_PATTERN = r"[0-9a-fA-F]{16}"
 
 
 def _safe_print(message: str) -> None:
@@ -66,15 +66,22 @@ def _display_bot_name(username: str) -> str:
     return normalized_username
 
 
-def _extract_record_id(text: str, bot_name: str) -> str | None:
-    normalized_text = str(text or "").strip().lower()
-    normalized_bot_name = str(bot_name or "").strip().lower()
-    prefix = f"{normalized_bot_name}_"
-    if normalized_bot_name and normalized_text.startswith(prefix):
-        normalized_text = normalized_text[len(prefix):]
-    if not VIDEO_ID_PATTERN.fullmatch(normalized_text):
-        return None
-    return normalized_text
+def _extract_record_ids(text: str, bot_name: str) -> list[str]:
+    normalized_bot_name = str(bot_name or "").strip().removeprefix("@")
+    prefixed_id = (
+        rf"{re.escape(normalized_bot_name)}_({VIDEO_ID_PATTERN})"
+        if normalized_bot_name
+        else rf"({VIDEO_ID_PATTERN})"
+    )
+    pattern = re.compile(
+        rf"(?<![0-9a-zA-Z_])(?:{prefixed_id}|({VIDEO_ID_PATTERN}))"
+        rf"(?![0-9a-zA-Z_])",
+        re.IGNORECASE,
+    )
+    return [
+        next(group for group in match.groups() if group is not None).lower()
+        for match in pattern.finditer(str(text or ""))
+    ]
 
 
 def _build_dispatcher(
@@ -160,31 +167,37 @@ def _build_dispatcher(
     async def receive_video_id(message: Message) -> None:
         if message.from_user is None:
             return
-        record_id = _extract_record_id(message.text or "", bot_name)
-        if record_id is None:
-            await message.reply("请输入有效的 16 字符视频 ID。")
+        record_ids = _extract_record_ids(message.text or "", bot_name)
+        if not record_ids:
+            await message.reply("请输入有效的密文。")
             return
 
-        record = store.get_video(record_id)
-        if record is None:
+        records = [
+            (record_id, store.get_video(record_id))
+            for record_id in record_ids
+        ]
+        if not any(record is not None for _, record in records):
             await message.reply("找不到这个视频。")
             return
 
-        try:
-            await message.reply_video(video=str(record["file_id"]))
-        except Exception as exc:
-            _safe_print(
-                f"[VIDEO_BOT] 发送视频 {record_id} 失败：{exc}"
-            )
-            await message.reply("视频发送失败，请稍后再试。")
-            return
+        for record_id, record in records:
+            if record is None:
+                continue
+            try:
+                await message.reply_video(video=str(record["file_id"]))
+            except Exception as exc:
+                _safe_print(
+                    f"[VIDEO_BOT] 发送视频 {record_id} 失败：{exc}"
+                )
+                await message.reply("视频发送失败，请稍后再试。")
+                continue
 
-        try:
-            store.record_unique_view(record_id, message.from_user.id)
-        except Exception as exc:
-            _safe_print(
-                f"[VIDEO_BOT] 记录视频 {record_id} 的观看数据失败：{exc}"
-            )
+            try:
+                store.record_unique_view(record_id, message.from_user.id)
+            except Exception as exc:
+                _safe_print(
+                    f"[VIDEO_BOT] 记录视频 {record_id} 的观看数据失败：{exc}"
+                )
 
     @dispatcher.message(F.chat.type == "private")
     async def unsupported_message(message: Message) -> None:
@@ -250,7 +263,7 @@ async def start_video_bot(
             int(airport_lobby_group_id),
         )
         username = str(getattr(me, "username", "") or "")
-        bot_name = _display_bot_name(username)
+        bot_name = username
         dispatcher = _build_dispatcher(
             store,
             bot_name,

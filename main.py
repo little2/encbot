@@ -27,13 +27,19 @@ from functools import lru_cache
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageOps
 import imagehash
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import (
+	TelegramBadRequest,
+	TelegramForbiddenError,
+	TelegramNetworkError,
+	TelegramNotFound,
+	TelegramRetryAfter,
+)
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile
@@ -87,6 +93,26 @@ def _parse_user_ids(value) -> set[int]:
             user_ids.add(user_id)
     return user_ids
 
+
+def _parse_chat_ids(value: str, setting_name: str) -> list[int]:
+	chat_ids: list[int] = []
+	seen_chat_ids: set[int] = set()
+	for item in str(value or "").split(","):
+		normalized_item = item.strip()
+		if not normalized_item:
+			continue
+		try:
+			chat_id = int(normalized_item)
+		except ValueError as exc:
+			raise RuntimeError(
+				f"{setting_name} contains an invalid chat ID: {normalized_item}"
+			) from exc
+		if chat_id == 0 or chat_id in seen_chat_ids:
+			continue
+		seen_chat_ids.add(chat_id)
+		chat_ids.append(chat_id)
+	return chat_ids
+
 load_dotenv(
 	dotenv_path=Path(__file__).resolve().parent / ".env",
 	override=True,
@@ -124,7 +150,10 @@ TERMINAL_CHANNEL_ID = int(os.getenv("TERMINAL_CHANNEL_ID", "0") or 0)
 TERMINAL_CHANNEL_THREAD_ID = int(os.getenv("TERMINAL_CHANNEL_THREAD_ID", "0") or 0)
 #发言可以增加通行证时间的群组
 AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(TERMINAL_CHANNEL_ID)) or 0)
-APRON_CHANNEL_ID = int(os.getenv("APRON_CHANNEL_ID", "0") or 0)
+APRON_CHANNEL_IDS = _parse_chat_ids(
+	os.getenv("APRON_CHANNEL_ID", "0"),
+	"APRON_CHANNEL_ID",
+)
 AIRPORT_DUTY_FREE_GROUP_ID = int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", "0") or 0)
 AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", "0") or 0)
 
@@ -1245,7 +1274,7 @@ async def _delete_message_later(sent_message: Message, delay_seconds: int) -> No
 
 
 def _enqueue_media_forward(task: MediaForwardTask) -> None:
-	if X_MAN_BOT_ID == 0 and APRON_CHANNEL_ID == 0:
+	if X_MAN_BOT_ID == 0 and not APRON_CHANNEL_IDS:
 		return
 
 	try:
@@ -1260,29 +1289,44 @@ def _enqueue_media_forward(task: MediaForwardTask) -> None:
 
 
 async def _forward_media_in_background(task: MediaForwardTask) -> None:
-	destinations = (
-		("APRON_CHANNEL_ID", APRON_CHANNEL_ID),
-		("X_MAN_BOT_ID", X_MAN_BOT_ID),
-	)
 	seen_destination_ids: set[int] = set()
-	for destination_name, destination_id in destinations:
-		if destination_id == 0 or destination_id in seen_destination_ids:
-			continue
-		seen_destination_ids.add(destination_id)
+	remaining_apron_ids = list(APRON_CHANNEL_IDS)
+	while remaining_apron_ids:
+		selected_apron_id = secrets.choice(remaining_apron_ids)
+		remaining_apron_ids.remove(selected_apron_id)
+		seen_destination_ids.add(selected_apron_id)
 		try:
-			await _send_media_forward_to_destination(
+			was_sent = await _send_media_forward_to_destination(
 				task,
-				destination_name,
-				destination_id,
+				"APRON_CHANNEL_ID",
+				selected_apron_id,
 			)
 		finally:
-			#每完成一個「目的地」的發送後，都等待 MEDIA_FORWARD_INTERVAL_SECONDS
 			await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
+		if was_sent:
+			break
+		print(
+			f"[MEDIA_FORWARD] apron {selected_apron_id} 发送失败，"
+			"尝试下一个 apron",
+			flush=True,
+		)
+
+	if X_MAN_BOT_ID == 0 or X_MAN_BOT_ID in seen_destination_ids:
+		return
+	try:
+		await _send_media_forward_to_destination(
+			task,
+			"X_MAN_BOT_ID",
+			X_MAN_BOT_ID,
+		)
+	finally:
+		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 
 
 async def _run_media_forward_operation(
 	operation: Any,
 	description: str,
+	error_handler: Callable[[Exception], None] | None = None,
 ) -> Any | None:
 	for attempt in range(1, MEDIA_FORWARD_MAX_ATTEMPTS + 1):
 		try:
@@ -1300,10 +1344,11 @@ async def _run_media_forward_operation(
 			await asyncio.sleep(wait_seconds)
 		except Exception as exc:
 			print(f"[MEDIA_FORWARD] {description} 失败: {exc}", flush=True)
+			if error_handler is not None:
+				error_handler(exc)
 			return None
 		else:
 			print(f"[MEDIA_FORWARD] {description} 成功", flush=True)
-			await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 			return result
 
 	print(
@@ -1311,6 +1356,37 @@ async def _run_media_forward_operation(
 		flush=True,
 	)
 	return None
+
+
+def _is_invalid_apron_error(exc: Exception) -> bool:
+	if isinstance(exc, (TelegramForbiddenError, TelegramNotFound)):
+		return True
+	if not isinstance(exc, TelegramBadRequest):
+		return False
+	error_text = str(exc).lower()
+	return any(
+		marker in error_text
+		for marker in (
+			"chat not found",
+			"bot was kicked",
+			"bot is not a member",
+			"not enough rights",
+			"chat_write_forbidden",
+		)
+	)
+
+
+def _remove_invalid_apron_channel(chat_id: int, exc: Exception) -> None:
+	if not _is_invalid_apron_error(exc):
+		return
+	try:
+		APRON_CHANNEL_IDS.remove(chat_id)
+	except ValueError:
+		return
+	print(
+		f"[MEDIA_FORWARD] removed invalid apron {chat_id}: {exc}",
+		flush=True,
+	)
 
 
 async def _send_file_id_with_switchbot(
@@ -1365,7 +1441,7 @@ async def _send_media_forward_to_destination(
 	task: MediaForwardTask,
 	destination_name: str,
 	destination_id: int,
-) -> None:
+) -> bool:
 	print(
 		f"[MEDIA_FORWARD] 开始发送至 {destination_name}={destination_id}",
 		flush=True,
@@ -1377,18 +1453,35 @@ async def _send_media_forward_to_destination(
 			message_id=task.message_id,
 		),
 		f"原媒体发送至 {destination_name}",
+		(
+			lambda exc: _remove_invalid_apron_channel(destination_id, exc)
+			if destination_name == "APRON_CHANNEL_ID"
+			else None
+		),
 	)
-	if destination_id == APRON_CHANNEL_ID and copy_result is not None:
+	if copy_result is None:
+		return False
+
+	if destination_name == "APRON_CHANNEL_ID" and copy_result is not None:
 		# print(task.file_id, flush=True)
 		# print(f"copy_result={copy_result}", flush=True)
-		await bot.delete_message(
-			chat_id=destination_id,
-			message_id=copy_result.message_id,
+		delete_result = await _run_media_forward_operation(
+			lambda: bot.delete_message(
+				chat_id=destination_id,
+				message_id=copy_result.message_id,
+			),
+			f"删除 apron {destination_id} 的临时媒体",
 		)
+		if delete_result is None:
+			print(
+				f"[MEDIA_FORWARD] 无法删除 apron {destination_id} "
+				f"的临时媒体 message_id={copy_result.message_id}",
+				flush=True,
+			)
 		await _send_file_id_with_switchbot(task)
 
 	if not task.thumb_bytes:
-		return
+		return True
 
 	# thumb_message = await _run_media_forward_operation(
 	# 	lambda: bot.send_photo(
@@ -1406,7 +1499,7 @@ async def _send_media_forward_to_destination(
 	# 	f"缩略图发送至 {destination_name}",
 	# )
 	# if (
-	# 	destination_id == APRON_CHANNEL_ID
+	# 	destination_name == "APRON_CHANNEL_ID"
 	# 	and isinstance(thumb_message, Message)
 	# 	and thumb_message.photo
 	# ):
@@ -1421,6 +1514,8 @@ async def _send_media_forward_to_destination(
 	# 		file_id=thumb_file_id,
 	# 		file_type="photo",
 	# 	)
+
+	return True
 
 
 async def _media_forward_worker() -> None:
@@ -2568,6 +2663,32 @@ async def cmd_me(message: Message) -> None:
 		f"到期时间：{expire_text}\n"
 		f"目前可请求：{available_view_count} 个资源"
 	)
+
+
+def _build_hot_message() -> str:
+	hot_batches = batch_view_store.get_hot_batches(days=7, limit=10)
+	if not hot_batches:
+		return "🔥 近 7 天暂无热门资源。"
+
+	lines = ["🔥 近 7 天热门资源 Top 10", ""]
+	for index, (batch_id, batch_content, view_count) in enumerate(
+		hot_batches,
+		start=1,
+	):
+		content = escape("".join(batch_content.split())[:20] or "（无内容）")
+		url = escape(
+			f"https://t.me/{bot_name}?start={batch_id}",
+			quote=True,
+		)
+		lines.append(
+			f"🛫 {index}. <a href=\"{url}\">{content}</a> — {view_count} 次"
+		)
+	return "\n".join(lines)
+
+
+@dp.message(F.chat.type == "private", Command("hot"))
+async def cmd_hot(message: Message) -> None:
+	await message.reply(_build_hot_message(), parse_mode="HTML")
 
 
 @dp.message(F.chat.type == "private", Command("admin"))
@@ -4016,6 +4137,48 @@ async def _daily_maintenance_worker() -> None:
 			)
 
 
+def _next_daily_hot_time(now: datetime) -> datetime:
+	next_run = now.replace(hour=19, minute=0, second=0, microsecond=0)
+	if next_run <= now:
+		next_run += timedelta(days=1)
+	return next_run
+
+
+async def _daily_hot_worker() -> None:
+	while True:
+		now = datetime.now(UTC8)
+		next_run = _next_daily_hot_time(now)
+		delay_seconds = max(1.0, (next_run - now).total_seconds())
+		print(
+			f"ℹ️ [DAILY_HOT] next run at {next_run.isoformat()}",
+			flush=True,
+		)
+		await asyncio.sleep(delay_seconds)
+
+		if AIRPORT_DUTY_FREE_GROUP_ID == 0:
+			print(
+				"[DAILY_HOT] AIRPORT_DUTY_FREE_GROUP_ID is 0, post skipped",
+				flush=True,
+			)
+			continue
+
+		try:
+			await _telegram_call_with_retry(
+				"send daily hot list to airport duty free group",
+				lambda: bot.send_message(
+					chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
+					text=_build_hot_message(),
+					parse_mode="HTML",
+					disable_web_page_preview=True,
+				),
+			)
+			print("✅ [DAILY_HOT] hot list posted", flush=True)
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			print(f"[DAILY_HOT] post failed: {exc}", flush=True)
+
+
 def _base36_encode(value: int) -> str:
 	digits = "0123456789abcdefghijklmnopqrstuvwxyz"
 	value = int(value)
@@ -4987,8 +5150,11 @@ async def _check_bot_group_admin_permissions() -> None:
 	groups = (
 		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
 		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
-		("APRON_CHANNEL_ID", APRON_CHANNEL_ID),
 		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+		*(
+			(f"APRON_CHANNEL_ID[{index}]", chat_id)
+			for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
+		),
 	)
 	for setting_name, chat_id in groups:
 		if chat_id == 0:
@@ -5619,13 +5785,16 @@ async def on_reward_group_message(message: Message) -> None:
 
 
 @dp.channel_post(
-	F.chat.id == APRON_CHANNEL_ID,
+	F.chat.id.in_(APRON_CHANNEL_IDS),
 	F.document | F.photo | F.video | F.audio | F.voice | F.animation | F.sticker,
 )
 async def on_apron_channel_media(message: Message) -> None:
 	"""Print the reusable Telegram file_id of media posted to the apron channel."""
 	try:
-		print(f"[APRON_MEDIA] received media in apron channel {APRON_CHANNEL_ID}", flush=True)
+		print(
+			f"[APRON_MEDIA] received media in apron channel {message.chat.id}",
+			flush=True,
+		)
 		_, file_id = _extract_media_info(message)
 	except ValueError as exc:
 		print(f"[APRON_MEDIA] failed to extract media info: {exc}", flush=True)
@@ -7033,6 +7202,7 @@ async def main() -> None:
 			# BotCommand(command="start", description="开始"),
 			# BotCommand(command="about", description="关于我"),
 			BotCommand(command="me", description="查询飞行通行证"),
+			BotCommand(command="hot", description="查看七天热门资源"),
 			# BotCommand(command="bonus", description="塔台发放 10 天时限"),
 			BotCommand(command="rule", description="查看飞行通行证规则"),
 			BotCommand(command="airport_access_request", description="请求进入机场或大厅"),
@@ -7043,6 +7213,7 @@ async def main() -> None:
 	workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
 	forward_worker = asyncio.create_task(_media_forward_worker())
 	maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
+	hot_worker = asyncio.create_task(_daily_hot_worker())
 	video_bot_task: asyncio.Task[None] | None = None
 	video_bot_enabled = str(
 		os.getenv("VIDEO_BOT_ENABLED", "false") or "false"
@@ -7071,12 +7242,14 @@ async def main() -> None:
 			worker.cancel()
 		forward_worker.cancel()
 		maintenance_worker.cancel()
+		hot_worker.cancel()
 		if video_bot_task is not None:
 			video_bot_task.cancel()
 		await asyncio.gather(
 			*workers,
 			forward_worker,
 			maintenance_worker,
+			hot_worker,
 			*([video_bot_task] if video_bot_task is not None else []),
 			return_exceptions=True,
 		)

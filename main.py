@@ -3742,26 +3742,6 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				0,
 				(check_timestamp - user_expire.expire_timestamp) // (24 * 60 * 60),
 			) if user_expire else INACTIVE_EXPIRE_DAYS
-			try:
-				await _telegram_call_with_retry(
-					f"notify inactive member {user_id}",
-					lambda: bot.send_message(
-						chat_id=user_id,
-						text=(
-							"🛫 机场成员清理通知\n\n"
-							f"你的飞行通行证已经过期 {expired_days} 天，"
-							f"超过机场设定的 {INACTIVE_EXPIRE_DAYS} 天不活跃期限。"
-							"系统将你移出「镇泰飞机场」和「航站大厅」，"
-							"并清除相关通行证数据。\n\n"
-							"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
-						),
-					),
-				)
-			except Exception as exc:
-				print(
-					f"[INACTIVE_CLEANUP] notice failed for user {user_id}: {exc}",
-					flush=True,
-				)
 
 			if not _is_inactive_candidate(user_id, int(datetime.now().timestamp())):
 				skipped_user_ids.append(user_id)
@@ -3811,35 +3791,87 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				)
 				continue
 
-			if not airport_ok or not lobby_ok:
+			duty_free_ok = True
+			duty_free_result = "免税店未配置"
+			if AIRPORT_DUTY_FREE_GROUP_ID != 0:
+				duty_free_ok, duty_free_result, duty_free_participant_error = (
+					await _remove_inactive_user_from_chat(
+						AIRPORT_DUTY_FREE_GROUP_ID,
+						user_id,
+						"免税店",
+					)
+				)
+				if duty_free_participant_error:
+					try:
+						_delete_inactive_user_data(user_id)
+					except Exception as exc:
+						failed_results.append(f"{user_id}：数据库删除失败：{exc}")
+						continue
+					participant_record_deleted_user_ids.append(user_id)
+					removed_user_ids.append(user_id)
+					print(
+						f"[INACTIVE_CLEANUP] deleted user {user_id} data after "
+						f"PARTICIPANT_ID from duty free lookup",
+						flush=True,
+					)
+					continue
+
+			if not airport_ok or not lobby_ok or not duty_free_ok:
 				failed_results.append(
-					f"{user_id}：{airport_result}；{lobby_result}"
+					f"{user_id}：{airport_result}；{lobby_result}；{duty_free_result}"
 				)
 				continue
 
-			try:
-				await _telegram_call_with_retry(
-					f"broadcast inactive cleanup for {user_id}",
-					lambda: bot.send_message(
-						chat_id=AIRPORT_LOBBY_GROUP_ID,
-						text=(
-							"🧹 长期不活跃成员清理\n\n"
-							f'<a href="tg://user?id={user_id}">旅客 {user_id}</a> '
-							f"的飞行通行证已过期 {expired_days} 天，"
-							"现已从「镇泰飞机场」与「航站大厅」移出。\n\n"
-							"本次属于不活跃成员整理，不是黑名单封禁，"
-							"之后仍可按照届时的入场规则重新申请加入。"
+			actually_removed = any(
+				result.endswith("已移出")
+				for result in (airport_result, lobby_result, duty_free_result)
+			)
+			if actually_removed:
+				try:
+					await _telegram_call_with_retry(
+						f"notify inactive member {user_id}",
+						lambda: bot.send_message(
+							chat_id=user_id,
+							text=(
+								"🛫 机场成员清理通知\n\n"
+								f"你的飞行通行证已经过期 {expired_days} 天，"
+								f"超过机场设定的 {INACTIVE_EXPIRE_DAYS} 天不活跃期限。"
+								"系统已将你移出原先所在的「镇泰飞机场」「航站大厅」或「免税店」，"
+								"并清除相关通行证数据。\n\n"
+								"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
+							),
 						),
-						parse_mode="HTML",
-					),
-				)
-			except Exception as exc:
-				broadcast_failed_results.append(f"{user_id}：{exc}")
-				print(
-					f"[INACTIVE_CLEANUP] lobby broadcast failed for "
-					f"user {user_id}: {exc}",
-					flush=True,
-				)
+					)
+				except Exception as exc:
+					print(
+						f"[INACTIVE_CLEANUP] notice failed for user {user_id}: {exc}",
+						flush=True,
+					)
+
+			if actually_removed:
+				try:
+					await _telegram_call_with_retry(
+						f"broadcast inactive cleanup for {user_id}",
+						lambda: bot.send_message(
+							chat_id=AIRPORT_LOBBY_GROUP_ID,
+							text=(
+								"🧹 长期不活跃成员清理\n\n"
+								f'<a href="tg://user?id={user_id}">旅客 {user_id}</a> '
+								f"的飞行通行证已过期 {expired_days} 天，"
+								"现已从「镇泰飞机场」「航站大厅」与「免税店」移出。\n\n"
+								"本次属于不活跃成员整理，不是黑名单封禁，"
+								"之后仍可按照届时的入场规则重新申请加入。"
+							),
+							parse_mode="HTML",
+						),
+					)
+				except Exception as exc:
+					broadcast_failed_results.append(f"{user_id}：{exc}")
+					print(
+						f"[INACTIVE_CLEANUP] lobby broadcast failed for "
+						f"user {user_id}: {exc}",
+						flush=True,
+					)
 
 			try:
 				_delete_inactive_user_data(user_id)
@@ -3850,7 +3882,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			removed_user_ids.append(user_id)
 			print(
 				f"[INACTIVE_CLEANUP] removed user {user_id}: "
-				f"{airport_result}; {lobby_result}; database deleted",
+				f"{airport_result}; {lobby_result}; {duty_free_result}; database deleted",
 				flush=True,
 			)
 

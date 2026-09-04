@@ -7283,7 +7283,7 @@ async def main() -> None:
 				return
 			exception = task.exception()
 			if exception is not None:
-				print(f"[VIDEO_BOT] stopped with error: {exception}", flush=True)
+				print(f"❌[VIDEO_BOT] stopped with error: {exception}", flush=True)
 
 		video_bot_task.add_done_callback(report_video_bot_result)
 	try:

@@ -2691,6 +2691,32 @@ async def cmd_hot(message: Message) -> None:
 	await message.reply(_build_hot_message(), parse_mode="HTML")
 
 
+@dp.message(F.chat.type == "private", Command("donate"))
+async def cmd_donate(message: Message) -> None:
+	text = (
+		"<b>可用账号乐捐说明</b>\n\n"
+		"由于「镇泰机场」的运行方式较为特殊，相关账号存在较高的限制、冻结或封禁风险，因此对于「Telegram 可用账号」有持续需求。\n\n"
+		"为维持群组建设与正常运行，「镇泰机场」接受群友自愿捐赠「Telegram 可用账号」。\n\n"
+		"账号一经捐赠并由群组接收后，<b>即不再退回</b>。请勿捐赠仍存有重要资料、联系人或其他个人用途的账号，并请在捐赠前确认能够接受账号可能遭到限制、封禁或永久失效的风险。\n\n"
+		"捐赠后的账号仅会用于<b>新增及维护频道、群组、机器人与其他相关建设用途</b>，不会用于转售、出租、交易或任何其他营利行为。\n\n"
+		"账号捐赠属于自愿且无偿的支持，<b>不代表因此取得管理权、决策权、特殊待遇或任何固定利益</b>，也不会因为曾经捐赠账号而取得干预群组建设与运营方向的权利。\n\n"
+		"对于愿意协助群组建设的群友，群组通常会视实际情况给予适当感谢，例如<b>延长飞行通行证期限、提供入群资格</b>等；但感谢方式、内容与期限均不固定，也不构成捐赠的对价或任何形式的承诺。\n\n"
+		"<b>捐账号是支持群组，不是购买权益；群组的感谢是心意，不是交易。</b>"
+	)
+	await message.reply(
+		text,
+		parse_mode="HTML",
+		reply_markup=InlineKeyboardMarkup(
+			inline_keyboard=[[
+				InlineKeyboardButton(
+					text="前往乐捐",
+					url="https://t.me/ztflybot",
+				),
+			]],
+		),
+	)
+
+
 @dp.message(F.chat.type == "private", Command("admin"))
 async def cmd_admin(message: Message) -> None:
 	if not _is_admin_message(message):
@@ -7223,6 +7249,7 @@ async def main() -> None:
 			# BotCommand(command="about", description="关于我"),
 			BotCommand(command="me", description="查询飞行通行证"),
 			BotCommand(command="hot", description="查看七天热门资源"),
+			BotCommand(command="donate", description="可用账号乐捐说明"),
 			# BotCommand(command="bonus", description="塔台发放 10 天时限"),
 			BotCommand(command="rule", description="查看飞行通行证规则"),
 			BotCommand(command="airport_access_request", description="请求进入机场或大厅"),

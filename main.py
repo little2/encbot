@@ -2710,7 +2710,7 @@ async def cmd_donate(message: Message) -> None:
 			inline_keyboard=[[
 				InlineKeyboardButton(
 					text="前往乐捐",
-					url="https://t.me/ztflybot",
+					url="https://t.me/ztdonatebot",
 				),
 			]],
 		),

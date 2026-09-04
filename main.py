@@ -4866,6 +4866,10 @@ async def cmd_airport_access_request(message: Message) -> None:
 				f"[AIRPORT_REGISTRATION] failed to print lobby member count: {exc}",
 				flush=True,
 			)
+			await message.reply(
+				"❌ 暂时无法确认航站大厅人数，目前无法受理注册，请稍后再试。"
+			)
+			return
 
 		if member_count >= 100:
 			registration_error = await _airport_registration_error()

@@ -4827,35 +4827,52 @@ async def cmd_airport_access_request(message: Message) -> None:
 		AIRPORT_LOBBY_GROUP_ID,
 		user_id,
 	):
-		registration_error = await _airport_registration_error()
-		if registration_error:
-			flight_board_url = "https://t.me/+FABeNW-I7p9iMjZl"
-			if AIRPORT_FLIGHT_BOARD_CHANNEL_ID != 0:
-				try:
-					flight_board_url = await _get_or_create_chat_invite_link(
-						chat_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,
-						link_key="airport-flight-board-approved",
-						link_name="airport-flight-board-approved-url",
-						creates_join_request=False,
-					)
-				except Exception as exc:
-					print(
-						f"[AIRPORT_INVITE] flight board invite creation failed: {exc}",
-						flush=True,
-					)
-			await message.reply(
-				registration_error,
-				parse_mode="HTML",
-				reply_markup=InlineKeyboardMarkup(
-					inline_keyboard=[[
-						InlineKeyboardButton(
-							text="✈️ 机场航班表频道",
-							url=flight_board_url,
-						),
-					]],
-				),
+		try:
+			member_count = await bot.get_chat_member_count(
+				chat_id=AIRPORT_LOBBY_GROUP_ID,
 			)
-			return
+			print(
+				f"[AIRPORT_REGISTRATION] current lobby member count: {member_count}",
+				flush=True,
+			)
+		except Exception as exc:
+			print(
+				f"[AIRPORT_REGISTRATION] failed to print lobby member count: {exc}",
+				flush=True,
+			)
+
+		if member_count >= 100:
+			registration_error = await _airport_registration_error()
+			if registration_error:
+				flight_board_url = ""
+
+
+				if AIRPORT_FLIGHT_BOARD_CHANNEL_ID != 0:
+					try:
+						flight_board_url = await _get_or_create_chat_invite_link(
+							chat_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,
+							link_key="airport-flight-board-approved",
+							link_name="airport-flight-board-approved-url",
+							creates_join_request=False,
+						)
+					except Exception as exc:
+						print(
+							f"[AIRPORT_INVITE] flight board invite creation failed: {exc}",
+							flush=True,
+						)
+				await message.reply(
+					registration_error,
+					parse_mode="HTML",
+					reply_markup=InlineKeyboardMarkup(
+						inline_keyboard=[[
+							InlineKeyboardButton(
+								text="✈️ 航班表频道",
+								url=flight_board_url,
+							),
+						]],
+					),
+				)
+				return
 
 	await message.reply(
 		_airport_access_text(),
@@ -5151,11 +5168,13 @@ async def _check_bot_group_admin_permissions() -> None:
 		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
 		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
 		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+		("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
 		*(
 			(f"APRON_CHANNEL_ID[{index}]", chat_id)
 			for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
 		),
 	)
+	notice_text = ""
 	for setting_name, chat_id in groups:
 		if chat_id == 0:
 			print(
@@ -5168,36 +5187,37 @@ async def _check_bot_group_admin_permissions() -> None:
 			bot_status = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
 		except TelegramBadRequest as exc:
 			if "chat not found" in str(exc).lower():
-				print(
+
+				notice_text += (
 					f"❌[群組設定錯誤] {setting_name}={chat_id} 找不到群組。"
-					"請確認群組 ID 正確，並將機器人加入群組及設為管理員。",
-					flush=True,
+					"請確認群組 ID 正確，並將機器人加入群組及設為管理員。\n"
 				)
 				continue
-			print(
-				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}",
-				flush=True,
+
+			notice_text += (
+				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
 			)
 			continue
 		except Exception as exc:
-			print(
-				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}",
-				flush=True,
+			notice_text += (
+				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
 			)
 			continue
 
 		if bot_status.status not in ("administrator", "creator"):
-			print(
+
+			notice_text += (
 				f"❌[群組權限不足] 機器人在 {setting_name}={chat_id} 中的身分為 "
-				f"{bot_status.status}，請將機器人設為管理員。",
-				flush=True,
+				f"{bot_status.status}，請將機器人設為管理員。\n"
 			)
 			continue
-
-		print(
-			f"✅[群組檢查成功] 機器人已在 {setting_name}={chat_id} 中並具有管理員權限。",
-			flush=True,
+		notice_text += (
+			f"✅[群組檢查成功] 機器人已在 {setting_name}={chat_id} 中並具有管理員權限。\n"
 		)
+
+	if notice_text:
+		print(notice_text, flush=True)
+		await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
 
 
 async def _get_join_rejection_reason(

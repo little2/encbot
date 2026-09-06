@@ -147,16 +147,27 @@ ADMIN_USER_IDS = _parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
 ADMIN_USER_IDS.update(_parse_user_ids([KEY_MAN_ID]))
 
 #取件码及预览发送群组
-TERMINAL_CHANNEL_ID = int(os.getenv("TERMINAL_CHANNEL_ID", "0") or 0)
-TERMINAL_CHANNEL_THREAD_ID = int(os.getenv("TERMINAL_CHANNEL_THREAD_ID", "0") or 0)
+zttower_terminal_channel = SharedConfig.get("zttower_terminal_channel", "")
+TERMINAL_CHANNEL_ID = zttower_terminal_channel.get("chat_id")
+TERMINAL_CHANNEL_THREAD_ID = zttower_terminal_channel.get("thread_id")
+
+
+zttower_airport_lobby_group = SharedConfig.get("zttower_airport_lobby_group", "")
+AIRPORT_LOBBY_GROUP_ID = zttower_airport_lobby_group.get("chat_id")
+
+zttower_duty_free_group = SharedConfig.get("zttower_duty_free_group", "")
+AIRPORT_DUTY_FREE_GROUP_ID = zttower_duty_free_group.get("chat_id")
+
+zttower_airport_flight_board_channel = SharedConfig.get("zttower_airport_flight_board_channel", "")
+AIRPORT_FLIGHT_BOARD_CHANNEL_ID = zttower_airport_flight_board_channel.get("chat_id")
+
 #发言可以增加通行证时间的群组
-AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(TERMINAL_CHANNEL_ID)) or 0)
+
 APRON_CHANNEL_IDS = _parse_chat_ids(
 	os.getenv("APRON_CHANNEL_ID", "0"),
 	"APRON_CHANNEL_ID",
 )
-AIRPORT_DUTY_FREE_GROUP_ID = int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", "0") or 0)
-AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", "0") or 0)
+
 
 DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
 DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
@@ -2783,6 +2794,7 @@ async def cmd_admin(message: Message) -> None:
 		"/backup — 将 SQLite 数据库备份发送给指定管理员",
 		"/clear_media — 备份数据库后清空 received_media 与 batch",
 		"/restore — 回复 SQLite 备份文件以恢复数据库",
+		"/reload_config — 强制从远程重新载入共享配置",
 		"/userinfo [用户id] — 查询用户时限及黑名单状态",
 		"/invite — 建立单人邀请（需先满足飞机场成员资格与通行证条件）",
 		"/rule — 查看机场规则与奖励机制",
@@ -2791,6 +2803,22 @@ async def cmd_admin(message: Message) -> None:
 		"/admin — 查看管理员命令说明",
 	]
 	await message.reply("\n".join(lines))
+
+
+@dp.message(F.chat.type == "private", Command("reload_config"))
+async def cmd_reload_config(message: Message) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
+	try:
+		await asyncio.to_thread(SharedConfig.load, True)
+	except Exception as exc:
+		print(f"[SHARED_CONFIG] forced reload failed: {exc}", flush=True)
+		await message.reply("❌ 共享配置重新载入失败，请查看运行日志。")
+		return
+
+	await message.reply("✅ 共享配置已强制重新载入。")
 
 
 def _create_sqlite_backup(source_path: Path, destination_path: Path) -> None:

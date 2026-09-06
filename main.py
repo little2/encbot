@@ -2215,6 +2215,7 @@ async def _notify_duty_free_new_batch(
 			lambda: bot.send_message(
 				chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
 				text=(
+					f"{batch_content}\n\n"
 					f"<code>{tower_bot_name}_{escape(normalized_batch_id)}</code>"
 				),
 				parse_mode="HTML",
@@ -5025,12 +5026,14 @@ async def cmd_airport_access_request(message: Message) -> None:
 
 				if AIRPORT_FLIGHT_BOARD_CHANNEL_ID != 0:
 					try:
-						flight_board_url = await _get_or_create_chat_invite_link(
-							chat_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,
-							link_key="airport-flight-board-approved",
-							link_name="airport-flight-board-approved-url",
-							creates_join_request=False,
-						)
+						flight_board_url = SharedConfig.get("zttower_airport_flight_board_channel")['invite_link']
+						if flight_board_url is None:
+							flight_board_url = await _get_or_create_chat_invite_link(
+								chat_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,
+								link_key="airport-flight-board-approved",
+								link_name="airport-flight-board-approved-url",
+								creates_join_request=False,
+							)
 					except Exception as exc:
 						print(
 							f"[AIRPORT_INVITE] flight board invite creation failed: {exc}",

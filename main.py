@@ -42,7 +42,7 @@ from aiogram.exceptions import (
 	TelegramRetryAfter,
 )
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import BaseFilter, Command, CommandObject
 from aiogram.types import FSInputFile
 from aiogram.types import User, BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, ChatJoinRequest, ChatMemberUpdated, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.types import (
@@ -65,6 +65,7 @@ from utils.received_media_utils import ReceivedMediaStore
 from utils.user_utils import UserExpireCache, UserExpire
 from dotenv import load_dotenv
 
+from tgfileid import TelegramFileId
 
 
 
@@ -272,10 +273,21 @@ AIRPORT_QUIZ_LOCKS: dict[int, asyncio.Lock] = {}
 AIRPORT_INVITE_LINK_LOCK = asyncio.Lock()
 INVITE_LINK_LOCKS: dict[str, asyncio.Lock] = {}
 BACKUP_LOCK = asyncio.Lock()
+X_MAN_REQUEST_LOCK = asyncio.Lock()
+X_MAN_PENDING_REPLY: asyncio.Future[XManReply] | None = None
+X_MAN_PENDING_REQUEST_MESSAGE_ID: int | None = None
+X_MAN_PENDING_FILE_UNIQUE_ID: str | None = None
+X_MAN_REPLY_TIMEOUT_SECONDS = 30
 PAID_INVITE_LOCKS: dict[str, asyncio.Lock] = {}
 USED_PAID_INVITES: dict[str, int] = {}
 USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
 PENDING_AIRPORT_JOIN_INVITES: dict[int, tuple[str, int]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class XManReply:
+	file_unique_id: str
+	message: Message
 
 
 @dataclass(frozen=True, slots=True)
@@ -1180,110 +1192,156 @@ def _is_invalid_media_reference_error(exc: TelegramBadRequest) -> bool:
         "wrong file identifier",
         "wrong file_id",
         "file is temporarily unavailable",
-    ))
+	))
+
+
+async def _request_x_man(file_unique_id: str) -> XManReply:
+	global X_MAN_PENDING_REPLY
+	global X_MAN_PENDING_REQUEST_MESSAGE_ID, X_MAN_PENDING_FILE_UNIQUE_ID
+
+	x_man_bot_id = int(SharedConfig.get("x_man_bot_id", 0) or 0)
+	if x_man_bot_id <= 0:
+		raise RuntimeError("SharedConfig.x_man_bot_id is not configured")
+
+	async with X_MAN_REQUEST_LOCK:
+		loop = asyncio.get_running_loop()
+		pending_reply: asyncio.Future[XManReply] = loop.create_future()
+		X_MAN_PENDING_REPLY = pending_reply
+		X_MAN_PENDING_FILE_UNIQUE_ID = file_unique_id
+		try:
+			request_message = await bot.send_message(x_man_bot_id, file_unique_id)
+			X_MAN_PENDING_REQUEST_MESSAGE_ID = request_message.message_id
+			return await asyncio.wait_for(
+				pending_reply,
+				timeout=X_MAN_REPLY_TIMEOUT_SECONDS,
+			)
+		finally:
+			if X_MAN_PENDING_REPLY is pending_reply:
+				X_MAN_PENDING_REPLY = None
+				X_MAN_PENDING_REQUEST_MESSAGE_ID = None
+				X_MAN_PENDING_FILE_UNIQUE_ID = None
 
 
 async def _send_all_media(
-    message: Message,
-    data: dict[str, Any],
-    receiver_id: int = None,
+	message: Message,
+	data: dict[str, Any],
+	receiver_id: int = None,
 ) -> tuple[list[Message], list[dict[str, Any]]]:
-    source_items = data.get("items") or [{
-        "file_id": data["file_id"],
-        "file_type": data["file_type"],
-    }]
-    items = [
-        {**item, "_item_index": index}
-        for index, item in enumerate(source_items, start=1)
-    ]
+	source_items = data.get("items") or [{
+		"file_id": data["file_id"],
+		"file_type": data["file_type"],
+	}]
+	items = [
+		{**item, "_item_index": index}
+		for index, item in enumerate(source_items, start=1)
+	]
 
-    no_forward = bool(data.get("no_forward", False))
-    if_spoiler = bool(data.get("if_spoiler", False))
-    sent_messages: list[Message] = []
-    skipped_items: list[dict[str, Any]] = []
-    pending_group: list[dict[str, Any]] = []
-    pending_kind: str | None = None
+	no_forward = bool(data.get("no_forward", False))
+	if_spoiler = bool(data.get("if_spoiler", False))
+	sent_messages: list[Message] = []
+	skipped_items: list[dict[str, Any]] = []
+	pending_group: list[dict[str, Any]] = []
+	pending_kind: str | None = None
 
-    async def send_item(item: dict[str, Any]) -> None:
-        item_data = dict(data)
-        item_data.update(item)
-        try:
-            sent = await _send_media_by_type(
-                message,
-                item_data,
-                receiver_id=receiver_id,
-            )
-        except TelegramBadRequest as exc:
-            if not _is_invalid_media_reference_error(exc):
-                raise
-            skipped_items.append(item)
-            print(
-                f"[MEDIA_SEND] skipped invalid file_id at item "
-                f"#{item.get('_item_index', '?')}: {exc.message}",
-                flush=True,
-            )
-            return
-        sent_messages.append(sent)
+	async def send_item(item: dict[str, Any]) -> None:
+		item_data = dict(data)
+		item_data.update(item)
+		try:
+			sent = await _send_media_by_type(
+				message,
+				item_data,
+				receiver_id=receiver_id,
+			)
+		except TelegramBadRequest as exc:
+			if not _is_invalid_media_reference_error(exc):
+				raise
+			skipped_items.append(item)
 
-    async def flush_group() -> None:
-        nonlocal pending_group, pending_kind
+			if "wrong file identifier" in str(exc.message):
+				try:
+					file_unique_id = TelegramFileId.file_id_to_unique_id(item["file_id"])
+					x_man_reply = await _request_x_man(file_unique_id)
+					# await bot.copy_message(
+					# 	chat_id=receiver_id or message.from_user.id,
+					# 	from_chat_id=x_man_reply.message.chat.id,
+					# 	message_id=x_man_reply.message.message_id,
+					# )
+					# todo
+
+					print(
+						f"[MEDIA_SEND1] wrong file identifier at item "
+						f"#{item.get('_item_index', '?')}",
+						f"file_unique_id={x_man_reply.file_unique_id}",
+						flush=True,
+					)
+				except Exception as e:
+					print(f"E=>{e} fiile_id={item["file_id"]}")
+					
 
 
-        if not pending_group:
-            return
 
-        if len(pending_group) >= 2:
-            media = [
-                _build_input_media(item, if_spoiler=if_spoiler)
-                for item in pending_group
-            ]
+			return
+		sent_messages.append(sent)
 
-            try:
-                async with ENCODED_FORWARD_SEND_LOCK:
-                    result = await bot.send_media_group(
-                        chat_id=receiver_id or message.from_user.id,
-                        media=media,
-                        protect_content=no_forward,
-                    )
-            except TelegramBadRequest as exc:
-                if not _is_invalid_media_reference_error(exc):
-                    raise
-                print(
-                    "[MEDIA_SEND] album contains an invalid file_id; "
-                    "retrying items individually",
-                    flush=True,
-                )
-                for item in pending_group:
-                    await send_item(item)
-            else:
-                sent_messages.extend(result)
-        else:
-            await send_item(pending_group[0])
+	async def flush_group() -> None:
+		nonlocal pending_group, pending_kind
 
-        pending_group = []
-        pending_kind = None
 
-    for item in items:
-        kind = _album_kind(str(item["file_type"]))
+		if not pending_group:
+			return
 
-        # 不支持相簿的类型
-        if kind is None:
-            await flush_group()
-            await send_item(item)
-            continue
+		if len(pending_group) >= 2:
+			media = [
+				_build_input_media(item, if_spoiler=if_spoiler)
+				for item in pending_group
+			]
 
-        # 类型不兼容或者已经达到 10 个
-        if pending_group and (
-            kind != pending_kind
-            or len(pending_group) >= 10
-        ):
-            await flush_group()
+			try:
+				async with ENCODED_FORWARD_SEND_LOCK:
+					result = await bot.send_media_group(
+						chat_id=receiver_id or message.from_user.id,
+						media=media,
+						protect_content=no_forward,
+					)
+			except TelegramBadRequest as exc:
+				if not _is_invalid_media_reference_error(exc):
+					raise
+				print(
+					"[MEDIA_SEND] album contains an invalid file_id; "
+					"retrying items individually",
+					flush=True,
+				)
+				for item in pending_group:
+					await send_item(item)
+			else:
+				sent_messages.extend(result)
+		else:
+			await send_item(pending_group[0])
 
-        pending_kind = kind
-        pending_group.append(item)
+		pending_group = []
+		pending_kind = None
 
-    await flush_group()
-    return sent_messages, skipped_items
+	for item in items:
+		kind = _album_kind(str(item["file_type"]))
+
+		# 不支持相簿的类型
+		if kind is None:
+			await flush_group()
+			await send_item(item)
+			continue
+
+		# 类型不兼容或者已经达到 10 个
+		if pending_group and (
+			kind != pending_kind
+			or len(pending_group) >= 10
+		):
+			await flush_group()
+
+		pending_kind = kind
+		pending_group.append(item)
+
+	await flush_group()
+	return sent_messages, skipped_items
 
 async def _send_all_media_old(message: Message, data: dict[str, Any]) -> list[Message]:
 	sent_messages: list[Message] = []
@@ -5927,17 +5985,72 @@ async def on_reward_group_message(message: Message) -> None:
 	F.document | F.photo | F.video | F.audio | F.voice | F.animation | F.sticker,
 )
 async def on_apron_channel_media(message: Message) -> None:
-	"""Print the reusable Telegram file_id of media posted to the apron channel."""
+	"""
+	Print the reusable Telegram file_id of media posted to the apron channel.
+	消息会在 _send_media_forward_to_destination 删除
+	"""
 	try:
 		print(
 			f"[APRON_MEDIA] received media in apron channel {message.chat.id}",
 			flush=True,
 		)
 		_, file_id = _extract_media_info(message)
+		#todo 因为在 apron ,所以 file_id 可以共用
 	except ValueError as exc:
 		print(f"[APRON_MEDIA] failed to extract media info: {exc}", flush=True)
 		return
 	print(file_id, flush=True)
+
+
+class XManReplyFilter(BaseFilter):
+	async def __call__(self, message: Message) -> bool:
+		if not message.from_user:
+			return False
+		x_man_bot_id = int(SharedConfig.get("x_man_bot_id", 0) or 0)
+		return x_man_bot_id > 0 and int(message.from_user.id) == x_man_bot_id
+
+
+@dp.message(F.chat.type == "private", XManReplyFilter())
+async def on_x_man_reply(message: Message) -> None:
+	pending_reply = X_MAN_PENDING_REPLY
+	pending_file_unique_id = X_MAN_PENDING_FILE_UNIQUE_ID
+	if (
+		pending_reply is None
+		or pending_reply.done()
+		or not pending_file_unique_id
+	):
+		print("[X_MAN] received an unexpected reply", flush=True)
+		return
+
+	replied_message = message.reply_to_message
+	if replied_message is None:
+		print("[X_MAN] response is not a reply to a request", flush=True)
+		return
+
+	if (
+		X_MAN_PENDING_REQUEST_MESSAGE_ID is not None
+		and replied_message.message_id != X_MAN_PENDING_REQUEST_MESSAGE_ID
+	):
+		print("[X_MAN] reply does not match the pending request", flush=True)
+		return
+
+	replied_file_unique_id = str(
+		replied_message.text or replied_message.caption or ""
+	).strip()
+	if replied_file_unique_id != pending_file_unique_id:
+		print(
+			f"[X_MAN] reply file_unique_id mismatch: "
+			f"expected={pending_file_unique_id} actual={replied_file_unique_id}",
+			flush=True,
+		)
+		return
+
+	pending_reply.set_result(
+		XManReply(
+			file_unique_id=replied_file_unique_id,
+			message=message,
+		)
+	)
 
 
 @dp.message(
@@ -7124,6 +7237,8 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	token = UtfConverter.unicode_cjk_to_telegram(parse_text)
 	data = UtfConverter.parse_file_token(token)
 	marked_flash_key: tuple[str, int] | None = None
+
+	print(f"{data}", flush=True)
 
 	print(f"2693 receiver_id={receiver_id}")
 	reader_user_id = (

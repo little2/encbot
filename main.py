@@ -171,12 +171,9 @@ AIRPORT_LOBBY_GROUP_ID = int(zttower_airport_lobby_group.get("chat_id", 0) or 0)
 zttower_duty_free_group = _get_shared_chat_config("zttower_duty_free_group")
 AIRPORT_DUTY_FREE_GROUP_ID = int(zttower_duty_free_group.get("chat_id", 0) or 0)
 
-zttower_airport_flight_board_channel = _get_shared_chat_config(
-	"zttower_airport_flight_board_channel"
-)
-AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(
-	zttower_airport_flight_board_channel.get("chat_id", 0) or 0
-)
+zttower_airport_flight_board_channel = _get_shared_chat_config("zttower_airport_flight_board_channel")
+AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(zttower_airport_flight_board_channel.get("chat_id", 0) or 0)
+AIRPORT_FLIGHT_BOARD_CHANNEL_URL = str(zttower_airport_flight_board_channel.get("invite_link", ""))
 
 #发言可以增加通行证时间的群组
 
@@ -5026,7 +5023,7 @@ async def cmd_airport_access_request(message: Message) -> None:
 
 				if AIRPORT_FLIGHT_BOARD_CHANNEL_ID != 0:
 					try:
-						flight_board_url = SharedConfig.get("zttower_airport_flight_board_channel")['invite_link']
+						flight_board_url = AIRPORT_FLIGHT_BOARD_CHANNEL_URL
 						if flight_board_url is None:
 							flight_board_url = await _get_or_create_chat_invite_link(
 								chat_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,

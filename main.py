@@ -21,6 +21,7 @@ import os
 import secrets
 import sqlite3
 import tempfile
+from time import monotonic
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -160,6 +161,8 @@ AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID
 DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
 DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
 DEFAULT_COVER_FILE_ID: str | None = None
+CHAT_RESTRICTED_ADMIN_NOTICE_COOLDOWN_SECONDS = 10 * 60
+_last_chat_restricted_admin_notice_at: float | None = None
 
 volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 default_user_expire_db_path = (
@@ -2151,6 +2154,8 @@ async def _send_encoded_snapshot(
 	batch_content: str,
 	is_first_send: bool,
 ) -> None:
+	global _last_chat_restricted_admin_notice_at
+
 	success = False
 	accepted_count = 0
 	forward_status: dict[str, Any] = {}
@@ -2205,6 +2210,45 @@ async def _send_encoded_snapshot(
 			received_media_store.release_pending_batch(batch_id)
 		except Exception as exc:
 			print(f"[RECEIVED_MEDIA] pending release failed: {exc}", flush=True)
+
+		if (
+			forward_status.get("ok") is False
+			and forward_status.get("reason") == "chat_restricted"
+		):
+			now = monotonic()
+			last_notice_at = _last_chat_restricted_admin_notice_at
+			if (
+				last_notice_at is None
+				or now - last_notice_at >= CHAT_RESTRICTED_ADMIN_NOTICE_COOLDOWN_SECONDS
+			):
+				# 发送前先占用冷却窗口，避免多个后台任务同时重复告警。
+				_last_chat_restricted_admin_notice_at = now
+				try:
+					await bot.send_message(
+						chat_id=KEY_MAN_ID,
+						text=(
+							"⚠️ 群组已经失效，请尽快检查并重建。\n"
+							f"群组 ID：{TERMINAL_CHANNEL_ID}"
+						),
+					)
+				except Exception as exc:
+					# 告警未送达时撤销冷却，让下一次失败可以重试通知。
+					_last_chat_restricted_admin_notice_at = None
+					print(
+						f"[ENCODED_FORWARD] key man notification failed: {exc}",
+						flush=True,
+					)
+
+			try:
+				await bot.send_message(
+					chat_id=owner_user_id,
+					text="⚠️ 目前群组已经失效，需要等待重建，请稍后再试。",
+				)
+			except Exception as exc:
+				print(
+					f"[ENCODED_FORWARD] user notification failed: {exc}",
+					flush=True,
+				)
 	state = ENCODER_UI_STATE.get(state_key)
 	if not state:
 		return

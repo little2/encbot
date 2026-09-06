@@ -221,3 +221,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 cache/
+encbot.code-workspace
+encbot.code-workspace

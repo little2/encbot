@@ -146,20 +146,36 @@ ADMIN_USER_IDS = _parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
 # 主要用户始终保留访问权限，避免共享配置遗漏时意外将其排除。
 ADMIN_USER_IDS.update(_parse_user_ids([KEY_MAN_ID]))
 
+
+def _get_shared_chat_config(name: str) -> dict[str, Any]:
+	chat_configs = SharedConfig.get("chat", {})
+	if not isinstance(chat_configs, dict):
+		raise RuntimeError("SharedConfig.chat must be an object")
+
+	chat_config = chat_configs.get(name, {})
+	if not isinstance(chat_config, dict):
+		raise RuntimeError(f"SharedConfig.chat.{name} must be an object")
+	return chat_config
+
+
 #取件码及预览发送群组
-zttower_terminal_channel = SharedConfig.get("zttower_terminal_channel", "")
-TERMINAL_CHANNEL_ID = zttower_terminal_channel.get("chat_id")
-TERMINAL_CHANNEL_THREAD_ID = zttower_terminal_channel.get("thread_id")
+zttower_terminal_channel = _get_shared_chat_config("zttower_terminal_channel")
+TERMINAL_CHANNEL_ID = int(zttower_terminal_channel.get("chat_id", 0) or 0)
+TERMINAL_CHANNEL_THREAD_ID = int(zttower_terminal_channel.get("thread_id", 0) or 0)
 
 
-zttower_airport_lobby_group = SharedConfig.get("zttower_airport_lobby_group", "")
-AIRPORT_LOBBY_GROUP_ID = zttower_airport_lobby_group.get("chat_id")
+zttower_airport_lobby_group = _get_shared_chat_config("zttower_airport_lobby_group")
+AIRPORT_LOBBY_GROUP_ID = int(zttower_airport_lobby_group.get("chat_id", 0) or 0)
 
-zttower_duty_free_group = SharedConfig.get("zttower_duty_free_group", "")
-AIRPORT_DUTY_FREE_GROUP_ID = zttower_duty_free_group.get("chat_id")
+zttower_duty_free_group = _get_shared_chat_config("zttower_duty_free_group")
+AIRPORT_DUTY_FREE_GROUP_ID = int(zttower_duty_free_group.get("chat_id", 0) or 0)
 
-zttower_airport_flight_board_channel = SharedConfig.get("zttower_airport_flight_board_channel", "")
-AIRPORT_FLIGHT_BOARD_CHANNEL_ID = zttower_airport_flight_board_channel.get("chat_id")
+zttower_airport_flight_board_channel = _get_shared_chat_config(
+	"zttower_airport_flight_board_channel"
+)
+AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(
+	zttower_airport_flight_board_channel.get("chat_id", 0) or 0
+)
 
 #发言可以增加通行证时间的群组
 

@@ -300,10 +300,14 @@ class UtfConverter:
 
 
 if __name__ == "__main__":
-    from datetime import datetime, timedelta
+    from datetime import timedelta
+    if __package__:
+        from .time_utils import app_now
+    else:
+        from time_utils import app_now
 
     file_unique_id = "BAACAgUAAx0Cd0bnWgACBKRoE-XMV3TiQ14Wsn9pXO3BcOPDCQACfgEAAkg4OFXzlA7pZcM7qjYE"
-    valid_until = (datetime.now() + timedelta(minutes=24)).strftime("%Y%m%d%H%M%S")
+    valid_until = (app_now() + timedelta(minutes=24)).strftime("%Y%m%d%H%M%S")
 
     token = UtfConverter.build_file_token(
         user_id=123456789,

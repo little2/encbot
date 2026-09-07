@@ -26,7 +26,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -62,6 +62,7 @@ from utils.batch_utils import BatchStore
 from utils.batch_view_utils import BatchViewStore
 from utils.invite_link_utils import SharedInviteLinkStore
 from utils.received_media_utils import ReceivedMediaStore
+from utils.time_utils import APP_TIMEZONE, app_fromtimestamp, app_now
 from utils.user_utils import UserExpireCache, UserExpire
 from dotenv import load_dotenv
 
@@ -166,10 +167,10 @@ TERMINAL_CHANNEL_THREAD_ID = int(zttower_terminal_channel.get("thread_id", 0) or
 
 
 zttower_airport_lobby_group = _get_shared_chat_config("zttower_airport_lobby_group")
-AIRPORT_LOBBY_GROUP_ID = int(zttower_airport_lobby_group.get("chat_id", 0) or 0)
+AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(zttower_airport_lobby_group.get("chat_id", 0))))
 
 zttower_duty_free_group = _get_shared_chat_config("zttower_duty_free_group")
-AIRPORT_DUTY_FREE_GROUP_ID = int(zttower_duty_free_group.get("chat_id", 0) or 0)
+AIRPORT_DUTY_FREE_GROUP_ID =  int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", str(zttower_duty_free_group.get("chat_id", 0))))
 
 zttower_airport_flight_board_channel = _get_shared_chat_config("zttower_airport_flight_board_channel")
 AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(zttower_airport_flight_board_channel.get("chat_id", 0) or 0)
@@ -207,8 +208,6 @@ shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 
 
 from textwrap import dedent
-
-UTC8 = timezone(timedelta(hours=8))
 
 # 私聊文字包含以下任一字串时，不进行后续处理。
 IGNORED_TEXT_SUBSTRINGS = (
@@ -516,12 +515,12 @@ def _cleanup_used_flash_nonces(now: datetime) -> None:
 
 def _format_datetime_utc8(value: datetime) -> str:
 	if value.tzinfo is None:
-		value = value.replace(tzinfo=UTC8)
-	return value.astimezone(UTC8).strftime("%m-%d %H:%M")
+		value = value.replace(tzinfo=APP_TIMEZONE)
+	return value.astimezone(APP_TIMEZONE).strftime("%m-%d %H:%M")
 
 
 def _format_timestamp_utc8(timestamp: int) -> str:
-	return _format_datetime_utc8(datetime.fromtimestamp(timestamp, tz=timezone.utc))
+	return _format_datetime_utc8(app_fromtimestamp(timestamp))
 
 
 
@@ -795,7 +794,7 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 		valid_until_display = "永久有效"
 	elif len(valid_until) == 14 and valid_until.isdigit():
 		valid_until_display = _format_datetime_utc8(
-			datetime.strptime(valid_until, "%Y%m%d%H%M%S").replace(tzinfo=UTC8)
+			datetime.strptime(valid_until, "%Y%m%d%H%M%S").replace(tzinfo=APP_TIMEZONE)
 		)
 	else:
 		valid_until_display = valid_until
@@ -946,11 +945,11 @@ def _resolve_valid_until(mode: str) -> str:
 	if mode == "perm":
 		return "99991231235959"
 	if mode == "10m":
-		return (datetime.now(UTC8) + timedelta(minutes=10)).strftime("%Y%m%d%H%M%S")
+		return (app_now() + timedelta(minutes=10)).strftime("%Y%m%d%H%M%S")
 	if mode == "30m":
-		return (datetime.now(UTC8) + timedelta(minutes=30)).strftime("%Y%m%d%H%M%S")
+		return (app_now() + timedelta(minutes=30)).strftime("%Y%m%d%H%M%S")
 	if mode == "1h":
-		return (datetime.now(UTC8) + timedelta(hours=1)).strftime("%Y%m%d%H%M%S")
+		return (app_now() + timedelta(hours=1)).strftime("%Y%m%d%H%M%S")
 	raise ValueError(f"Unsupported valid mode: {mode}")
 
 
@@ -968,7 +967,7 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 	anonymous = bool(state.get("anonymous", True))
 	owner_user_id = int(state.get("owner_user_id", 0))
 
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	user_expire = user_expire_cache.get(int(owner_user_id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 		
@@ -2342,7 +2341,7 @@ async def _send_encoded_snapshot(
 		state["sent_revision"] = revision
 		if is_first_send:
 			try:
-				now_timestamp = int(datetime.now().timestamp())
+				now_timestamp = int(app_now().timestamp())
 				previous_user_expire = user_expire_cache.get(owner_user_id)
 				previous_expire_timestamp = (
 					previous_user_expire.expire_timestamp
@@ -2767,7 +2766,7 @@ async def cmd_me(message: Message) -> None:
 	if not message.from_user:
 		return
 
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	user_expire = user_expire_cache.get(int(message.from_user.id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 		await message.reply(
@@ -3021,7 +3020,7 @@ async def cmd_backup(message: Message) -> None:
 
 	async with BACKUP_LOCK:
 		started_at = asyncio.get_running_loop().time()
-		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		timestamp = app_now().strftime("%Y%m%d-%H%M%S")
 		backup_filename = f"encbot-backup-{timestamp}.sqlite3"
 		backup_stage = "建立 SQLite 快照"
 		try:
@@ -3117,7 +3116,7 @@ async def cmd_clear_media(message: Message) -> None:
 			print(f"[CLEAR_MEDIA] status update failed: {exc}", flush=True)
 
 	async with BACKUP_LOCK:
-		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		timestamp = app_now().strftime("%Y%m%d-%H%M%S")
 		backup_filename = f"encbot-before-clear-media-{timestamp}.sqlite3"
 		try:
 			with tempfile.TemporaryDirectory(prefix="encbot-clear-media-") as temp_dir:
@@ -3208,7 +3207,7 @@ async def cmd_restore(message: Message) -> None:
 
 	async with BACKUP_LOCK:
 		started_at = asyncio.get_running_loop().time()
-		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		timestamp = app_now().strftime("%Y%m%d-%H%M%S")
 		restore_stage = "下载恢复文件"
 		try:
 			with tempfile.TemporaryDirectory(prefix="encbot-restore-") as temp_dir:
@@ -3376,7 +3375,7 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 
 
 	bonus_minutes = MAX_VALID_DURATION_MINUTES
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	previous_user_expire = user_expire_cache.get(target_user_id)
 	previous_expire_timestamp = (
 		previous_user_expire.expire_timestamp
@@ -3429,7 +3428,7 @@ async def cmd_expire15(message: Message, command: CommandObject) -> None:
 			await message.reply("用法：/expire15 [用户id]")
 			return
 
-	expire_timestamp = int((datetime.now() + timedelta(days=15)).timestamp())
+	expire_timestamp = int((app_now() + timedelta(days=15)).timestamp())
 	user_expire = user_expire_cache.update(target_user_id, expire_timestamp)
 
 	await message.reply(
@@ -3480,7 +3479,7 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 		await message.reply("用法：/userinfo [用户id]")
 		return
 
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	user_expire = user_expire_cache.get(target_user_id)
 	lines = [
 		"👤 用户资料",
@@ -3795,7 +3794,7 @@ async def cmd_banlist(message: Message, command: CommandObject) -> None:
 
 
 def _inactive_cutoff_timestamp(now_timestamp: int | None = None) -> int:
-	now_timestamp = now_timestamp or int(datetime.now().timestamp())
+	now_timestamp = now_timestamp or int(app_now().timestamp())
 	return now_timestamp - INACTIVE_EXPIRE_DAYS * 24 * 60 * 60
 
 
@@ -3932,7 +3931,7 @@ async def cmd_inactive_candidate(message: Message, command: CommandObject) -> No
 		await message.reply("用法：/inactive_candidate [页码]")
 		return
 
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	candidates = _get_inactive_candidates(now_timestamp)
 	if not candidates:
 		await message.reply(
@@ -4007,7 +4006,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 		return False
 
 	async with INACTIVE_CLEANUP_LOCK:
-		now_timestamp = int(datetime.now().timestamp())
+		now_timestamp = int(app_now().timestamp())
 		candidates = _get_inactive_candidates(now_timestamp)
 		if not candidates:
 			await notify(
@@ -4023,7 +4022,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 		participant_record_deleted_user_ids: list[int] = []
 
 		for user_id, _ in candidates:
-			check_timestamp = int(datetime.now().timestamp())
+			check_timestamp = int(app_now().timestamp())
 			if not _is_inactive_candidate(user_id, check_timestamp):
 				skipped_user_ids.append(user_id)
 				continue
@@ -4034,7 +4033,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				(check_timestamp - user_expire.expire_timestamp) // (24 * 60 * 60),
 			) if user_expire else INACTIVE_EXPIRE_DAYS
 
-			if not _is_inactive_candidate(user_id, int(datetime.now().timestamp())):
+			if not _is_inactive_candidate(user_id, int(app_now().timestamp())):
 				skipped_user_ids.append(user_id)
 				continue
 
@@ -4229,7 +4228,7 @@ async def _run_scheduled_backup() -> bool:
 		return False
 
 	async with BACKUP_LOCK:
-		timestamp = datetime.now(UTC8).strftime("%Y%m%d-%H%M%S")
+		timestamp = app_now().strftime("%Y%m%d-%H%M%S")
 		backup_filename = f"encbot-daily-backup-{timestamp}.sqlite3"
 		try:
 			with tempfile.TemporaryDirectory(prefix="encbot-daily-backup-") as temp_dir:
@@ -4282,7 +4281,7 @@ def _next_daily_maintenance_time(now: datetime) -> datetime:
 
 async def _daily_maintenance_worker() -> None:
 	while True:
-		now = datetime.now(UTC8)
+		now = app_now()
 		next_run = _next_daily_maintenance_time(now)
 		delay_seconds = max(1.0, (next_run - now).total_seconds())
 		print(
@@ -4316,7 +4315,7 @@ def _next_daily_hot_time(now: datetime) -> datetime:
 
 async def _daily_hot_worker() -> None:
 	while True:
-		now = datetime.now(UTC8)
+		now = app_now()
 		next_run = _next_daily_hot_time(now)
 		delay_seconds = max(1.0, (next_run - now).total_seconds())
 		print(
@@ -4402,7 +4401,7 @@ def _parse_paid_invite_name(name: str | None) -> int | None:
 
 
 def _prune_used_paid_invites(now_timestamp: int | None = None) -> None:
-	now_timestamp = now_timestamp or int(datetime.now().timestamp())
+	now_timestamp = now_timestamp or int(app_now().timestamp())
 	cutoff = now_timestamp - PAID_INVITE_USED_RETENTION_SECONDS
 	for invite_link, used_at in list(USED_PAID_INVITES.items()):
 		if used_at < cutoff:
@@ -4473,7 +4472,7 @@ async def cmd_invite(message: Message) -> None:
 		await message.reply("❌ 只有航站大厅或机场的现有成员可以建立邀请。")
 		return
 	user_expire = user_expire_cache.get(user_id)
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	if (
 		not user_expire
 		or user_expire.expire_timestamp - now_timestamp
@@ -4506,7 +4505,7 @@ async def on_paid_invite_cancel(callback: CallbackQuery) -> None:
 	if key in USED_INVITE_CONFIRMATIONS:
 		await callback.answer("此操作已经处理", cache_time=0)
 		return
-	USED_INVITE_CONFIRMATIONS[key] = int(datetime.now().timestamp())
+	USED_INVITE_CONFIRMATIONS[key] = int(app_now().timestamp())
 	await callback.message.edit_text("已取消建立邀请。")
 	await callback.answer("已取消", cache_time=0)
 
@@ -4522,7 +4521,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 	if confirmation_key in USED_INVITE_CONFIRMATIONS:
 		await callback.answer("此操作已经处理", cache_time=0)
 		return
-	USED_INVITE_CONFIRMATIONS[confirmation_key] = int(datetime.now().timestamp())
+	USED_INVITE_CONFIRMATIONS[confirmation_key] = int(app_now().timestamp())
 	await callback.answer("正在建立邀请……", cache_time=0)
 	try:
 		await callback.message.edit_reply_markup(reply_markup=None)
@@ -4544,7 +4543,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 	user_lock = TAKEOFF_USER_LOCKS.setdefault(user_id, asyncio.Lock())
 	async with user_lock:
 		user_expire = user_expire_cache.get(user_id)
-		now_timestamp = int(datetime.now().timestamp())
+		now_timestamp = int(app_now().timestamp())
 		if (
 			not user_expire
 			or user_expire.expire_timestamp - now_timestamp
@@ -4562,7 +4561,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 			invite = await bot.create_chat_invite_link(
 				chat_id=AIRPORT_LOBBY_GROUP_ID,
 				name=_build_paid_invite_name(user_id),
-				expire_date=datetime.now(timezone.utc) + timedelta(
+				expire_date=app_now() + timedelta(
 					hours=PAID_INVITE_LIFETIME_HOURS
 				),
 				creates_join_request=True,
@@ -4576,7 +4575,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 			consumed = True
 			remaining_seconds = max(
 				0,
-				updated_user.expire_timestamp - int(datetime.now().timestamp()),
+				updated_user.expire_timestamp - int(app_now().timestamp()),
 			)
 			await callback.message.edit_text(
 				"✅ 单人审核邀请已建立\n\n"
@@ -4603,7 +4602,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 					)
 				except Exception as revoke_exc:
 					USED_PAID_INVITES[invite.invite_link] = int(
-						datetime.now().timestamp()
+						app_now().timestamp()
 					)
 					print(
 						f"[PAID_INVITE] rollback revoke failed for user "
@@ -4661,7 +4660,7 @@ AIRPORT_ACCESS_REQUEST_TTL_SECONDS = 30 * 60
 
 
 def _airport_access_request_callback_data(now_timestamp: int | None = None) -> str:
-	stamp = int(now_timestamp if now_timestamp is not None else datetime.now().timestamp())
+	stamp = int(now_timestamp if now_timestamp is not None else app_now().timestamp())
 	return f"airport:access:request:{stamp}"
 
 
@@ -4907,7 +4906,7 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 		remembered_invite = PENDING_AIRPORT_JOIN_INVITES.get(user_id)
 		if remembered_invite is not None:
 			remembered_link, remembered_expire_timestamp = remembered_invite
-			now_timestamp = int(datetime.now().timestamp())
+			now_timestamp = int(app_now().timestamp())
 			if (
 				(remembered_expire_timestamp <= 0 or remembered_expire_timestamp > now_timestamp)
 				and remembered_link not in USED_PAID_INVITES
@@ -4918,7 +4917,7 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 				PENDING_AIRPORT_JOIN_INVITES.pop(user_id, None)
 
 	if not invite_link:
-		invite_expire_date = datetime.now(timezone.utc) + timedelta(minutes=5)
+		invite_expire_date = app_now() + timedelta(minutes=5)
 		invite = await bot.create_chat_invite_link(
 			chat_id=create_chat_id,
 			name=f"airport-access-{user_id}",
@@ -4930,10 +4929,10 @@ async def _send_airport_join_request_invite(user_id: int, request_plant_channel:
 
 	remaining_invite_seconds = max(
 		0,
-		invite_expire_timestamp - int(datetime.now().timestamp()),
+		invite_expire_timestamp - int(app_now().timestamp()),
 	) if invite_expire_timestamp > 0 else 0
 	invite_deadline_text = (
-		f"请在 {_format_duration(remaining_invite_seconds)} 内送出入场审核申请。"
+		f"连结将在 {(app_fromtimestamp(invite_expire_timestamp)).strftime('%Y-%m-%d %H:%M:%S')} 到期，请在 {_format_duration(remaining_invite_seconds)} 内送出入场审核申请。"
 		if remaining_invite_seconds > 0
 		else "请使用此连结送出入场审核申请。"
 	)
@@ -5121,7 +5120,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 		)
 		return
 
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	if now_timestamp - issued_at > AIRPORT_ACCESS_REQUEST_TTL_SECONDS:
 		await callback.answer(
 			"此入场申请已超过 30 分钟有效期，请重新打开机场入口。",
@@ -5159,7 +5158,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 
 	lock = AIRPORT_QUIZ_LOCKS.setdefault(user_id, asyncio.Lock())
 	async with lock:
-		now_timestamp = int(datetime.now().timestamp())
+		now_timestamp = int(app_now().timestamp())
 		retry_at = AIRPORT_QUIZ_RETRY_AT.get(user_id, 0)
 		if retry_at > now_timestamp:
 			await callback.answer(
@@ -5245,7 +5244,7 @@ async def on_airport_quiz_answer(callback: CallbackQuery) -> None:
 			AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
 			AIRPORT_QUIZ_PASSED_UNTIL.pop(user_id, None)
 			AIRPORT_QUIZ_RETRY_AT[user_id] = (
-				int(datetime.now().timestamp()) + AIRPORT_QUIZ_RETRY_SECONDS
+				int(app_now().timestamp()) + AIRPORT_QUIZ_RETRY_SECONDS
 			)
 			await callback.message.edit_text(
 				"❌ 回答错误，本次考试未通过。\n\n"
@@ -5266,7 +5265,7 @@ async def on_airport_quiz_answer(callback: CallbackQuery) -> None:
 
 		AIRPORT_QUIZ_PROGRESS.pop(user_id, None)
 		AIRPORT_QUIZ_PASSED_UNTIL[user_id] = (
-			int(datetime.now().timestamp()) + AIRPORT_QUIZ_PASS_SECONDS
+			int(app_now().timestamp()) + AIRPORT_QUIZ_PASS_SECONDS
 		)
 		await callback.message.edit_text(
 			f"✅ {len(AIRPORT_QUIZ_QUESTIONS)} 道题目全部答对，"
@@ -5402,7 +5401,7 @@ async def _get_join_rejection_reason(
 	if blacklist_store.is_blocked(context.user_id):
 		return JoinRejection("blacklisted", "你目前无法申请进入机场。")
 
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	user_expire = user_expire_cache.get(context.user_id)
 	remaining_seconds = max(
 		0,
@@ -5457,7 +5456,8 @@ async def _reject_join_request(
 
 		text = f"❌ 入场审核未通过：{reason}"
 		if context.is_paid_invite and include_access_help:
-			text += "\n\n本邀请不会免除机场资格要求，本次申请不会占用此邀请连结。"
+			after_30min = app_now() + timedelta(minutes=30)
+			text += f"\n\n本邀请不会免除机场资格要求，本次申请不会占用此邀请连结。\n\n请在 {after_30min.strftime('%Y-%m-%d %H:%M:%S')} 之前完成申请，否则连结可能失效。"
 		# if include_access_help:
 		# 	text += f"\n\n{_airport_access_text()}"
 
@@ -5494,7 +5494,7 @@ async def _notify_join_retry(context: AirportJoinContext) -> None:
 def _remember_failed_join_invite(context: AirportJoinContext) -> None:
 	if context.chat_id != AIRPORT_LOBBY_GROUP_ID or not context.invite_link:
 		return
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	if (
 		context.invite_expire_timestamp > 0
 		and context.invite_expire_timestamp <= now_timestamp
@@ -5523,7 +5523,7 @@ async def _approve_join_request(context: AirportJoinContext) -> bool:
 
 
 async def _consume_paid_invite(context: AirportJoinContext) -> None:
-	USED_PAID_INVITES[context.invite_link] = int(datetime.now().timestamp())
+	USED_PAID_INVITES[context.invite_link] = int(app_now().timestamp())
 	try:
 		await bot.revoke_chat_invite_link(
 			chat_id=context.chat_id,
@@ -5549,7 +5549,7 @@ async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
 		asyncio.Lock(),
 	)
 	async with inviter_lock:
-		now_timestamp = int(datetime.now().timestamp())
+		now_timestamp = int(app_now().timestamp())
 		previous_user = user_expire_cache.get(context.inviter_user_id)
 		previous_expire_timestamp = (
 			previous_user.expire_timestamp if previous_user else 0
@@ -5565,7 +5565,7 @@ async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
 		)
 		remaining_seconds = max(
 			0,
-			updated_user.expire_timestamp - int(datetime.now().timestamp()),
+			updated_user.expire_timestamp - int(app_now().timestamp()),
 		)
 
 	print(
@@ -5842,7 +5842,7 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 		return
 
 	chat_name = "航站大厅"
-	expires_at = int(datetime.now().timestamp()) + 24 * 60 * 60
+	expires_at = int(app_now().timestamp()) + 24 * 60 * 60
 	reason = f"主动离开{chat_name}，系统自动加入黑名单一天"
 	PENDING_AIRPORT_JOIN_INVITES.pop(target_user_id, None)
 	try:
@@ -5951,7 +5951,7 @@ async def on_reward_group_message(message: Message) -> None:
 
 
 	user_id = int(message.from_user.id)
-	now_timestamp = int(datetime.now().timestamp())
+	now_timestamp = int(app_now().timestamp())
 	previous_user_expire = user_expire_cache.get(user_id)
 	if (
 		previous_user_expire
@@ -6737,13 +6737,13 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		valid_until_dt = datetime.strptime(
 			str(parsed["valid_until"]),
 			"%Y%m%d%H%M%S",
-		).replace(tzinfo=UTC8)
+		).replace(tzinfo=APP_TIMEZONE)
 	except Exception as exc:
 		print(f"[TAKEOFF] token parse failed: {exc}", flush=True)
 		await callback.answer("❌ 无法解析此航班", show_alert=True, cache_time=0)
 		return
 
-	now = datetime.now(UTC8)
+	now = app_now()
 	if now > valid_until_dt and not is_admin:
 		# overdue_text = _format_duration(int((now - valid_until_dt).total_seconds()))
 		await callback.answer(
@@ -6757,7 +6757,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 	user_lock = TAKEOFF_USER_LOCKS.setdefault(reader_user_id, asyncio.Lock())
 
 	async with user_lock:
-		now_timestamp = int(datetime.now().timestamp())
+		now_timestamp = int(app_now().timestamp())
 		user_expire = user_expire_cache.get(reader_user_id)
 		# print(f"now_timestamp=>{now_timestamp}")
 		# print(f"user_expire=>{user_expire}")
@@ -6943,7 +6943,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		if uploader_id > 0:
 			try:
 				reward_minutes = requested_qty * REWARD_HOURS_PER_MEDIA * 60
-				reward_now_timestamp = int(datetime.now().timestamp())
+				reward_now_timestamp = int(app_now().timestamp())
 				previous_uploader_expire = user_expire_cache.get(uploader_id)
 				reward_base_timestamp = max(
 					reward_now_timestamp,
@@ -7256,8 +7256,8 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 	valid_until_dt = datetime.strptime(
 		str(data["valid_until"]),
 		"%Y%m%d%H%M%S",
-	).replace(tzinfo=UTC8)
-	now = datetime.now(UTC8)
+	).replace(tzinfo=APP_TIMEZONE)
+	now = app_now()
 	_cleanup_used_flash_nonces(now)
 
 	if now > valid_until_dt and not is_admin:

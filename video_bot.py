@@ -4,7 +4,7 @@ import asyncio
 import os
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -19,6 +19,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from utils.time_utils import app_now
 from utils.video_store import VideoStore
 
 
@@ -121,7 +122,7 @@ def _build_dispatcher(
                 invite = await video_bot.create_chat_invite_link(
                     chat_id=airport_lobby_group_id,
                     name=f"video-check-{message.from_user.id}",
-                    expire_date=datetime.now(timezone.utc) + timedelta(
+                    expire_date=app_now() + timedelta(
                         hours=paid_invite_lifetime_hours
                     ),
                     creates_join_request=True,

@@ -279,6 +279,7 @@ USED_PAID_INVITES: dict[str, int] = {}
 USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
 PENDING_AIRPORT_JOIN_INVITES: dict[int, tuple[str, int]] = {}
 
+SHUTTLE_BOT_NAME = "shuttle67bot"
 
 @dataclass(frozen=True, slots=True)
 class XManReply:
@@ -4710,7 +4711,7 @@ async def _airport_registration_error() -> str | None:
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
 			"有想法想进来的，四个途径：\n"
-			"1.将你喜欢的视频资源发送给「<a href='https://t.me/shuttle67bot'>摆渡车机器人</a>」，获取对应密文后，再到你平时活跃的正太群中，将密文分享给群友。当你分享的资源累计有 100 人查看 后，即可通过<a href='https://t.me/shuttle67bot'>摆渡车机器人</a>的私信指令，获取 入群邀请链接。\n"
+			f"1.将你喜欢的视频资源发送给「<a href='https://t.me/{SHUTTLE_BOT_NAME}'>摆渡车机器人</a>」，获取对应密文后，再到你平时活跃的正太群中，将密文分享给群友。当你分享的资源累计有 100 人查看 后，即可通过<a href='https://t.me/{SHUTTLE_BOT_NAME}'>摆渡车机器人</a>的私信指令，获取 入群邀请链接。\n"
 			"2.要么找已经在机场群内的熟人，机场群里成员可以生成邀请链接直接入群；\n"
 			"3.要么去找你平时待的正太社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。\n"
 			"4.最后您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
@@ -7475,10 +7476,16 @@ async def main() -> None:
 	if video_bot_enabled:
 		from video_bot import start_video_bot
 
+		def update_shuttle_bot_name(username: str) -> None:
+			global SHUTTLE_BOT_NAME
+			SHUTTLE_BOT_NAME = username
+
 		video_bot_task = asyncio.create_task(
 			start_video_bot(
 				AIRPORT_LOBBY_GROUP_ID,
 				PAID_INVITE_LIFETIME_HOURS,
+				AIRPORT_FLIGHT_BOARD_CHANNEL_URL,
+				on_ready=update_shuttle_bot_name,
 			)
 		)
 		def report_video_bot_result(task: asyncio.Task[None]) -> None:

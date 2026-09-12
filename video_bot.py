@@ -6,6 +6,7 @@ import re
 import sys
 from datetime import timedelta
 from pathlib import Path
+from typing import Callable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -91,6 +92,7 @@ def _build_dispatcher(
     video_bot: Bot,
     airport_lobby_group_id: int,
     paid_invite_lifetime_hours: int,
+    airport_flight_board_channel_url: str,
 ) -> Dispatcher:
     dispatcher = Dispatcher()
 
@@ -143,6 +145,10 @@ def _build_dispatcher(
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
+
+    @dispatcher.message(F.chat.type == "private", Command("board"))
+    async def board(message: Message) -> None:
+        await message.reply(airport_flight_board_channel_url)
 
     @dispatcher.message(F.chat.type == "private", F.video)
     async def receive_video(message: Message) -> None:
@@ -241,6 +247,8 @@ async def _check_airport_lobby_admin(
 async def start_video_bot(
     airport_lobby_group_id: int | None = None,
     paid_invite_lifetime_hours: int | None = None,
+    airport_flight_board_channel_url: str | None = None,
+    on_ready: Callable[[str], None] | None = None,
 ) -> None:
     token, db_path = _load_settings()
     if airport_lobby_group_id is None:
@@ -251,6 +259,10 @@ async def start_video_bot(
         paid_invite_lifetime_hours = int(
             os.getenv("PAID_INVITE_LIFETIME_HOURS", "24") or 24
         )
+    if airport_flight_board_channel_url is None:
+        airport_flight_board_channel_url = str(
+            os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_URL", "") or ""
+        ).strip()
     paid_invite_lifetime_hours = max(1, int(paid_invite_lifetime_hours))
     store = VideoStore(db_path)
     video_bot = Bot(
@@ -259,11 +271,13 @@ async def start_video_bot(
     )
     try:
         me = await video_bot.get_me()
+        username = str(getattr(me, "username", "") or "")
+        if on_ready is not None:
+            on_ready(username)
         await _check_airport_lobby_admin(
             video_bot,
             int(airport_lobby_group_id),
         )
-        username = str(getattr(me, "username", "") or "")
         bot_name = username
         dispatcher = _build_dispatcher(
             store,
@@ -271,9 +285,11 @@ async def start_video_bot(
             video_bot,
             int(airport_lobby_group_id),
             paid_invite_lifetime_hours,
+            airport_flight_board_channel_url,
         )
         await video_bot.set_my_commands([
             BotCommand(command="check", description="查看資源分享情況"),
+            BotCommand(command="board", description="班机时刻表"),
         ])
         _safe_print(f"[VIDEO_BOT] 已启动：@{username}")
         await dispatcher.start_polling(video_bot)

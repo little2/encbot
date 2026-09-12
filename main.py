@@ -7484,7 +7484,6 @@ async def main() -> None:
 			start_video_bot(
 				AIRPORT_LOBBY_GROUP_ID,
 				PAID_INVITE_LIFETIME_HOURS,
-				AIRPORT_FLIGHT_BOARD_CHANNEL_URL,
 				on_ready=update_shuttle_bot_name,
 			)
 		)

@@ -92,7 +92,6 @@ def _build_dispatcher(
     video_bot: Bot,
     airport_lobby_group_id: int,
     paid_invite_lifetime_hours: int,
-    airport_flight_board_channel_url: str,
 ) -> Dispatcher:
     dispatcher = Dispatcher()
 
@@ -247,7 +246,6 @@ async def _check_airport_lobby_admin(
 async def start_video_bot(
     airport_lobby_group_id: int | None = None,
     paid_invite_lifetime_hours: int | None = None,
-    airport_flight_board_channel_url: str | None = None,
     on_ready: Callable[[str], None] | None = None,
 ) -> None:
     token, db_path = _load_settings()
@@ -259,10 +257,6 @@ async def start_video_bot(
         paid_invite_lifetime_hours = int(
             os.getenv("PAID_INVITE_LIFETIME_HOURS", "24") or 24
         )
-    if airport_flight_board_channel_url is None:
-        airport_flight_board_channel_url = str(
-            os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_URL", "") or ""
-        ).strip()
     paid_invite_lifetime_hours = max(1, int(paid_invite_lifetime_hours))
     store = VideoStore(db_path)
     video_bot = Bot(
@@ -285,7 +279,6 @@ async def start_video_bot(
             video_bot,
             int(airport_lobby_group_id),
             paid_invite_lifetime_hours,
-            airport_flight_board_channel_url,
         )
         await video_bot.set_my_commands([
             BotCommand(command="check", description="查看資源分享情況"),

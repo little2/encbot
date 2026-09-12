@@ -19,6 +19,7 @@ class ReceivedMediaStore:
                 file_unique_id TEXT PRIMARY KEY,
                 file_id TEXT NOT NULL DEFAULT '',
                 file_type TEXT NOT NULL,
+                duration INTEGER NOT NULL DEFAULT 0,
                 first_user_id INTEGER NOT NULL,
                 source_chat_id INTEGER NOT NULL,
                 source_message_id INTEGER NOT NULL,
@@ -42,6 +43,11 @@ class ReceivedMediaStore:
             self.connection.execute(
                 "ALTER TABLE received_media "
                 "ADD COLUMN file_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "duration" not in columns:
+            self.connection.execute(
+                "ALTER TABLE received_media "
+                "ADD COLUMN duration INTEGER NOT NULL DEFAULT 0"
             )
         if "batch_id" not in columns:
             self.connection.execute(
@@ -148,7 +154,7 @@ class ReceivedMediaStore:
             raise ValueError("batch_id cannot exceed 64 characters")
 
         rows: list[tuple[
-            str, str, str, int, int, int, str,
+            str, str, str, int, int, int, int, str,
             str | None, str | None, str | None, int,
         ]] = []
         seen: set[str] = set()
@@ -161,6 +167,7 @@ class ReceivedMediaStore:
                 file_unique_id,
                 str(item.get("file_id", "")),
                 str(item.get("file_type", "")),
+                max(0, int(item.get("duration", 0) or 0)),
                 int(user_id),
                 int(item.get("source_chat_id", 0)),
                 int(item.get("source_message_id", 0)),
@@ -204,6 +211,7 @@ class ReceivedMediaStore:
                     file_unique_id,
                     file_id,
                     file_type,
+                    duration,
                     first_user_id,
                     source_chat_id,
                     source_message_id,
@@ -215,7 +223,7 @@ class ReceivedMediaStore:
                     created_at,
                     accepted_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL)
             """, rows)
         return []
 
@@ -335,7 +343,7 @@ class ReceivedMediaStore:
             for file_unique_id, batch_id in rows
         }
 
-    def get_media_by_batch_id(self, batch_id: str) -> list[dict[str, str]]:
+    def get_media_by_batch_id(self, batch_id: str) -> list[dict[str, str | int]]:
         normalized_batch_id = str(batch_id or "").strip()
         if not normalized_batch_id:
             return []
@@ -346,6 +354,7 @@ class ReceivedMediaStore:
                     file_id,
                     file_unique_id,
                     file_type,
+                    duration,
                     thumb_file_id,
                     thumb_file_unique_id
                 FROM received_media
@@ -361,6 +370,7 @@ class ReceivedMediaStore:
                 "file_id": str(file_id),
                 "file_unique_id": str(file_unique_id),
                 "file_type": str(file_type),
+                "duration": max(0, int(duration or 0)),
                 "thumb_file_id": str(thumb_file_id or ""),
                 "thumb_file_unique_id": str(thumb_file_unique_id or ""),
             }
@@ -368,6 +378,7 @@ class ReceivedMediaStore:
                 file_id,
                 file_unique_id,
                 file_type,
+                duration,
                 thumb_file_id,
                 thumb_file_unique_id,
             ) in rows

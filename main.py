@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import imagehash
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -308,7 +308,7 @@ MAX_USER_PENDING = 15
 PREVIEW_DOWNLOAD_LIMIT = asyncio.Semaphore(4)
 PREVIEW_CACHE_LIMIT = 500
 PREVIEW_STYLE_ORIGINAL = "original-v1"
-PREVIEW_STYLE_VIDEO = "video-play-v1"
+PREVIEW_STYLE_VIDEO = "video-play-duration-v1"
 PLAY_ICON_SIZES = (48, 64, 80, 96, 128)
 PREVIEW_CACHE: OrderedDict[tuple[str, str], bytes] = OrderedDict()
 bot_name = ""
@@ -493,19 +493,14 @@ def _create_play_icon(size: int) -> Image.Image:
 PLAY_ICON_CACHE = {size: _create_play_icon(size) for size in PLAY_ICON_SIZES}
 
 
-def _make_fallback_preview(video: bool = False) -> bytes:
+def _make_fallback_preview() -> bytes:
 	image = Image.new("RGB", (320, 180), (245, 245, 245))
-	if video:
-		icon = PLAY_ICON_CACHE[64]
-		position = ((image.width - icon.width) // 2, (image.height - icon.height) // 2)
-		image.paste(icon, position, icon)
 	output = BytesIO()
 	image.save(output, format="JPEG", quality=80, subsampling=2, optimize=False, progressive=False)
 	return output.getvalue()
 
 
 FALLBACK_PREVIEW_BYTES = _make_fallback_preview()
-VIDEO_FALLBACK_PREVIEW_BYTES = _make_fallback_preview(video=True)
 
 
 def _cleanup_used_flash_nonces(now: datetime) -> None:
@@ -1640,7 +1635,14 @@ def _get_play_icon(short_edge: int) -> Image.Image:
 	return PLAY_ICON_CACHE[size]
 
 
-def _overlay_video_play_icon(image_bytes: bytes) -> bytes:
+def _format_preview_duration(seconds: int) -> str:
+	total_seconds = max(0, int(seconds or 0))
+	hours, remainder = divmod(total_seconds, 3600)
+	minutes, seconds = divmod(remainder, 60)
+	return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _decorate_video_preview(image_bytes: bytes, duration: int) -> bytes:
 	with Image.open(BytesIO(image_bytes)) as source:
 		image = ImageOps.exif_transpose(source).convert("RGBA")
 	if max(image.size) > 480:
@@ -1649,6 +1651,44 @@ def _overlay_video_play_icon(image_bytes: bytes) -> bytes:
 	icon = _get_play_icon(min(image.size))
 	position = ((image.width - icon.width) // 2, (image.height - icon.height) // 2)
 	image.paste(icon, position, icon)
+
+	if duration > 0:
+		short_edge = min(image.size)
+		font_size = max(11, min(16, short_edge // 28))
+		font = ImageFont.load_default(size=font_size)
+		duration_text = _format_preview_duration(duration)
+		badge_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+		draw = ImageDraw.Draw(badge_layer)
+		text_box = draw.textbbox((0, 0), duration_text, font=font)
+		text_width = text_box[2] - text_box[0]
+		text_height = text_box[3] - text_box[1]
+		padding_x = max(4, font_size // 3)
+		padding_y = 2
+		margin = max(5, short_edge // 40)
+		badge_width = text_width + padding_x * 2
+		badge_height = text_height + padding_y * 2
+		badge_left = image.width - margin - badge_width
+		badge_top = image.height - margin - badge_height
+		draw.rounded_rectangle(
+			(
+				badge_left,
+				badge_top,
+				badge_left + badge_width,
+				badge_top + badge_height,
+			),
+			radius=max(2, badge_height // 4),
+			fill=(0, 0, 0, 165),
+		)
+		draw.text(
+			(
+				badge_left + padding_x - text_box[0],
+				badge_top + padding_y - text_box[1],
+			),
+			duration_text,
+			font=font,
+			fill=(255, 255, 255, 240),
+		)
+		image = Image.alpha_composite(image, badge_layer)
 
 	output = BytesIO()
 	image.convert("RGB").save(
@@ -1663,15 +1703,17 @@ def _overlay_video_play_icon(image_bytes: bytes) -> bytes:
 
 
 def _process_preview_batch(
-	jobs: list[tuple[tuple[str, str], bytes | None, bool]],
+	jobs: list[tuple[tuple[str, str], bytes | None, bool, int]],
 ) -> dict[tuple[str, str], tuple[bytes, bool]]:
 	processed: dict[tuple[str, str], tuple[bytes, bool]] = {}
-	for cache_key, content, is_video in jobs:
+	for cache_key, content, is_video, duration in jobs:
 		if content is None:
-			processed[cache_key] = (
-				VIDEO_FALLBACK_PREVIEW_BYTES if is_video else FALLBACK_PREVIEW_BYTES,
-				False,
+			fallback = (
+				_decorate_video_preview(FALLBACK_PREVIEW_BYTES, duration)
+				if is_video
+				else FALLBACK_PREVIEW_BYTES
 			)
+			processed[cache_key] = (fallback, False)
 			continue
 
 		if not is_video:
@@ -1679,10 +1721,16 @@ def _process_preview_batch(
 			continue
 
 		try:
-			processed[cache_key] = (_overlay_video_play_icon(content), True)
+			processed[cache_key] = (
+				_decorate_video_preview(content, duration),
+				True,
+			)
 		except Exception as exc:
 			print(f"[ENCODED_FORWARD] video preview processing failed: {exc}", flush=True)
-			processed[cache_key] = (VIDEO_FALLBACK_PREVIEW_BYTES, False)
+			processed[cache_key] = (
+				_decorate_video_preview(FALLBACK_PREVIEW_BYTES, duration),
+				False,
+			)
 	return processed
 
 
@@ -1702,7 +1750,7 @@ async def _prepare_batch_preview_payloads(
 ) -> list[tuple[bytes, str]]:
 	preview_entries: list[tuple[tuple[str, str], str]] = []
 	download_requests: dict[tuple[str, str], str] = {}
-	job_video_types: dict[tuple[str, str], bool] = {}
+	job_video_metadata: dict[tuple[str, str], tuple[bool, int]] = {}
 
 	for index, item in enumerate(items):
 		file_type = str(item.get("file_type", ""))
@@ -1720,10 +1768,16 @@ async def _prepare_batch_preview_payloads(
 			or item.get("file_unique_id", "")
 			or item.get("file_id", index)
 		)
-		style = PREVIEW_STYLE_VIDEO if file_type == "video" else PREVIEW_STYLE_ORIGINAL
+		is_video = file_type == "video"
+		duration = max(0, int(item.get("duration", 0) or 0)) if is_video else 0
+		style = (
+			f"{PREVIEW_STYLE_VIDEO}-d{duration}"
+			if is_video
+			else PREVIEW_STYLE_ORIGINAL
+		)
 		cache_key = (preview_unique_id, style)
 		preview_entries.append((cache_key, f"preview_{index + 1}.jpg"))
-		job_video_types.setdefault(cache_key, file_type == "video")
+		job_video_metadata.setdefault(cache_key, (is_video, duration))
 		if _preview_cache_get(cache_key) is None:
 			download_requests.setdefault(cache_key, preview_file_id)
 
@@ -1732,8 +1786,8 @@ async def _prepare_batch_preview_payloads(
 		for cache_key, file_id in download_requests.items()
 	])) if download_requests else {}
 	jobs = [
-		(cache_key, downloaded.get(cache_key), is_video)
-		for cache_key, is_video in job_video_types.items()
+		(cache_key, downloaded.get(cache_key), is_video, duration)
+		for cache_key, (is_video, duration) in job_video_metadata.items()
 		if _preview_cache_get(cache_key) is None
 	]
 	processed = await asyncio.to_thread(_process_preview_batch, jobs) if jobs else {}
@@ -1946,7 +2000,7 @@ async def _forward_encoded_if_whitelisted(
 		if preview_show:
 			preview_entries: list[tuple[tuple[str, str], str]] = []
 			download_requests: dict[tuple[str, str], str] = {}
-			job_video_types: dict[tuple[str, str], bool] = {}
+			job_video_metadata: dict[tuple[str, str], tuple[bool, int]] = {}
 			source_items_by_file_id = {
 				str(item.get("file_id", "")): item
 				for item in items
@@ -1967,10 +2021,20 @@ async def _forward_encoded_if_whitelisted(
 					preview_file_id = str(source_item.get("preview_file_id", ""))
 					preview_unique_id = str(source_item.get("preview_unique_id", "") or preview_unique_id)
 
-				style = PREVIEW_STYLE_VIDEO if file_type == "video" else PREVIEW_STYLE_ORIGINAL
+				is_video = file_type == "video"
+				duration = (
+					max(0, int(parsed_item.get("duration", 0) or 0))
+					if is_video
+					else 0
+				)
+				style = (
+					f"{PREVIEW_STYLE_VIDEO}-d{duration}"
+					if is_video
+					else PREVIEW_STYLE_ORIGINAL
+				)
 				cache_key = (preview_unique_id, style)
 				preview_entries.append((cache_key, f"preview_{index + 1}.jpg"))
-				job_video_types.setdefault(cache_key, file_type == "video")
+				job_video_metadata.setdefault(cache_key, (is_video, duration))
 				if _preview_cache_get(cache_key) is None and preview_file_id:
 					download_requests.setdefault(cache_key, preview_file_id)
 
@@ -1980,8 +2044,8 @@ async def _forward_encoded_if_whitelisted(
 			])) if download_requests else {}
 
 			jobs = [
-				(cache_key, downloaded.get(cache_key), is_video)
-				for cache_key, is_video in job_video_types.items()
+				(cache_key, downloaded.get(cache_key), is_video, duration)
+				for cache_key, (is_video, duration) in job_video_metadata.items()
 				if _preview_cache_get(cache_key) is None
 			]
 

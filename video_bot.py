@@ -148,7 +148,7 @@ def _build_dispatcher(
 
     @dispatcher.message(F.chat.type == "private", Command("board"))
     async def board(message: Message) -> None:
-        await message.reply(airport_flight_board_channel_url)
+        await message.reply("https://t.me/ztflybot")
 
     @dispatcher.message(F.chat.type == "private", F.video)
     async def receive_video(message: Message) -> None:

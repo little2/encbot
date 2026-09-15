@@ -7440,9 +7440,8 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 	if not normalized_text:
 		return None
 	first_line = normalized_text.splitlines()[0]
-	tower_bot_name = bot_name or "ztTowerRobot"
 	match = re.fullmatch(
-		rf"(?:🎫\s*)?{re.escape(tower_bot_name)}_([A-Za-z0-9_-]{{16}})",
+		r"zttower\d+bot_([A-Za-z0-9_-]{16})",
 		first_line.strip(),
 		flags=re.IGNORECASE,
 	)

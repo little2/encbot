@@ -5476,7 +5476,19 @@ async def _check_bot_group_admin_permissions() -> None:
 
 	if notice_text:
 		print(notice_text, flush=True)
-		await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
+		if int(KEY_MAN_ID or 0) <= 0:
+			print(
+				"⚠️ [群組檢查通知未送出] KEY_MAN_ID 尚未配置。",
+				flush=True,
+			)
+			return
+		try:
+			await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
+		except Exception as exc:
+			print(
+				f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
+				flush=True,
+			)
 
 
 async def _get_join_rejection_reason(
@@ -7528,7 +7540,10 @@ async def say_hello_to_x_man(bot_name):
 		try:
 			await switchbot.send_message(X_MAN_BOT_ID, f"|_kick_|@{bot_name}")
 			print("✅ Sent hello to X-Man bot", flush=True)
+		except Exception as exc:
+			print(f"❌ Failed to send hello to X-Man bot: {exc}", flush=True)
 		finally:
+
 			await switchbot.session.close()
 	else:
 		print("❌ No SWITCHBOT_TOKEN found, skipping hello to X-Man bot.", flush=True)
@@ -7539,8 +7554,9 @@ async def main() -> None:
 	bot_name = str(getattr(me, "username", "") or "")
 	print(f"🤖 Bot started as @{bot_name}", flush=True)
 
-	await _check_bot_group_admin_permissions()
 	await say_hello_to_x_man(bot_name)
+	await _check_bot_group_admin_permissions()
+	
 
 
 	await bot.set_my_commands(

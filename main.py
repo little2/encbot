@@ -318,7 +318,7 @@ AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
 AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
 AIRPORT_REGISTRATION_MEMBER_LIMIT = 1
 PAID_INVITE_COST_MINUTES = 24 * 60
-PAID_INVITE_REWARD_MINUTES = 1.2 * 24 * 60
+PAID_INVITE_REWARD_MINUTES = 1 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
 PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
 INACTIVE_CANDIDATE_PAGE_SIZE = 20
@@ -2640,7 +2640,12 @@ def _upload_keyboard() -> InlineKeyboardMarkup:
 	)
 
 
-async def _notify_media_limit(message: Message, text: str) -> None:
+async def _notify_media_limit(
+	message: Message,
+	text: str,
+	show_cancel_upload: bool = False,
+) -> None:
+	"""Reply with an upload notice, optionally offering cancellation of this batch."""
 	if not message.from_user:
 		return
 	key = (message.chat.id, message.from_user.id)
@@ -2648,7 +2653,21 @@ async def _notify_media_limit(message: Message, text: str) -> None:
 	if now - OVERFLOW_NOTICE_TIME.get(key, 0) < 5:
 		return
 	OVERFLOW_NOTICE_TIME[key] = now
-	await message.reply(f"⚠️ {text}")
+	reply_markup = None
+	if show_cancel_upload:
+		reply_markup = InlineKeyboardMarkup(
+			inline_keyboard=[
+				[
+					InlineKeyboardButton(
+						text="❌ 取消上传",
+						callback_data="enc:upload:cancel",
+					),
+				],
+			]
+		)
+	notice = await message.reply(f"⚠️ {text}", reply_markup=reply_markup)
+	if show_cancel_upload and (session := UPLOAD_SESSIONS.get(key)):
+		session.setdefault("cancel_notice_message_ids", set()).add(notice.message_id)
 
 
 async def _update_upload_panel(message: Message, session: dict[str, Any]) -> None:
@@ -5079,7 +5098,7 @@ async def cmd_airport_access_request(message: Message) -> None:
 			)
 			return
 
-		if member_count >= 100:
+		if member_count >= 200:
 			registration_error = await _airport_registration_error()
 			if registration_error:
 				flight_board_url = ""
@@ -6135,7 +6154,11 @@ async def on_media(message: Message) -> None:
 
 	session = UPLOAD_SESSIONS.get(key)
 	if session and int(session["accepted_count"]) >= MAX_BATCH_MEDIA:
-		await _notify_media_limit(message, "每批最多上传 10 个媒体，多余媒体未加入")
+		await _notify_media_limit(
+			message,
+			"每批最多上传 10 个媒体，多余媒体未加入",
+			show_cancel_upload=True,
+		)
 		return
 
 	try:
@@ -6156,6 +6179,7 @@ async def on_media(message: Message) -> None:
 			"accepted_count": 0,
 			"processed_count": 0,
 			"panel_message_id": None,
+			"cancel_notice_message_ids": set(),
 		}
 		UPLOAD_SESSIONS[key] = session
 
@@ -7131,7 +7155,11 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 		lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())
 		async with lock:
 			session = UPLOAD_SESSIONS.get(key)
-			if not session or session.get("panel_message_id") != callback.message.message_id:
+			cancel_notice_message_ids = session.get("cancel_notice_message_ids", set()) if session else set()
+			if not session or (
+				session.get("panel_message_id") != callback.message.message_id
+				and callback.message.message_id not in cancel_notice_message_ids
+			):
 				await callback.answer("此上传批次已结束", show_alert=True)
 				return
 			UPLOAD_SESSIONS.pop(key, None)

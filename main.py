@@ -2876,11 +2876,11 @@ async def cmd_me(message: Message) -> None:
 
 
 def _build_hot_message() -> str:
-	hot_batches = batch_view_store.get_hot_batches(days=7, limit=10)
+	hot_batches = batch_view_store.get_hot_batches(days=7, limit=30)
 	if not hot_batches:
 		return "🔥 近 7 天暂无热门资源。"
 
-	lines = ["🔥 近 7 天热门资源 Top 10", ""]
+	lines = ["🔥 近 7 天热门资源 Top 30", ""]
 	for index, (batch_id, batch_content, view_count) in enumerate(
 		hot_batches,
 		start=1,

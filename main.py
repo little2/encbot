@@ -3118,16 +3118,18 @@ async def cmd_donate(message: Message) -> None:
 
 
 @dp.message(F.chat.type == "private", Command("admin"))
-async def cmd_admin(message: Message) -> None:
+async def cmd_admin(message: Message, command: CommandObject) -> None:
 	if not _is_admin_message(message):
 		await message.reply("❌ 无效指令")
 		return
+
+
 
 	lines = [
 		"🛠️ 管理员命令总览",
 		"",
 		"/me — 查看当前飞行通行证状态与剩余可请求数量",
-		"/bonus [用户id] — 给指定用户发放飞行通行证奖励",
+		"/bonus [用户id] — 给指定用户发放飞行通证奖励",
 		"/expire15 [用户id] — 直接设置指定用户 15 天通行证",
 		"/ban [用户id|回复用户] [原因] — 封禁用户并从群组移除",
 		"/unban [用户id] — 解除封禁",
@@ -3145,9 +3147,30 @@ async def cmd_admin(message: Message) -> None:
 		"/rule — 查看机场规则与奖励机制",
 		"/about / /airport_access_request — 进入机场入场说明与申请入口",
 		"/start — 进入机场入口流程",
+		"/check_group — 检查机器人各群组/频道的管理员权限",
 		"/admin — 查看管理员命令说明",
 	]
 	await message.reply("\n".join(lines))
+
+
+@dp.message(F.chat.type == "private", Command("check_group"))
+async def cmd_check_group(message: Message) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
+	notice_text = await _check_bot_group_admin_permissions()
+	await message.reply(notice_text or "✅ 群组管理员权限检查已完成，但没有发现异常。")
+
+
+@dp.message(F.chat.type == "private", Command("check_group_admin_permissions"))
+async def cmd_check_group_admin_permissions(message: Message) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
+	notice_text = await _check_bot_group_admin_permissions()
+	await message.reply(notice_text or "✅ 群组管理员权限检查已完成，但没有发现异常。")
 
 
 @dp.message(F.chat.type == "private", Command("reload_config"))
@@ -5612,7 +5635,7 @@ async def _is_member_of_chat(chat_id: int, user_id: int) -> bool:
 	return _is_current_chat_member(status)
 
 
-async def _check_bot_group_admin_permissions() -> None:
+async def _check_bot_group_admin_permissions() -> str:
 	groups = (
 		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
 		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
@@ -5666,19 +5689,20 @@ async def _check_bot_group_admin_permissions() -> None:
 
 	if notice_text:
 		print(notice_text, flush=True)
-		if int(KEY_MAN_ID or 0) <= 0:
+		if int(KEY_MAN_ID or 0) > 0:
+			try:
+				await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
+			except Exception as exc:
+				print(
+					f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
+					flush=True,
+				)
+		else:
 			print(
 				"⚠️ [群組檢查通知未送出] KEY_MAN_ID 尚未配置。",
 				flush=True,
 			)
-			return
-		try:
-			await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
-		except Exception as exc:
-			print(
-				f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
-				flush=True,
-			)
+	return notice_text
 
 
 async def _get_join_rejection_reason(

@@ -50,6 +50,12 @@ class BatchViewStore:
         days: int = 7,
         limit: int = 10,
     ) -> list[tuple[str, str, int]]:
+        table_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='batch' LIMIT 1"
+        ).fetchone()
+        if table_exists is None:
+            return []
+
         normalized_days = max(1, int(days))
         normalized_limit = min(100, max(1, int(limit)))
         cutoff_timestamp = int(time.time()) - normalized_days * 24 * 60 * 60

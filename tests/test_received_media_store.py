@@ -3,7 +3,18 @@ import tempfile
 from pathlib import Path
 import unittest
 
+from utils.batch_view_utils import BatchViewStore
 from utils.received_media_utils import ReceivedMediaStore
+
+
+class BatchViewStoreHotBatchTests(unittest.TestCase):
+    def test_get_hot_batches_without_batch_table_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = BatchViewStore(Path(directory) / "batch_view.sqlite3")
+            try:
+                self.assertEqual(store.get_hot_batches(), [])
+            finally:
+                store.close()
 
 
 class ReceivedMediaStoreDurationTests(unittest.TestCase):

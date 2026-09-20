@@ -162,18 +162,22 @@ def _get_shared_chat_config(name: str) -> dict[str, Any]:
 
 #取件码及预览发送群组
 zttower_terminal_channel = _get_shared_chat_config("zttower_terminal_channel")
-TERMINAL_CHANNEL_ID = int(zttower_terminal_channel.get("chat_id", 0) or 0)
+TERMINAL_CHANNEL_ID = int(os.getenv("TERMINAL_CHANNEL_ID", str(zttower_terminal_channel.get("chat_id", 0))))
+TERMINAL_CHANNEL_ID = int(TERMINAL_CHANNEL_ID or 0)
 TERMINAL_CHANNEL_THREAD_ID = int(zttower_terminal_channel.get("thread_id", 0) or 0)
 
 
 zttower_airport_lobby_group = _get_shared_chat_config("zttower_airport_lobby_group")
 AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(zttower_airport_lobby_group.get("chat_id", 0))))
+AIRPORT_LOBBY_GROUP_ID = int(AIRPORT_LOBBY_GROUP_ID or 0)
 
 zttower_duty_free_group = _get_shared_chat_config("zttower_duty_free_group")
 AIRPORT_DUTY_FREE_GROUP_ID =  int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", str(zttower_duty_free_group.get("chat_id", 0))))
+AIRPORT_DUTY_FREE_GROUP_ID = int(AIRPORT_DUTY_FREE_GROUP_ID or 0)
 
 zttower_airport_flight_board_channel = _get_shared_chat_config("zttower_airport_flight_board_channel")
-AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(zttower_airport_flight_board_channel.get("chat_id", 0) or 0)
+AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", str(zttower_airport_flight_board_channel.get("chat_id", 0))))
+AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(AIRPORT_FLIGHT_BOARD_CHANNEL_ID or 0)
 AIRPORT_FLIGHT_BOARD_CHANNEL_URL = str(zttower_airport_flight_board_channel.get("invite_link", ""))
 
 #发言可以增加通行证时间的群组
@@ -809,6 +813,10 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 	else:
 		return_text += f"<code>{'ㅤ' * 25}</code>\n\n"
 
+	tag_values = _ordered_tags(_normalize_tag_list(data.get("tag", data.get("selected_tags", []))))
+	if tag_values:
+		return_text += "🏷️ " + " ".join(f"#{tag}" for tag in tag_values) + "\n\n"
+
 	if bool(data.get("anonymous", False)):
 		user_url = "[匿名]"
 	else:
@@ -953,6 +961,156 @@ def _choice(label: str, selected: bool) -> str:
 	return f"✅ {label}" if selected else f"{label}"
 
 
+TAG_TYPE_GROUPS: dict[str, list[tuple[str, str]]] = {
+	"group1": [
+		("age", "年纪"),
+		("face", "露脸"),
+		("act", "动作"),
+		("nudity", "裸露"),
+		("par", "对象"),
+		("fetish", "性癖"),
+		("att", "属性"),
+	],
+	"group2": [
+		("feedback", "反应"),
+		("pro", "出品"),
+		("eth", "种族"),
+		("play", "玩法"),
+		("position", "姿势"),
+		("hardcore", "重口"),
+	],
+}
+
+TAG_TYPE_VALUES: dict[str, list[str]] = {
+	"age": ["少年_高中", "初毛", "高年级_小五", "低年级_小二", "婴儿","成人男同"],
+	"face": ["有露脸", "没有露脸", "带了面罩"],
+	"act": ["爆菊", "口交","撸管", "手交","内射", "射精", "口爆", "颜射","亲吻","舔蛋","舔肛"],
+	"nudity": ["露出鸡鸡","打码", "诱惑但不露点", "没有裸体"],
+	"par": ["正太与叔叔", "正太独秀", "正太和正太", "群交", "正太与萝莉", "正太与阿姨"],
+	"fetish": ["打屁股","挠痒", "胖太", "恋足", "网路调教","BDSM", "人兽", "袜","制服"],
+	"att": ["性玩具","尿尿","大便","睡觉偷摸","粗暴性爱","年下攻","大屌", "霸凌", "文化习俗", "操射", "医学", "无性裸露","户外拍摄"],
+	"feedback": ["呻吟","享受", "没反应", "忙别的事", "喊痛或哭"],
+	"pro": ["AI创作", "卡通动漫", "视频通话录屏", "监视器", "偷拍", "电影或影集"],
+	"eth": ["黄种人", "棕种人", "黑人", "白人"],
+	"play": ["公众场所", "戏弄嬉闹", "恶搞"],
+	"position": ["翘屁股被操", "传教士体位", "童子坐莲","其他体位"],
+	"hardcore": ["重口味", "残忍重口味", "猎奇"],
+}
+
+DEFAULT_TAG_CHOICES = [tag for values in TAG_TYPE_VALUES.values() for tag in values]
+
+TAG_TYPE_DESCRIPTIONS: dict[str, str] = {
+	"age": "年龄分类：用于区分角色的年龄层次，例如清纯、成熟、萝莉、御姐、人妻等。",
+	"face": "脸部分类：用于描述面部特征，例如大眼、小脸、笑脸、甜美、可爱等。",
+	"act": "动作分类：用于描述动作和互动场景，例如接吻、摸胸、口交、性爱、自慰等。",
+	"nudity": "裸露分类：用于描述露出程度，例如露乳、露臀、全裸、半裸等。",
+	"par": "伴侣分类：用于描述角色关系或伴侣构成，例如单男、单女、双男、双女等。",
+	"fetish": "性癖分类：用于描述题材偏好，例如丝袜、黑丝、制服、校服、女仆等。",
+	"att": "姿态分类：用于描述拍摄姿势和角度，例如正面、侧面、背面、俯拍、仰拍等。",
+	"feedback": "反馈分类：用于记录内容评价与推荐，例如好评、推荐、高分、收藏、爆款等。",
+	"pro": "职业分类：用于区分角色职业，例如学生、老师、护士、空姐、女仆、律师等。",
+	"eth": "民族/风格分类：用于区分画风和人群特色，例如中式、日系、韩系、欧美、东南亚等。",
+	"play": "玩法分类：用于描述剧情和玩法，例如角色扮演、调教、恋爱、调情、实验等。",
+	"position": "姿势分类：用于描述性爱姿势，例如后入、正常位、女上、骑乘、口交、69等。",
+	"hardcore": "硬核分类：用于区分强烈刺激的内容，例如重口、硬核、极致、猛烈、高潮等。",
+}
+
+
+def _normalize_tag_list(value: Any) -> list[str]:
+	if value is None:
+		return []
+	if isinstance(value, str):
+		return [item.strip() for item in value.split(",") if item.strip()]
+	if isinstance(value, (list, tuple, set)):
+		result: list[str] = []
+		seen: set[str] = set()
+		for item in value:
+			text = str(item or "").strip()
+			if not text or text in seen:
+				continue
+			seen.add(text)
+			result.append(text)
+		return result
+	return []
+
+
+def _ordered_tags(tags: list[str]) -> list[str]:
+	ordered: list[str] = []
+	seen: set[str] = set()
+	for tag in DEFAULT_TAG_CHOICES:
+		if tag in tags and tag not in seen:
+			ordered.append(tag)
+			seen.add(tag)
+	for tag in tags:
+		if tag not in seen:
+			ordered.append(tag)
+			seen.add(tag)
+	return ordered
+
+
+def _build_tag_menu_text(state: dict[str, Any]) -> str:
+	tag_draft = _ordered_tags(_normalize_tag_list(state.get("tag_draft", state.get("selected_tags", []))))
+	if tag_draft:
+		selected_text = " #".join(tag_draft)
+		selected_text = f"#{selected_text}"
+	else:
+		selected_text = "未选择"
+	return f"🏷️ 请选择标签\n\n已选：{selected_text}"
+
+
+def _build_tag_menu_keyboard(state: dict[str, Any]) -> InlineKeyboardMarkup:
+	tag_draft = set(_normalize_tag_list(state.get("tag_draft", state.get("selected_tags", []))))
+	active_group = str(state.get("tag_group", "group1"))
+	if active_group not in TAG_TYPE_GROUPS:
+		active_group = "group1"
+
+	rows: list[list[InlineKeyboardButton]] = []
+	for group_name, entries in TAG_TYPE_GROUPS.items():
+		if group_name == active_group:
+			for type_code, type_cn in entries:
+				selected_count = sum(1 for tag in TAG_TYPE_VALUES.get(type_code, []) if tag in tag_draft)
+				rows.append([
+					InlineKeyboardButton(
+						text=f"🔵 {type_cn}({selected_count})",
+						callback_data=f"enc:nothing",
+						style="primary",
+					)
+				])
+				for index in range(0, len(TAG_TYPE_VALUES.get(type_code, [])), 4):
+					item_row: list[InlineKeyboardButton] = []
+					for tag in TAG_TYPE_VALUES.get(type_code, [])[index:index + 4]:
+						item_row.append(
+							InlineKeyboardButton(
+								text=f"✅ {tag}" if tag in tag_draft else tag,
+								callback_data=f"enc:tag:toggle:{tag}",
+							)
+						)
+					rows.append(item_row)
+			continue
+
+		hidden_row: list[InlineKeyboardButton] = []
+		for type_code, type_cn in entries:
+			selected_count = sum(1 for tag in TAG_TYPE_VALUES.get(type_code, []) if tag in tag_draft)
+			hidden_row.append(
+				InlineKeyboardButton(
+					text=f"🔵 {type_cn}({selected_count})",
+					style="primary",
+					callback_data=f"enc:tag:group:{group_name}:{type_code}",
+				)
+			)
+			if len(hidden_row) == 4:
+				rows.append(hidden_row)
+				hidden_row = []
+		if hidden_row:
+			rows.append(hidden_row)
+
+	rows.append([
+		InlineKeyboardButton(text="💾 保存并返回", callback_data="enc:tag:save"),
+		InlineKeyboardButton(text="↩️ 取消并返回", callback_data="enc:tag:cancel"),
+	])
+	return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeyboardMarkup:
 	no_forward = bool(state.get("no_forward", False))
 	
@@ -1026,6 +1184,7 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 				)
 			],
 		]
+
 	rows.append([
 		InlineKeyboardButton(
 			text=(
@@ -1036,6 +1195,12 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 			callback_data="enc:content:edit",
 		)
 	])
+	rows.append([
+		InlineKeyboardButton(
+			text="🏷️ 标签",
+			callback_data="enc:tag:menu",
+		),
+	])	
 	# if len(encoded) <= 256:
 	# 	rows.append([
 	# 		InlineKeyboardButton(
@@ -1088,6 +1253,7 @@ def _build_token_and_encoded(state: dict[str, Any]) -> tuple[str, str, dict[str,
 	encoded = UtfConverter.telegram_to_unicode_cjk(token)
 	parsed = UtfConverter.parse_file_token(token)
 	parsed["batch_content"] = str(state.get("batch_content", "") or "").strip()
+	parsed["tag"] = ",".join(_ordered_tags(_normalize_tag_list(state.get("selected_tags", []))))
 	return token, encoded, parsed
 
 
@@ -1924,6 +2090,7 @@ async def _get_batch_preview_message_settings(
 	encoded = UtfConverter.telegram_to_unicode_cjk(token)
 	parsed = UtfConverter.parse_file_token(token)
 	parsed["batch_content"] = batch_content
+	parsed["tag"] = str(batch_record.get("tag", "") or "")
 
 	return {
 		"batch_id": normalized_batch_id,
@@ -1941,6 +2108,7 @@ async def _forward_encoded_if_whitelisted(
 	encoded: str,
 	items: list[dict[str, Any]],
 	batch_content: str = "",
+	selected_tags: list[str] | None = None,
 ) -> dict:
 	global DEFAULT_COVER_FILE_ID
 	if TERMINAL_CHANNEL_ID == 0:
@@ -1984,6 +2152,7 @@ async def _forward_encoded_if_whitelisted(
 				flush=True,
 			)
 		parsed["batch_content"] = str(batch_content or "").strip()
+		parsed["tag"] = ",".join(_ordered_tags(_normalize_tag_list(selected_tags or [])))
 		parsed_items = list(parsed.get("items", []))
 		if not parsed_items:
 			raise ValueError("encoded 中没有媒体")
@@ -2208,6 +2377,7 @@ async def _record_batch_channel_location(
 	channel_chat_id: int,
 	channel_message_id: int,
 	batch_content: str = "",
+	tag: str = "",
 	uploader_user_id: int = 0,
 	batch_settings: dict[str, Any] | None = None,
 ) -> None:
@@ -2219,6 +2389,7 @@ async def _record_batch_channel_location(
 			channel_chat_id=channel_key[0],
 			channel_message_id=channel_key[1],
 			batch_content=batch_content,
+			tag=tag,
 			uploader_user_id=int(uploader_user_id),
 			no_forward=bool(settings.get("no_forward", False)),
 			if_spoiler=bool(settings.get("if_spoiler", False)),
@@ -2245,6 +2416,7 @@ async def _record_batch_channel_location(
 async def _notify_duty_free_new_batch(
 	batch_id: str,
 	batch_content: str,
+	selected_tags: list[str] | None = None,
 ) -> None:
 	normalized_batch_id = str(batch_id or "").strip()
 	if AIRPORT_DUTY_FREE_GROUP_ID == 0:
@@ -2257,6 +2429,12 @@ async def _notify_duty_free_new_batch(
 		print("[DUTY_FREE] empty batch_id, notification skipped", flush=True)
 		return
 
+	tag_values = _ordered_tags(_normalize_tag_list(selected_tags or []))
+	if tag_values:
+		tag_text = f"\n🏷️ {' '.join(f'#{tag}' for tag in tag_values)}"
+		tag_text = f"\n{tag_text}"
+	else:
+		tag_text = ""
 	
 	tower_bot_name = str(bot_name or "ztTowerRobot").strip().lstrip("@")
 	new_flight_keyboard = InlineKeyboardMarkup(
@@ -2276,7 +2454,7 @@ async def _notify_duty_free_new_batch(
 			lambda: bot.send_message(
 				chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
 				text=(
-					f"{batch_content}\n\n"
+					f"{batch_content}{tag_text}\n\n"
 					f"<code>{tower_bot_name}_{escape(normalized_batch_id)}</code>"
 				),
 				parse_mode="HTML",
@@ -2299,6 +2477,7 @@ async def _send_encoded_snapshot(
 	encoded: str,
 	items: list[dict[str, Any]],
 	batch_content: str,
+	selected_tags: list[str] | None,
 	is_first_send: bool,
 ) -> None:
 	global _last_chat_restricted_admin_notice_at
@@ -2313,6 +2492,7 @@ async def _send_encoded_snapshot(
 			encoded,
 			items,
 			batch_content,
+			selected_tags=selected_tags,
 		)
 		success = bool(forward_status.get("ok", False))
 	except Exception as exc:
@@ -2326,6 +2506,7 @@ async def _send_encoded_snapshot(
 				channel_chat_id=int(forward_status["channel_chat_id"]),
 				channel_message_id=int(forward_status["channel_message_id"]),
 				batch_content=batch_content,
+				tag=",".join(_ordered_tags(_normalize_tag_list(selected_tags or []))),
 				uploader_user_id=owner_user_id,
 				batch_settings=dict(forward_status.get("batch_settings", {})),
 			)
@@ -2351,6 +2532,7 @@ async def _send_encoded_snapshot(
 			await _notify_duty_free_new_batch(
 				batch_id=batch_id,
 				batch_content=batch_content,
+				selected_tags=list(selected_tags or []),
 			)
 	else:
 		try:
@@ -2584,6 +2766,7 @@ async def _handle_send_encoded(
 			encoded=encoded_snapshot,
 			items=items_snapshot,
 			batch_content=batch_content_snapshot,
+			selected_tags=list(state.get("selected_tags", [])),
 			is_first_send=is_first_send,
 		)
 	)
@@ -2729,6 +2912,8 @@ async def _finish_upload(
 		"send_confirm_pending": False,
 		"batch_content": "",
 		"editing_content": False,
+		"selected_tags": [],
+		"tag_draft": [],
 	}
 	token, encoded, parsed = _build_token_and_encoded(state)
 	state["token"] = token
@@ -2876,7 +3061,11 @@ async def cmd_me(message: Message) -> None:
 
 
 def _build_hot_message() -> str:
-	hot_batches = batch_view_store.get_hot_batches(days=7, limit=30)
+	try:
+		hot_batches = batch_view_store.get_hot_batches(days=7, limit=30)
+	except Exception as exc:  # pragma: no cover - defensive guard for legacy DBs
+		print(f"_build_hot_message: failed to load hot batches: {exc}", flush=True)
+		hot_batches = []
 	if not hot_batches:
 		return "🔥 近 7 天暂无热门资源。"
 
@@ -2885,7 +3074,8 @@ def _build_hot_message() -> str:
 		hot_batches,
 		start=1,
 	):
-		content = escape("".join(batch_content.split())[:20] or "（无内容）")
+		content_text = str(batch_content or "")
+		content = escape("".join(content_text.split())[:20] or "（无内容）")
 		url = escape(
 			f"https://t.me/{bot_name}?start={batch_id}",
 			quote=True,
@@ -7143,6 +7333,9 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 	if callback.message.chat.type != "private":
 		await callback.answer("仅支持私信", show_alert=True)
 		return
+	if callback.data == "enc:nothing":
+		await callback.answer()
+		return
 	if callback.data == "enc:upload:done":
 		key = (callback.message.chat.id, callback.from_user.id)
 		lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())
@@ -7220,6 +7413,88 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			)
 			return
 
+		if group == "tag":
+			if value == "menu":
+				state.setdefault("tag_group", "group1")
+				state["tag_draft"] = list(_normalize_tag_list(state.get("selected_tags", [])))
+				await callback.message.edit_text(
+					_build_tag_menu_text(state),
+					reply_markup=_build_tag_menu_keyboard(state),
+					parse_mode="HTML",
+				)
+				await callback.answer()
+				return
+			if value.startswith("group:"):
+				parts = value.split(":")
+				clicked_group = state.get("tag_group", "group1")
+				if len(parts) >= 3 and parts[1] in TAG_TYPE_GROUPS:
+					clicked_group = parts[1]
+				elif len(parts) >= 2 and parts[1] in TAG_TYPE_GROUPS:
+					clicked_group = parts[1]
+				else:
+					for group_name, entries in TAG_TYPE_GROUPS.items():
+						for type_code, _ in entries:
+							if type_code == parts[-1]:
+								clicked_group = group_name
+								break
+						if clicked_group == group_name:
+							break
+					clicked_group = clicked_group if clicked_group in TAG_TYPE_GROUPS else state.get("tag_group", "group1")
+
+				state["tag_group"] = clicked_group
+				state["tag_draft"] = list(_normalize_tag_list(state.get("tag_draft", state.get("selected_tags", []))))
+				await callback.message.edit_text(
+					_build_tag_menu_text(state),
+					reply_markup=_build_tag_menu_keyboard(state),
+					parse_mode="HTML",
+				)
+				await callback.answer()
+				return
+			if value == "save":
+				state["selected_tags"] = _ordered_tags(_normalize_tag_list(state.get("tag_draft", [])))
+				state["tag_draft"] = list(state["selected_tags"])
+				token, encoded, parsed = _build_token_and_encoded(state)
+				state["token"] = token
+				state["encoded"] = encoded
+				await callback.message.edit_text(
+					await _build_display(parsed, encoded),
+					reply_markup=_build_controls_keyboard(state, encoded),
+					parse_mode="HTML",
+				)
+				await callback.answer("✅ 标签已保存")
+				return
+			if value == "cancel":
+				state["tag_draft"] = list(_normalize_tag_list(state.get("selected_tags", [])))
+				state["tag_group"] = state.get("tag_group", "group1")
+				token, encoded, parsed = _build_token_and_encoded(state)
+				state["token"] = token
+				state["encoded"] = encoded
+				await callback.message.edit_text(
+					await _build_display(parsed, encoded),
+					reply_markup=_build_controls_keyboard(state, encoded),
+					parse_mode="HTML",
+				)
+				await callback.answer("↩️ 已取消标签修改")
+				return
+			if value.startswith("toggle:"):
+				tag = value.split(":", 1)[1]
+				tag_draft = _normalize_tag_list(state.get("tag_draft", state.get("selected_tags", [])))
+				selected = set(tag_draft)
+				if tag in selected:
+					selected.remove(tag)
+				else:
+					selected.add(tag)
+				state["tag_draft"] = _ordered_tags(list(selected))
+				await callback.message.edit_text(
+					_build_tag_menu_text(state),
+					reply_markup=_build_tag_menu_keyboard(state),
+					parse_mode="HTML",
+				)
+				await callback.answer()
+				return
+			await callback.answer("标签操作异常", show_alert=True)
+			return
+
 		if group == "content":
 			content_input_key = (
 				int(callback.message.chat.id),
@@ -7258,14 +7533,37 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			return
 
 		if group == "send":
+			pending_reason_text = ""
 			batch_content = str(state.get("batch_content", "") or "").strip()
 			if not 5 <= len(batch_content) <= 250:
 				state["send_confirm_pending"] = False
+				pending_reason_text += "\n❌ 内容介绍为必填，长度必须为 5–250 字。介绍超过 20 字，额外加奖励"
+				# await callback.answer(
+				# 	"❌ 内容介绍为必填，长度必须为 5–250 字。介绍超过 20 字，额外加奖励",
+				# 	show_alert=True,
+				# )
+				# return
+			# todo 标签一定要选择,至少选3个标签
+			selected_tags = state.get("selected_tags", [])
+			if len(selected_tags) < 3:
+				state["send_confirm_pending"] = False
+				pending_reason_text += "\n❌ 必须选择至少三个标签。"
+				# await callback.answer(
+				# 	"❌ 必须选择至少三个标签。",
+				# 	show_alert=True,
+				# )
+				# return
+			
+
+			if pending_reason_text:
+				state["send_confirm_pending"] = False
 				await callback.answer(
-					"❌ 内容介绍为必填，长度必须为 5–250 字。介绍超过 20 字，额外加奖励",
+					pending_reason_text,
 					show_alert=True,
 				)
 				return
+				
+
 			if not bool(state.get("send_confirm_pending", False)):
 				state["send_confirm_pending"] = True
 				try:

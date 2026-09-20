@@ -20,6 +20,7 @@ class BatchStore:
                 discussion_chat_id INTEGER,
                 discussion_message_id INTEGER,
                 batch_content TEXT,
+                tag TEXT,
                 uploader_user_id INTEGER NOT NULL DEFAULT 0,
                 no_forward INTEGER NOT NULL DEFAULT 0,
                 if_spoiler INTEGER NOT NULL DEFAULT 0,
@@ -38,6 +39,10 @@ class BatchStore:
         if "batch_content" not in columns:
             self.connection.execute(
                 "ALTER TABLE batch ADD COLUMN batch_content TEXT"
+            )
+        if "tag" not in columns:
+            self.connection.execute(
+                "ALTER TABLE batch ADD COLUMN tag TEXT"
             )
         migrations = {
             "uploader_user_id": (
@@ -80,6 +85,7 @@ class BatchStore:
         channel_chat_id: int,
         channel_message_id: int,
         batch_content: str = "",
+        tag: str = "",
         uploader_user_id: int = 0,
         no_forward: bool = False,
         if_spoiler: bool = False,
@@ -102,6 +108,7 @@ class BatchStore:
                         discussion_chat_id,
                         discussion_message_id,
                         batch_content,
+                        tag,
                         uploader_user_id,
                         no_forward,
                         if_spoiler,
@@ -111,7 +118,7 @@ class BatchStore:
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(batch_id) DO UPDATE SET
                         discussion_chat_id = CASE
                             WHEN batch.channel_chat_id = excluded.channel_chat_id
@@ -128,6 +135,7 @@ class BatchStore:
                         channel_chat_id = excluded.channel_chat_id,
                         channel_message_id = excluded.channel_message_id,
                         batch_content = excluded.batch_content,
+                        tag = excluded.tag,
                         uploader_user_id = excluded.uploader_user_id,
                         no_forward = excluded.no_forward,
                         if_spoiler = excluded.if_spoiler,
@@ -141,6 +149,7 @@ class BatchStore:
                     int(channel_chat_id),
                     int(channel_message_id),
                     str(batch_content or "").strip(),
+                    str(tag or "").strip(),
                     int(uploader_user_id),
                     int(bool(no_forward)),
                     int(bool(if_spoiler)),
@@ -190,6 +199,7 @@ class BatchStore:
                     discussion_chat_id,
                     discussion_message_id,
                     batch_content,
+                    tag,
                     uploader_user_id,
                     no_forward,
                     if_spoiler,
@@ -212,14 +222,15 @@ class BatchStore:
             "discussion_chat_id": int(row[3]) if row[3] is not None else None,
             "discussion_message_id": int(row[4]) if row[4] is not None else None,
             "batch_content": str(row[5] or ""),
-            "uploader_user_id": int(row[6]),
-            "no_forward": bool(row[7]),
-            "if_spoiler": bool(row[8]),
-            "anonymous": bool(row[9]),
-            "flash_seconds": int(row[10]),
-            "valid_until": str(row[11]),
-            "created_at": int(row[12]),
-            "updated_at": int(row[13]),
+            "tag": str(row[6] or ""),
+            "uploader_user_id": int(row[7]),
+            "no_forward": bool(row[8]),
+            "if_spoiler": bool(row[9]),
+            "anonymous": bool(row[10]),
+            "flash_seconds": int(row[11]),
+            "valid_until": str(row[12]),
+            "created_at": int(row[13]),
+            "updated_at": int(row[14]),
         }
 
     def get_discussion_location(

@@ -324,7 +324,7 @@ USED_FLASH_NONCES: dict[tuple[str, int], datetime] = {}
 PERM_FLASH_NONCE_RETENTION_DAYS = 30
 AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
 AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
-AIRPORT_REGISTRATION_MEMBER_LIMIT = 1
+AIRPORT_REGISTRATION_MEMBER_LIMIT = 175	# 机场注册的成员上限
 PAID_INVITE_COST_MINUTES = 24 * 60
 PAID_INVITE_REWARD_MINUTES = 1 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
@@ -973,11 +973,11 @@ TAG_TYPE_GROUPS: dict[str, list[tuple[str, str]]] = {
 		("nudity", "裸露"),
 		("par", "对象"),
 		("fetish", "性癖"),
-		("att", "属性"),
+		("pro", "出品"),
 	],
 	"group2": [
 		("feedback", "反应"),
-		("pro", "出品"),
+		("att", "属性"),
 		("eth", "种族"),
 		("play", "玩法"),
 		("position", "姿势"),
@@ -2477,7 +2477,7 @@ async def _notify_duty_free_new_batch(
 			lambda: bot.send_message(
 				chat_id=PEACH_CHAT_ID,
 				text=(
-					f"🍑 {tag_text}"
+					f"{tag_text}"
 				),
 				parse_mode="HTML",
 				reply_markup=new_peach_keyboard,
@@ -5370,7 +5370,7 @@ async def cmd_airport_access_request(message: Message) -> None:
 			)
 			return
 
-		if member_count >= 200:
+		if member_count >= AIRPORT_REGISTRATION_MEMBER_LIMIT:
 			registration_error = await _airport_registration_error()
 			if registration_error:
 				flight_board_url = ""
@@ -8023,3 +8023,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
 	asyncio.run(main())
+	

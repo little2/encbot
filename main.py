@@ -180,6 +180,10 @@ AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID
 AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(AIRPORT_FLIGHT_BOARD_CHANNEL_ID or 0)
 AIRPORT_FLIGHT_BOARD_CHANNEL_URL = str(zttower_airport_flight_board_channel.get("invite_link", ""))
 
+
+PEACH_CHAT_ID = 0
+
+
 #发言可以增加通行证时间的群组
 
 APRON_CHANNEL_IDS = _parse_chat_ids(
@@ -283,7 +287,7 @@ USED_PAID_INVITES: dict[str, int] = {}
 USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
 PENDING_AIRPORT_JOIN_INVITES: dict[int, tuple[str, int]] = {}
 
-SHUTTLE_BOT_NAME = "shuttle67bot"
+SHUTTLE_BOT_NAME = "shuttle681bot"
 
 @dataclass(frozen=True, slots=True)
 class XManReply:
@@ -999,21 +1003,7 @@ TAG_TYPE_VALUES: dict[str, list[str]] = {
 
 DEFAULT_TAG_CHOICES = [tag for values in TAG_TYPE_VALUES.values() for tag in values]
 
-TAG_TYPE_DESCRIPTIONS: dict[str, str] = {
-	"age": "年龄分类：用于区分角色的年龄层次，例如清纯、成熟、萝莉、御姐、人妻等。",
-	"face": "脸部分类：用于描述面部特征，例如大眼、小脸、笑脸、甜美、可爱等。",
-	"act": "动作分类：用于描述动作和互动场景，例如接吻、摸胸、口交、性爱、自慰等。",
-	"nudity": "裸露分类：用于描述露出程度，例如露乳、露臀、全裸、半裸等。",
-	"par": "伴侣分类：用于描述角色关系或伴侣构成，例如单男、单女、双男、双女等。",
-	"fetish": "性癖分类：用于描述题材偏好，例如丝袜、黑丝、制服、校服、女仆等。",
-	"att": "姿态分类：用于描述拍摄姿势和角度，例如正面、侧面、背面、俯拍、仰拍等。",
-	"feedback": "反馈分类：用于记录内容评价与推荐，例如好评、推荐、高分、收藏、爆款等。",
-	"pro": "职业分类：用于区分角色职业，例如学生、老师、护士、空姐、女仆、律师等。",
-	"eth": "民族/风格分类：用于区分画风和人群特色，例如中式、日系、韩系、欧美、东南亚等。",
-	"play": "玩法分类：用于描述剧情和玩法，例如角色扮演、调教、恋爱、调情、实验等。",
-	"position": "姿势分类：用于描述性爱姿势，例如后入、正常位、女上、骑乘、口交、69等。",
-	"hardcore": "硬核分类：用于区分强烈刺激的内容，例如重口、硬核、极致、猛烈、高潮等。",
-}
+
 
 
 def _normalize_tag_list(value: Any) -> list[str]:
@@ -2448,6 +2438,19 @@ async def _notify_duty_free_new_batch(
 			),
 		]],
 	)
+
+	new_peach_keyboard = InlineKeyboardMarkup(
+		inline_keyboard=[[
+			InlineKeyboardButton(
+				text="🍑 新桃子",
+				url=(
+					f"https://t.me/{tower_bot_name}"
+					f"?start={normalized_batch_id}"
+				),
+			),
+		]],
+	)
+
 	try:
 		await _telegram_call_with_retry(
 			"send new batch to airport duty free group",
@@ -2464,6 +2467,25 @@ async def _notify_duty_free_new_batch(
 	except Exception as exc:
 		print(
 			f"[DUTY_FREE] new batch notification failed "
+			f"(batch_id={normalized_batch_id}): {exc}",
+			flush=True,
+		)
+
+	try:
+		await _telegram_call_with_retry(
+			"send new batch to peach chat",
+			lambda: bot.send_message(
+				chat_id=PEACH_CHAT_ID,
+				text=(
+					f"🍑 {tag_text}"
+				),
+				parse_mode="HTML",
+				reply_markup=new_peach_keyboard,
+			),
+		)
+	except Exception as exc:
+		print(
+			f"[PEACH] new batch notification failed "
 			f"(batch_id={normalized_batch_id}): {exc}",
 			flush=True,
 		)
@@ -3141,6 +3163,7 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"/backup — 将 SQLite 数据库备份发送给指定管理员",
 		"/clear_media — 备份数据库后清空 received_media 与 batch",
 		"/restore — 回复 SQLite 备份文件以恢复数据库",
+		"/reload — 执行共享配置重载",
 		"/reload_config — 强制从远程重新载入共享配置",
 		"/userinfo [用户id] — 查询用户时限及黑名单状态",
 		"/invite — 建立单人邀请（需先满足飞机场成员资格与通行证条件）",
@@ -3148,9 +3171,42 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"/about / /airport_access_request — 进入机场入场说明与申请入口",
 		"/start — 进入机场入口流程",
 		"/check_group — 检查机器人各群组/频道的管理员权限",
+		"/setup [link_key] [chat_id] — 设定 shared_invite_link 指定 link_key 的 chat_id（不存在则新增）",
 		"/admin — 查看管理员命令说明",
 	]
 	await message.reply("\n".join(lines))
+
+
+@dp.message(F.chat.type == "private", Command("setup"))
+async def cmd_setup_shared_invite_link(message: Message, command: CommandObject) -> None:
+	if not _is_admin_message(message):
+		await message.reply("❌ 无效指令")
+		return
+
+	parts = (str(command.args or "").strip().split())
+	if len(parts) != 2:
+		await message.reply("用法：/setup [link_key] [chat_id]\n例如：/setup peach -1001234567890")
+		return
+
+	link_key, chat_id_text = parts
+	try:
+		chat_id = int(chat_id_text)
+	except ValueError:
+		await message.reply("❌ chat_id 必须为整数。")
+		return
+
+	try:
+		record = shared_invite_link_store.set_chat_id(link_key, chat_id)
+	except Exception as exc:
+		print(f"[SETUP_INVITE_LINK] failed: {exc}", flush=True)
+		await message.reply("❌ 更新失败，请检查日志。")
+		return
+
+	await message.reply(
+		f"✅ 已更新 shared_invite_link\n"
+		f"link_key={record.link_key}\n"
+		f"chat_id={record.chat_id}"
+	)
 
 
 @dp.message(F.chat.type == "private", Command("check_group"))
@@ -3173,6 +3229,7 @@ async def cmd_check_group_admin_permissions(message: Message) -> None:
 	await message.reply(notice_text or "✅ 群组管理员权限检查已完成，但没有发现异常。")
 
 
+@dp.message(F.chat.type == "private", Command("reload"))
 @dp.message(F.chat.type == "private", Command("reload_config"))
 async def cmd_reload_config(message: Message) -> None:
 	if not _is_admin_message(message):
@@ -3186,7 +3243,9 @@ async def cmd_reload_config(message: Message) -> None:
 		await message.reply("❌ 共享配置重新载入失败，请查看运行日志。")
 		return
 
-	await message.reply("✅ 共享配置已强制重新载入。")
+	await reload_config()
+
+	await message.reply("✅ 共享配置已强制重新载入。\nPEACH_CHAT_ID=" + str(PEACH_CHAT_ID))
 
 
 def _create_sqlite_backup(source_path: Path, destination_path: Path) -> None:
@@ -6248,7 +6307,7 @@ async def on_lobby_channel_auto_forward(message: Message) -> None:
 	)
 
 
-@dp.message(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID, AIRPORT_DUTY_FREE_GROUP_ID}), F.text)
+@dp.message(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID, AIRPORT_DUTY_FREE_GROUP_ID, PEACH_CHAT_ID}), F.text)
 async def on_reward_group_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
 		return
@@ -7869,6 +7928,17 @@ async def say_hello_to_x_man(bot_name):
 	else:
 		print("❌ No SWITCHBOT_TOKEN found, skipping hello to X-Man bot.", flush=True)
 
+async def reload_config():
+	global PEACH_CHAT_ID
+	# 从 table shared_invite_link 取得 key = peach	
+	record = shared_invite_link_store.get("peach")
+	if record is not None:
+		PEACH_CHAT_ID = record.chat_id
+		print(f"PEACH_CHAT_ID set to {PEACH_CHAT_ID}", flush=True)
+	else:
+		PEACH_CHAT_ID = 0
+		print(f"PEACH_CHAT_ID set to default value {PEACH_CHAT_ID}", flush=True)
+
 async def main() -> None:
 	global bot_name
 	me = await bot.get_me()
@@ -7924,6 +7994,7 @@ async def main() -> None:
 				print(f"❌[VIDEO_BOT] stopped with error: {exception}", flush=True)
 
 		video_bot_task.add_done_callback(report_video_bot_result)
+	await reload_config()
 	try:
 		await dp.start_polling(bot)
 	finally:

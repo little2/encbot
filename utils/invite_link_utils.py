@@ -103,6 +103,39 @@ class SharedInviteLinkStore:
                 WHERE link_key = ?
             """, (int(time.time()), str(link_key)))
 
+    def set_chat_id(self, link_key: str, chat_id: int) -> SharedInviteLink:
+        link_key = str(link_key)
+        chat_id = int(chat_id)
+        now = int(time.time())
+
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO shared_invite_link (
+                    link_key,
+                    chat_id,
+                    invite_link,
+                    name,
+                    created_at,
+                    validated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(link_key) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    validated_at = excluded.validated_at
+            """, (
+                link_key,
+                chat_id,
+                "",
+                link_key,
+                now,
+                now,
+            ))
+
+        existing = self.get(link_key)
+        if existing is None:
+            raise RuntimeError(f"failed to set chat_id for link_key={link_key!r}")
+        return existing
+
     def delete(self, link_key: str) -> bool:
         with self.connection:
             cursor = self.connection.execute(

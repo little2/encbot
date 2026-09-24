@@ -28,7 +28,7 @@ class VideoBotCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await self._handler("board")(message)
 
-        message.reply.assert_awaited_once_with("https://t.me/ztflybot")
+        message.reply.assert_awaited_once_with("https://t.me/ztzlp")
 
     async def test_check_reports_when_user_has_no_videos(self) -> None:
         self.store.get_top_videos.return_value = []

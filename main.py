@@ -15,24 +15,26 @@ import base64
 from email.mime import message
 import hashlib
 import hmac
+import json
 import re
 import asyncio
 import os
 import secrets
 import sqlite3
 import tempfile
+import time as pytime
 from time import monotonic
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import imagehash
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import (
 	TelegramBadRequest,
@@ -191,6 +193,7 @@ APRON_CHANNEL_IDS = _parse_chat_ids(
 	"APRON_CHANNEL_ID",
 )
 
+USED_FLASH_NONCES: dict[tuple[str, int], datetime] = {}
 
 DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
 DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
@@ -249,6 +252,83 @@ bot = Bot(
 	default=DefaultBotProperties(link_preview_is_disabled=True),
 )
 dp = Dispatcher()
+
+
+def _cleanup_used_flash_nonces(now: datetime) -> None:
+	expired_keys = [key for key, expires_at in USED_FLASH_NONCES.items() if now >= expires_at]
+	for key in expired_keys:
+		USED_FLASH_NONCES.pop(key, None)
+
+
+def _format_datetime_utc8(value: datetime) -> str:
+	if value.tzinfo is None:
+		value = value.replace(tzinfo=APP_TIMEZONE)
+	return value.astimezone(APP_TIMEZONE).strftime("%m-%d %H:%M")
+
+
+def _format_timestamp_utc8(timestamp: int) -> str:
+	return _format_datetime_utc8(app_fromtimestamp(timestamp))
+
+
+class PrivateBotSenderLogMiddleware(BaseMiddleware):
+	"""记录私聊中来自机器人账号的消息。"""
+
+	async def __call__(self, handler: Callable, event: Message, data: dict[str, Any]) -> Any:
+		from_user = getattr(event, "from_user", None)
+		chat = getattr(event, "chat", None)
+		if getattr(chat, "type", None) == "private" and getattr(from_user, "is_bot", False):
+			print(
+				"[Private Bot Message] "
+				f"chat_id={getattr(chat, 'id', None)} "
+				f"from_user_id={getattr(from_user, 'id', None)} "
+				f"username={getattr(from_user, 'username', None)} "
+				f"message_id={getattr(event, 'message_id', None)} "
+				f"text={getattr(event, 'text', None) or getattr(event, 'caption', None)}",
+				flush=True,
+			)
+			# 如果文字是 json 格式，则尝试解析。 范例: {"action": "captcha", "user_id": 8696673867, "second": 21600}
+			try:
+				json_data = json.loads(getattr(event, "text", None) or "")
+				if json_data and json_data.get("action") == "captcha":
+					print(
+						"[Private Bot Message] "
+						f"chat_id={getattr(chat, 'id', None)} "
+						f"from_user_id={getattr(from_user, 'id', None)} "
+						f"username={getattr(from_user, 'username', None)} "
+						f"message_id={getattr(event, 'message_id', None)} "
+					)
+					# 为 user_id 增加或减少有效时间 second
+					user_id = json_data.get("user_id")
+					if user_id:
+						
+
+						user_expire = user_expire_cache.extend_minutes(
+							user_id,
+							int(json_data.get("minutes", 0) or 0),
+						)
+
+						expire_text = _format_timestamp_utc8(user_expire.expire_timestamp)
+
+						# 传送私聊消息给用户，告知其通行证有效时间已更新
+						await bot.send_message(
+							chat_id=user_id,
+							text=dedent(
+								f"""
+								参加福利机活动
+								您的通行证有效期已更新。
+								有效期至: {expire_text}
+								"""
+							)
+						)
+						
+			except json.JSONDecodeError:
+				pass
+			
+		return await handler(event, data)
+
+
+dp.message.outer_middleware(PrivateBotSenderLogMiddleware())
+
 ENCODER_UI_STATE: dict[tuple[int, int], dict[str, Any]] = {}
 ENCODER_CONTENT_INPUT_STATE: dict[
 	tuple[int, int], tuple[int, int]
@@ -320,7 +400,7 @@ PREVIEW_STYLE_VIDEO = "video-play-duration-v1"
 PLAY_ICON_SIZES = (48, 64, 80, 96, 128)
 PREVIEW_CACHE: OrderedDict[tuple[str, str], bytes] = OrderedDict()
 bot_name = ""
-USED_FLASH_NONCES: dict[tuple[str, int], datetime] = {}
+
 PERM_FLASH_NONCE_RETENTION_DAYS = 30
 AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
 AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
@@ -511,20 +591,7 @@ def _make_fallback_preview() -> bytes:
 FALLBACK_PREVIEW_BYTES = _make_fallback_preview()
 
 
-def _cleanup_used_flash_nonces(now: datetime) -> None:
-	expired_keys = [key for key, expires_at in USED_FLASH_NONCES.items() if now >= expires_at]
-	for key in expired_keys:
-		USED_FLASH_NONCES.pop(key, None)
 
-
-def _format_datetime_utc8(value: datetime) -> str:
-	if value.tzinfo is None:
-		value = value.replace(tzinfo=APP_TIMEZONE)
-	return value.astimezone(APP_TIMEZONE).strftime("%m-%d %H:%M")
-
-
-def _format_timestamp_utc8(timestamp: int) -> str:
-	return _format_datetime_utc8(app_fromtimestamp(timestamp))
 
 
 

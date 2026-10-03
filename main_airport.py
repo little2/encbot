@@ -2362,7 +2362,7 @@ async def _notify_duty_free_new_batch(
 			flush=True,
 		)
 
-	if PEACH_CHAT_ID:
+	if PEACH_CHAT_ID and False:
 
 		new_peach_keyboard = InlineKeyboardMarkup(
 			inline_keyboard=[[

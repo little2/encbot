@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_COST_MINUTES, MESSAGE_EXTEND_MINUTES, MAX_VALID_DURATION_MINUTES
+from config import MEDIA_UPLOAD_EXTEND_MINUTES, MEDIA_VIEW_CONSUMPTION_MINUTES, MESSAGE_REWARD_MINUTES, MAX_HP_CAPACITY_MINUTES
 
 
 @dataclass(slots=True)
@@ -175,7 +175,7 @@ class UserExpireCache:
             user.expire_timestamp if user else 0,
         )
         wanted_expire_timestamp = base_timestamp + max(0, minutes) * 60
-        max_expire_timestamp = now + MAX_VALID_DURATION_MINUTES * 60
+        max_expire_timestamp = now + MAX_HP_CAPACITY_MINUTES * 60
         expire_timestamp = max(
             base_timestamp,
             min(wanted_expire_timestamp, max_expire_timestamp),

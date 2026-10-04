@@ -1182,13 +1182,14 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 
 
 	try:
-		if args:
+		if args != "":
 			await message.delete()
 	except Exception as exc:
 		print(f"[START] failed to delete parameterized command: {exc}", flush=True)
 
 
 	if "fly_" in args:
+		await message.delete()
 		return
 
 	else:			

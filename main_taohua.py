@@ -9,7 +9,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, CallbackQuery, ChatJoinRequest, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
@@ -35,12 +35,13 @@ BOT_TOKEN = SharedConfig.get("my_bot_token", "")
 CHAT_ROW = SharedConfig.get("chat","")
 if CHAT_ROW:
 	CHAT_SCHOOL = CHAT_ROW.get("school")
-	CHAT_SCHOOL_GROUP_ID = CHAT_SCHOOL.get("chat_id")
-	CHAT_SCHOOL_THREAD_ID = CHAT_SCHOOL.get("thread_id")
+	CHAT_SCHOOL_GROUP_ID = int(os.getenv("CHAT_SCHOOL_GROUP_ID", CHAT_SCHOOL.get("chat_id"))) 
+	CHAT_SCHOOL_THREAD_ID = int(os.getenv("CHAT_SCHOOL_THREAD_ID", CHAT_SCHOOL.get("thread_id")))
 
 	CHAT_PUBLIC = CHAT_ROW.get("public")
-	CHAT_PUBLIC_GROUP_ID = CHAT_PUBLIC.get("chat_id")
-	CHAT_PUBLIC_THREAD_ID = CHAT_PUBLIC.get("thread_id")
+	CHAT_PUBLIC_GROUP_ID = int(os.getenv("CHAT_PUBLIC_GROUP_ID", CHAT_PUBLIC.get("chat_id"))) 
+	CHAT_PUBLIC_THREAD_ID = int(os.getenv("CHAT_PUBLIC_THREAD_ID", CHAT_PUBLIC.get("thread_id")))
+	CHAT_PUBLIC_LINK = os.getenv("CHAT_PUBLIC_LINK", CHAT_PUBLIC.get("invite_link"))
 
 ADMIN_USER_IDS = ParseUtils.parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
 # 主要用户始终保留访问权限，避免共享配置遗漏时意外将其排除。
@@ -1172,9 +1173,35 @@ async def on_reward_group_message(message: Message) -> None:
 	)
 
 
+@dp.chat_join_request()
+async def on_join_request(join_request: ChatJoinRequest) -> None:
+	if join_request.chat.id not in {CHAT_PUBLIC_GROUP_ID, CHAT_SCHOOL_GROUP_ID}:
+		print(f"[JOIN_REQUEST] ignored join request from chat {join_request.chat.id}", flush=True)
+		return
+	print(f"[JOIN_REQUEST] {join_request.from_user.id}", flush=True)
+	try:
+		now_timestamp = int(app_now().timestamp())
+		user_expire = user_expire_cache.get(int(join_request.from_user.id))
+		if not user_expire or user_expire.expire_timestamp <= now_timestamp:
+
+			text = f"🚧 为避免坏份子混入桃花村，入村前请先交一份「投名状」——传送一份正太资源（文件或视频）给我，确认你我是否是同路人。\n\n📤 传送完成后，再重新申请加入群组。\n\n🍑 确认是同路人，方可入村。"
+			await bot.send_message(chat_id=join_request.from_user.id, text=text)
+			await join_request.decline()
+
+			return
+		# 检查申请者的桃气值是否逾期或不存在
+		
+		await join_request.approve()
+			
+	except Exception as exc:
+		print(f"[JOIN_REQUEST] failed to approve join request: {exc}", flush=True)
+
+
 '''
 Command
 '''
+
+
 
 @dp.message(F.chat.type == "private", Command("start"))
 async def cmd_start(message: Message, command: CommandObject) -> None:
@@ -1247,7 +1274,9 @@ async def cmd_me(message: Message) -> None:
 		
 	)
 
-@dp.message(F.chat.type == "private", Command("rule"))
+
+# 同时监听 /home 和 /rule 命令
+@dp.message(F.chat.type == "private", Command("home", "rule"))
 async def cmd_rule(message: Message) -> None:
 	
 	media_upload_extend_text = FormatUtils.minutes_to_day_hour(MEDIA_UPLOAD_EXTEND_MINUTES)[0]
@@ -1255,6 +1284,20 @@ async def cmd_rule(message: Message) -> None:
 	view_cost_text = FormatUtils.minutes_to_day_hour(MEDIA_VIEW_CONSUMPTION_MINUTES)[0]
 	message_extend_text = FormatUtils.minutes_to_day_hour(MESSAGE_REWARD_MINUTES)[0]
 	max_duration_text = FormatUtils.minutes_to_day_hour(MAX_HP_CAPACITY_MINUTES)[0]
+
+	reply_markup = InlineKeyboardMarkup(
+		inline_keyboard=[
+			[
+				InlineKeyboardButton(
+					text="🌸 加入桃花林",
+					url=(
+						f"{CHAT_PUBLIC_LINK}"
+					),
+				)
+			]
+		]
+	)
+
 
 	await message.reply(
 		"🌸 桃花村的传说与生存法则\n\n"
@@ -1301,6 +1344,7 @@ async def cmd_rule(message: Message) -> None:
 
 		"<b>🌸 欢迎来到桃花村！在这里，交流能够引动共鸣，分享能够获得灵韵，而探索资源与日常生活都需要消耗桃气值。遵循村庄的天地法则，合理规划桃气值的获取与使用，才能在桃花村中持续探索，发现更多精彩内容。</b>",
 		parse_mode="HTML",
+		reply_markup=reply_markup,
 	)
 
 

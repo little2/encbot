@@ -29,6 +29,8 @@ SharedConfig.load(True)
 
 from utils.emoji_utils import EmojiUtils
 
+PEACH_CHANNEL_ID = os.getenv("PEACH_CHANNEL_ID")
+
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
 KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
@@ -421,6 +423,23 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			inline_keyboard=[[InlineKeyboardButton(text="🍑 (1)", callback_data="peach:link")]]
 		),
 	)
+
+
+
+	if data['file_type'] == "video":
+		send_result = await bot.send_video(
+			chat_id = PEACH_CHANNEL_ID,
+			video =data['file_id'],
+			parse_mode="HTML",					
+			caption=f"{html.escape(text)}",
+		)
+	elif data['file_type'] == "document":
+		send_result = await bot.send_document(
+			chat_id = PEACH_CHANNEL_ID,
+			document =data['file_id'],
+			parse_mode="HTML",					
+			caption=f"{html.escape(text)}",
+		)
 
 
 	await state.clear()

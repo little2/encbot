@@ -27,6 +27,7 @@ from pathlib import Path
 from shared_config import SharedConfig
 SharedConfig.load(True)
 
+from utils.emoji_utils import EmojiUtils
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
@@ -199,6 +200,37 @@ async def _ask_intro(message: Message, state: FSMContext, text: str) -> None:
 	await state.update_data(prompt_message_id=prompt.message_id)
 
 
+
+
+
+def _extract_media_dict(message: Message) -> dict:
+	file_type = None
+	caption = None
+	file_id = None
+	file_name = None
+
+	print(f"Extracting media from message: {message}")
+	
+	if message.video:
+		file_type = "video"
+		file_id = message.video.file_id
+	elif message.document:
+		mime_type = str(message.document.mime_type or "").lower()
+		file_type = "video" if mime_type == "video/mp4" else "document"
+		file_id = message.document.file_id
+
+	file_name = str((message.video or message.document).file_name or "").strip()
+
+	
+	if message.caption:
+		caption = message.caption.strip()
+		if EmojiUtils._extract_consecutive_emojis(caption):
+			print(f"Caption contains consecutive emojis: {caption}")
+			caption = EmojiUtils.strip_consecutive_emojis(caption)
+			print(f"Caption cleaned: {caption}")
+
+	return {"file_type": file_type, "caption": caption, "file_id": file_id, "file_name": file_name}
+
 def _extract_media_info(message: Message) -> tuple[str, str]:
 	if message.video:
 		return "video", message.video.file_id
@@ -301,8 +333,13 @@ async def on_media(message: Message, state: FSMContext) -> None:
 		print(f"只接受视频或文件消息", flush=True)
 		return
 
-	file_type, file_id = _extract_media_info(message)
-	file_name = str((message.video or message.document).file_name or "").strip()
+	media_info = _extract_media_dict(message)
+	file_type = media_info.get("file_type")
+	file_id = media_info.get("file_id")
+	file_name = media_info.get("file_name")
+	caption = media_info.get("caption")
+
+		
 
 	had_pending = await state.get_state() == IntroStates.waiting_intro.state
 	await state.set_state(IntroStates.waiting_intro)
@@ -319,11 +356,18 @@ async def on_media(message: Message, state: FSMContext) -> None:
 	if had_pending:
 		lines.append("⚠️ 上一个媒体尚未填写介绍内容，已被放弃。")
 
-	chinese_name = Path(file_name).stem.strip() if CHINESE_RE.search(file_name) else ""
+	if caption:
+		chinese_name = caption
+		
+	elif not caption and file_name:
+		chinese_name = Path(file_name).stem.strip() if CHINESE_RE.search(file_name) else ""
+	else:
+		chinese_name = ""
+	
 	if chinese_name:
 		lines.append(
 			"可点击复制文件名作为介绍：\n"
-			f"<code>{html.escape(chinese_name)}</code>\n\n"
+			f"<a href=\"https://t.me/{bot_name}?text={html.escape(chinese_name)}\">{html.escape(chinese_name)}</a>\n\n"
 			"请回复此消息并输入介绍内容（2~100 字）。"
 		)
 	else:
@@ -1048,9 +1092,9 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 
 		notify_text = (
 			f"{callback.message.text}\n\n"
-			f"✅ 采菊成功，消耗 {requested_human_time} 点桃气值。\n"
+			f"✅ 采菊成功，消耗 {requested_minutes // HOURLY_CONSUMPTION_MINUTES} 点桃气值。\n"
 			f"🍑 剩余桃气值：{remaining_view_count} / {MAX_HP_CAPACITY_QUANTITY} 点\n"
-			f"🕒 预计耗尽：{expire_text}\n\n"
+			f"🕒 预计耗尽：{expire_text}\n"
 		)
 
 		notify_keyboard_rows: list[list[InlineKeyboardButton]] = []

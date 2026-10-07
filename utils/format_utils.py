@@ -19,13 +19,13 @@ class FormatUtils:
 
 		parts: list[str] = []
 		if days:
-			parts.append(f"{days}天")
+			parts.append(f"{days} 天 ")
 		if hours:
-			parts.append(f"{hours}小时")
+			parts.append(f"{hours} 小时 ")
 		if minutes:
-			parts.append(f"{minutes}分钟")
-		if secs or not parts:
-			parts.append(f"{secs}秒")
+			parts.append(f"{minutes} 分 ")
+		# if secs or not parts:
+		# 	parts.append(f"{secs} 秒 ")
 
 		return "".join(parts)
 
@@ -33,7 +33,7 @@ class FormatUtils:
 	def format_datetime_utc8(value: datetime) -> str:
 		if value.tzinfo is None:
 			value = value.replace(tzinfo=APP_TIMEZONE)
-		return value.astimezone(APP_TIMEZONE).strftime("%m-%d %H:%M")
+		return value.astimezone(APP_TIMEZONE).strftime("%m 月 %d 日 %H 时 %M 分")
 
 	@staticmethod
 	def format_timestamp_utc8(timestamp: int) -> str:
@@ -100,3 +100,14 @@ class FormatUtils:
 			text += f" <code>{user_id}</code>"
 
 		return text
+
+	@staticmethod
+	def hp_bar(current_hp, max_hp, length=12):
+		current_hp = max(0, min(current_hp, max_hp))
+
+		filled = round(current_hp / max_hp * length)
+		empty = length - filled
+
+		return "🟩" * filled + "⬜" * empty
+
+

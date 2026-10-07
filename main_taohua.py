@@ -9,7 +9,8 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, CallbackQuery, ChatJoinRequest, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, CallbackQuery, ChatJoinRequest, CopyTextButton, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import ReplyKeyboardRemove
 
 from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
@@ -367,9 +368,46 @@ async def on_media(message: Message, state: FSMContext) -> None:
 		chinese_name = ""
 	
 	if chinese_name:
+		
+		# keyboard = ReplyKeyboardMarkup(
+		# 	keyboard=[
+		# 		[
+		# 			KeyboardButton(text=f"{html.escape(chinese_name)}"),
+					
+		# 		]
+		# 	],
+		# 	resize_keyboard=True,
+		# 	one_time_keyboard=True,
+		# 	input_field_placeholder="请选择操作",
+		# 	selective=False,
+		# )
+		
+
+		# await message.answer(
+		# 	"可点击下方按钮复制文字作为介绍：",
+		# 	reply_markup=keyboard
+		# )
+
+
+
+		await bot.send_message(
+			message.chat.id,
+			f"<a href=\"https://t.me/{bot_name}?text={html.escape(chinese_name)}\">{html.escape(chinese_name)}</a>\n\n",
+			parse_mode="HTML",
+			reply_markup=InlineKeyboardMarkup(
+				inline_keyboard=[
+					[
+						InlineKeyboardButton(
+							text="📋 复制",
+							copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}")
+							
+						)
+					]
+				]
+			)
+		)
+
 		lines.append(
-			"可点击复制文件名作为介绍：\n"
-			f"<a href=\"https://t.me/{bot_name}?text={html.escape(chinese_name)}\">{html.escape(chinese_name)}</a>\n\n"
 			"请回复此消息并输入介绍内容（2~100 字）。"
 		)
 	else:
@@ -420,7 +458,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		message_thread_id=CHAT_PUBLIC_THREAD_ID or None,
 		parse_mode=ParseMode.HTML,
 		reply_markup=InlineKeyboardMarkup(
-			inline_keyboard=[[InlineKeyboardButton(text="🍑 (1)", callback_data="peach:link")]]
+			inline_keyboard=[[InlineKeyboardButton(text="🍑", callback_data="peach:link")]]
 		),
 	)
 
@@ -477,12 +515,11 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
 		expire_text = FormatUtils.format_timestamp_utc8(user_expire.expire_timestamp)
 		
-
+		status_text = await get_user_status(from_user_id)
 		
 		notify_text = (
 			f"🌿 灵韵馈赠成功！你获得了 {peach_count} 点桃气值。 \n"
-			f"🌀 当前桃气可维持至：{expire_text}。\n\n"
-			f"✨ 请注意，桃气上限为 {MAX_HP_CAPACITY_QUANTITY} 点。达到上限后，超出上限的桃气值将无法继续累积。"
+			f"\n\n{status_text}"
 		)
 
 
@@ -491,6 +528,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		await bot.send_message(
 			chat_id=from_user_id,
 			text=notify_text,
+			reply_markup=ReplyKeyboardRemove()
 			
 		)
 
@@ -1308,34 +1346,38 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 	]
 	await message.reply("\n".join(lines))
 
-
-@dp.message(F.chat.type == "private", Command("me"))
-async def cmd_me(message: Message) -> None:
-	if not message.from_user:
-		return
-
+async def get_user_status(from_user_id):
 	now_timestamp = int(app_now().timestamp())
-	user_expire = user_expire_cache.get(int(message.from_user.id))
+	user_expire = user_expire_cache.get(int(from_user_id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
-		await message.reply(
-			"📊 村民状态\n\n"
+		status_text = (
+			"<blockquote>📊 村民状态</blockquote>\n\n"
 			"状态：目前没有桃气\n"
 			"你可以在桃花村发言或分享资源来增加桃气值。"
 		)
-		return
+		return status_text
 
 	remaining_seconds = user_expire.expire_timestamp - now_timestamp
 	remaining_minutes = remaining_seconds // 60
 	available_view_count = remaining_minutes // MEDIA_VIEW_CONSUMPTION_MINUTES
 	expire_text = FormatUtils.format_timestamp_utc8(user_expire.expire_timestamp)
-
-	await message.reply(
-		"📊 村民状态\n\n"
+	hp_bar = FormatUtils.hp_bar(available_view_count, MAX_HP_CAPACITY_QUANTITY)
+	status_text = (
+		"<blockquote>📊 村民状态</blockquote>\n\n"
 		f"🍑 桃气值：{available_view_count} / {MAX_HP_CAPACITY_QUANTITY} \n"
+		f"{hp_bar}\n\n"
 		f"⏳ 可维持：{FormatUtils.format_duration(remaining_seconds)}\n"
 		f"🕒 预计耗尽：{expire_text}"
 		
 	)
+	return status_text
+@dp.message(F.chat.type == "private", Command("me"))
+async def cmd_me(message: Message) -> None:
+	if not message.from_user:
+		return
+	status_text = await get_user_status(message.from_user.id)
+	await message.reply(status_text)
+		
 
 
 # 同时监听 /home 和 /rule 命令
@@ -1368,35 +1410,36 @@ async def cmd_rule(message: Message) -> None:
 		"桃气值是村民在桃花村生活、交流与探索的重要能量。村民可以通过日常交流与分享资源获得桃气值，而查看其他村民分享的资源，以及维持日常生活，都需要消耗桃气值。\n\n"
 		"为了维持桃花村的秩序与能量平衡，村中流传着以下法则。</i>\n\n"
 
-		"<blockquote>🌸 一、共鸣生息</blockquote>\n"
+		"<blockquote expandable>🌸 一、共鸣生息\n"
 		"桃花村中生长着一棵神奇的「共鸣树」。村民之间的发言交流，会让共鸣树感受到村庄的生机与活力，并将这份共鸣转化为桃气值。\n"
-		"村民在桃花村（桃花林和桃花源）进行符合条件的交流，即可获得桃气值。\n\n"
+		"村民在桃花村（桃花林和桃花源）进行符合条件的交流，即可获得桃气值。</blockquote>"
+
 		f"✨ 每次有效交流，可获得 {MESSAGE_REWARD_QUANTITY} 点桃气值。\n"
-		"每个自然分钟最多计算一次有效交流。重复刷屏、无意义的消息或不符合条件的内容，不会触发共鸣。\n\n"
-
-		"<blockquote>🌿 二、灵韵馈赠</blockquote>\n"
+		"每分钟最多计算一次有效交流。重复刷屏、无意义的消息或不符合条件的内容，不会触发共鸣。\n\n"
+		
+		"<blockquote expandable>🌿 二、灵韵馈赠\n"
 		"桃花村鼓励村民分享有价值的视频与文件，让更多村民能够发现和探索不同的内容。\n"
-		"每当村民成功分享符合条件的资源，共鸣树便会感知到新的灵韵，并将部分灵韵转化为桃气值，作为对分享者的馈赠。\n\n"
-		f"🎁 每次成功分享资源，可获得 {MEDIA_UPLOAD_EXTEND_QUANTITY} 点桃气值。\n"
-		"重复分享相同资源或发送无效文件，不会重复获得奖励。\n"
-		"所有分享所得的桃气值均受桃气上限约束，超出上限的部分不再累加。\n\n"
-
-		"<blockquote>🌼 三、采菊寻芳</blockquote>\n"
+		"每当村民成功分享符合条件的资源，共鸣树便会感知到新的灵韵，并将部分灵韵转化为桃气值，作为对分享者的馈赠。</blockquote>"
+		
+		f"🎁 每次成功分享资源，可获 {MEDIA_UPLOAD_EXTEND_QUANTITY} 点桃气值。\n"
+		"重复分享相同资源或发送无效文件，不会重复获得奖励。\n\n"
+		
+		"<blockquote expandable>🌼 三、采菊寻芳\n"
 		"在桃花村，「采菊」是查看其他村民已经分享的视频或文件的专用说法。每一份资源都像藏在桃花林中的一朵菊花，等待有缘的村民前来发现。\n"
-		"「采菊」探秘需要消耗桃气值。村民可以根据自己的桃气储量，决定何时采菊，以及探索多少资源。\n\n"
+		"「采菊」探秘需要消耗桃气值。村民可以根据自己的桃气储量，决定何时采菊，以及探索多少资源。</blockquote>"
 		f"🔍 每次采菊，需要消耗 {MEDIA_VIEW_CONSUMPTION_QUANTITY} 点桃气值。\n"
-		"当桃气值不足时，将无法继续采菊。请合理规划桃气值，避免因能量不足而错过感兴趣的资源。\n\n"
+		"当桃气值不足时，将无法继续采菊。\n\n"
 
-		"<blockquote>⏳ 四、岁时流转</blockquote>\n"
-		"桃花村遵循着独有的天地运行法则。日月更替，四时流转，村民即使没有进行其他活动，也需要定期消耗桃气值，以维持日常生活所需的能量。\n\n"
-		f"⏰ 每小时需要消耗 {HOURLY_CONSUMPTION_QUANTITY} 点桃气值。\n"
-		"村民应留意桃气值的变化，并及时通过交流或分享资源补充能量。如果桃气值不足，可能无法继续进行需要消耗桃气值的活动。\n\n"
+		"<blockquote expandable>⏳ 四、岁时流转\n"
+		"桃花村遵循着独有的天地运行法则。日月更替，四时流转，村民即使没有进行其他活动，也需要定期消耗桃气值，以维持日常生活所需的能量。</blockquote>"
+		f"⏰ 每小时需要消耗 {HOURLY_CONSUMPTION_QUANTITY} 点桃气值。\n\n"
+		
 
-		"<blockquote>🌀 五、桃气上限</blockquote>\n"
-		"桃花村的天地法则规定，每位村民能够累积的桃气值都有一定上限。桃气上限决定了村民最多能够持有多少桃气值，是规划日常活动与资源获取的重要依据。\n\n"
+		"<blockquote expandable>🌀 五、桃气上限\n"
+		"桃花村的天地法则规定，每位村民能够累积的桃气值都有一定上限。桃气上限决定了村民最多能够持有多少桃气值，是规划日常活动与资源获取的重要依据。</blockquote>"
 		f"📊 桃气上限：最多累积 {MAX_HP_CAPACITY_QUANTITY} 点桃气值。\n"
-		"当桃气值达到上限后，超出上限的部分将不再累加。即使继续触发共鸣或分享资源，也无法使桃气值超过规定的上限。\n"
-		"因此，村民应合理安排交流、资源分享、采菊与日常消耗，让桃气值保持在适当的水平，避免浪费后续获得的桃气值。\n\n"
+		"当桃气值达到上限后，超出上限的部分将不再累加。即使继续触发共鸣或分享资源，也无法使桃气值超过规定的上限。\n\n"
+		
 
 		"<blockquote>📜 六、桃花村生存指南</blockquote>\n"
 		f"🌸 共鸣生息：每次有效交流，获得 {MESSAGE_REWARD_QUANTITY} 点桃气值。\n"

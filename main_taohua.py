@@ -262,6 +262,7 @@ async def _check_bot_group_admin_permissions() -> str:
 	groups = (
 		("CHAT_PUBLIC_GROUP_ID", CHAT_PUBLIC_GROUP_ID),
 		("CHAT_SCHOOL_GROUP_ID", CHAT_SCHOOL_GROUP_ID),
+		("PEACH_CHANNEL_ID", PEACH_CHANNEL_ID),
 		
 	)
 	notice_text = ""
@@ -1352,7 +1353,7 @@ async def get_user_status(from_user_id):
 	user_expire = user_expire_cache.get(int(from_user_id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 		status_text = (
-			"<blockquote>📊 村民状态</blockquote>\n\n"
+			"<blockquote>📊 村民状态</blockquote>\n"
 			"状态：目前没有桃气\n"
 			"你可以在桃花村发言或分享资源来增加桃气值。"
 		)

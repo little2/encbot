@@ -464,21 +464,23 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 	)
 
 
-
-	if data['file_type'] == "video":
-		send_result = await bot.send_video(
-			chat_id = PEACH_CHANNEL_ID,
-			video =data['file_id'],
-			parse_mode="HTML",					
-			caption=f"{html.escape(text)}",
-		)
-	elif data['file_type'] == "document":
-		send_result = await bot.send_document(
-			chat_id = PEACH_CHANNEL_ID,
-			document =data['file_id'],
-			parse_mode="HTML",					
-			caption=f"{html.escape(text)}",
-		)
+	try:
+		if data['file_type'] == "video":
+			send_result = await bot.send_video(
+				chat_id = PEACH_CHANNEL_ID,
+				video =data['file_id'],
+				parse_mode="HTML",					
+				caption=f"{html.escape(text)}",
+			)
+		elif data['file_type'] == "document":
+			send_result = await bot.send_document(
+				chat_id = PEACH_CHANNEL_ID,
+				document =data['file_id'],
+				parse_mode="HTML",					
+				caption=f"{html.escape(text)}",
+			)
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] send to PEACH_CHANNEL failed: {exc}", flush=True)
 
 
 	await state.clear()

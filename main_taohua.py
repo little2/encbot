@@ -528,6 +528,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		await bot.send_message(
 			chat_id=from_user_id,
 			text=notify_text,
+			parse_mode="HTML",
 			reply_markup=ReplyKeyboardRemove()
 			
 		)
@@ -1376,7 +1377,7 @@ async def cmd_me(message: Message) -> None:
 	if not message.from_user:
 		return
 	status_text = await get_user_status(message.from_user.id)
-	await message.reply(status_text)
+	await message.reply(status_text, parse_mode="HTML")
 		
 
 

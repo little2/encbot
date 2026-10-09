@@ -2266,7 +2266,8 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 			lines.extend([
 				"状态：✅ 有效",
 				f"剩余时限：{FormatUtils.format_duration(remaining_seconds)}",
-				f"目前可请求：{available_view_count} 个资源",
+				f"目前可请求：{available_view_count} 个资源\n",
+				f"🎈 桃气值不足不能采菊，但不会被逐出桃花村",
 			])
 		else:
 			lines.extend([

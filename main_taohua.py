@@ -2038,8 +2038,8 @@ async def get_user_status(from_user_id):
 		f"🍑 桃气值：{available_view_count} / {MAX_HP_CAPACITY_QUANTITY} \n"
 		f"{hp_bar}\n\n"
 		f"⏳ 可维持：{FormatUtils.format_duration(remaining_seconds)}\n"
-		f"🕒 预计耗尽：{expire_text}\n"
-		f"🎈 桃气值不足不能采菊，但不会被逐出桃花村"
+		f"🕒 预计耗尽：{expire_text}\n\n"
+		f"🎈 <i>桃气值不足不能采菊，但不会被逐出桃花村</i>"
 		
 	)
 	return status_text

@@ -499,7 +499,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 
 
 	try:
-		if PEACH_CHANNEL_ID and PEACH_CHANNEL_ID != 0:
+		if PEACH_CHANNEL_ID and int(PEACH_CHANNEL_ID) != 0:
 			if data['file_type'] == "video":
 				await _telegram_call_with_retry(
 					"forward intro video to peach channel",
@@ -1492,11 +1492,11 @@ async def on_reward_group_message(message: Message) -> None:
 		0,
 		(user_expire.expire_timestamp - base_timestamp) // 60,
 	)
-	print(
-		f"[MESSAGE_REWARD] user {user_id} granted "
-		f"{actual_added_minutes}/{MESSAGE_REWARD_MINUTES} minutes",
-		flush=True,
-	)
+	# print(
+	# 	f"[MESSAGE_REWARD] user {user_id} granted "
+	# 	f"{actual_added_minutes}/{MESSAGE_REWARD_MINUTES} minutes",
+	# 	flush=True,
+	# )
 
 
 @dp.chat_join_request()

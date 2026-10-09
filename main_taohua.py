@@ -1,16 +1,18 @@
 
 import asyncio
+import base64
 import html
+from io import BytesIO
 import os
 import re
 import time
-
+from functools import lru_cache
 from aiogram import Dispatcher, Bot, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, CallbackQuery, ChatJoinRequest, CopyTextButton, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BufferedInputFile, CallbackQuery, ChatJoinRequest, CopyTextButton, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument, KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.types import ReplyKeyboardRemove
 from aiogram.types import ErrorEvent
 
@@ -94,6 +96,38 @@ TARGET_CHATS = [
 	("桃花源", CHAT_SCHOOL_GROUP_ID),
 ]
 
+DEFAULT_COVER_FILE_ID: str | None = None
+DEFAULT_IMAGE_PATHS = (Path(__file__).resolve().parent / "default_image.jpeg",)
+
+import base64
+from functools import lru_cache
+from pathlib import Path
+
+DEFAULT_IMAGE_PATHS = (
+    Path(__file__).resolve().parent / "default_image.jpeg",
+)
+
+_WHITE_JPEG_BASE64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
+    "//////////////////////////////////////////////////////////////////////////////////////////////"
+    "//////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////"
+    "//////////////////////////////////////////////////////////////////////////////////////////////"
+    "//////////////wAARCAAQABADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAA"
+    "AAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AMf/AP/Z"
+)
+
+_WHITE_JPEG_BYTES = base64.b64decode(_WHITE_JPEG_BASE64)
+
+
+@lru_cache(maxsize=1)
+def _get_default_image_bytes() -> bytes:
+    image_path = DEFAULT_IMAGE_PATHS[0]
+
+    if image_path.is_file():
+        return image_path.read_bytes()
+
+    image_path.write_bytes(_WHITE_JPEG_BYTES)
+    return _WHITE_JPEG_BYTES
 
 if not BOT_TOKEN:
 	raise RuntimeError("Missing bot token. Please set ENCBOT_TOKEN or BOT_TOKEN.")
@@ -187,13 +221,36 @@ def _extract_media_dict(message: Message) -> dict:
 
 	# print(f"Extracting media from message: {message}")
 	
+	# if reply_message.video:
+	# 		cover = getattr(reply_message.video, "cover", None)
+	# 		if isinstance(cover, list) and cover:
+	# 			preview = cover[0]
+	# 		elif cover:
+	# 			preview = cover
+	# 		if not preview:
+	# 			preview = reply_message.video.thumbnail
+	# 	elif reply_message.document:
+	# 		preview = reply_message.document.thumbnail
+
+	thumb_file_id = None
+
 	if message.video:
 		file_type = "video"
 		file_id = message.video.file_id
+		cover = getattr(message.video, "cover", None)
+		if isinstance(cover, list) and cover:
+			thumb_file_id = cover[0]
+		elif cover:
+			thumb_file_id = cover
+		if not thumb_file_id:
+			thumb_file_id = message.video.thumbnail
+
+
 	elif message.document:
 		mime_type = str(message.document.mime_type or "").lower()
 		file_type = "video" if mime_type == "video/mp4" else "document"
 		file_id = message.document.file_id
+		thumb_file_id = message.document.thumbnail
 
 	file_name = str((message.video or message.document).file_name or "").strip()
 
@@ -205,7 +262,7 @@ def _extract_media_dict(message: Message) -> dict:
 			caption = EmojiUtils.strip_consecutive_emojis(caption)
 			print(f"Caption cleaned: {caption}")
 
-	return {"file_type": file_type, "caption": caption, "file_id": file_id, "file_name": file_name}
+	return {"file_type": file_type, "caption": caption, "file_id": file_id, "file_name": file_name, "thumb_file_id": thumb_file_id}
 
 def _extract_media_info(message: Message) -> tuple[str, str]:
 	if message.video:
@@ -315,6 +372,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 	file_id = media_info.get("file_id")
 	file_name = media_info.get("file_name")
 	caption = media_info.get("caption")
+	thumb_file_id = media_info.get("thumb_file_id")
 
 		
 
@@ -326,8 +384,10 @@ async def on_media(message: Message, state: FSMContext) -> None:
 			"file_type": file_type,
 			"file_id": file_id,
 			"uploader_id": int(message.from_user.id),
+			"thumb_file_id": thumb_file_id,
 		}
 	)
+
 
 	lines = []
 	if had_pending:
@@ -394,7 +454,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 
 
 def encode_file_url(data: dict) -> str:
-	return f"https://peach.{data['file_type']}/{data['uploader_id']}/{data['file_id']}"
+	return f"https://peach.{data['file_type']}/{data['uploader_id']}/{data['file_id']}/{data['thumb_file_id']}"
 
 def parse_file_url(url: str) -> dict:
 	parts = url.split("/")
@@ -403,7 +463,8 @@ def parse_file_url(url: str) -> dict:
 	file_type = parts[2].split(".")[-1]
 	uploader_id = parts[3]
 	file_id = parts[4]
-	return {"file_type": file_type, "uploader_id": uploader_id, "file_id": file_id}
+	thumb_file_id = parts[5] if len(parts) > 5 else ""
+	return {"file_type": file_type, "uploader_id": uploader_id, "file_id": file_id, "thumb_file_id": thumb_file_id}
 
 
 
@@ -445,6 +506,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 	text = (message.text or "").strip()
 
 	data = await state.get_data()
+
 	replied = message.reply_to_message
 	if not replied or replied.message_id not in (
 		data.get("prompt_message_id"),
@@ -452,6 +514,10 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 	):
 		await _ask_intro(message, state, "需要选择要介绍的媒体，并回复该消息，输入介绍内容。")
 		return
+	
+	
+
+	
 
 	if not INTRO_MIN_LEN <= len(text) <= INTRO_MAX_LEN:
 		await _ask_intro(
@@ -460,6 +526,49 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			f"介绍内容需为 {INTRO_MIN_LEN}~{INTRO_MAX_LEN} 字，目前 {len(text)} 字，请重新回复此消息。",
 		)
 		return
+
+	preview = None
+	thumb_file_id = ""
+
+
+	thumb_file_id = data.get("thumb_file_id")
+	if thumb_file_id:
+		try:
+			thumb_result = await bot.send_photo(
+				chat_id=X_MAN_BOT_ID,
+				photo=thumb_file_id,
+			)
+
+			print(f"thumb_result_file_id={thumb_result.photo[-1].file_id}", flush=True)
+		
+			
+		except Exception as exc:
+			print(f"[ENCODED_FORWARD] send thumb to X_MAN_BOT_ID failed: {exc}", flush=True)
+
+			try:
+				buffer = BytesIO()
+
+				await bot.download(
+					thumb_file_id,
+					destination=buffer,
+				)
+
+				thumb_result = await bot.send_photo(
+					chat_id=X_MAN_BOT_ID,
+					photo=BufferedInputFile(
+						buffer.getvalue(),
+						filename="thumbnail.jpg",
+					),
+				)
+
+				print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
+				thumb_file_id = thumb_result.photo[-1].file_id
+				data["thumb_file_id"] = thumb_file_id
+			except Exception as exc:
+				print(f"[ENCODED_FORWARD] download and send thumb failed: {exc}", flush=True)
+
+
+	
 	url = encode_file_url(data)
 	
 	try:
@@ -1213,8 +1322,337 @@ def _prune_delivery_records() -> None:
 			PEACH_LAST_DELIVERY_AT.pop(key, None)
 
 
-@dp.callback_query(F.data.startswith("peach:link"))
-async def on_peach_link(callback: CallbackQuery) -> None:
+
+@dp.callback_query(F.data.startswith(("peach:link","preview:link","buy:link")))
+async def on_preview_link(callback: CallbackQuery) -> None:
+	global DEFAULT_COVER_FILE_ID
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+	message = callback.message
+
+	act_type = callback.data.split(":")[0]
+
+	
+	
+
+	# print(f"{callback.message.text}")
+
+	if not message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	entities = (
+		getattr(message, "entities", None) or []
+	) + (
+		getattr(message, "caption_entities", None) or []
+	)
+
+	
+	# print(f"message=>{message}")
+	url = next((e.url for e in entities if e.type == "text_link" and e.url), "")
+	if not url:
+		await callback.answer("找不到链接", show_alert=True)
+		return
+
+	# 解析 url, 取出 file_type 和 file_id
+	file_data = parse_file_url(url)
+	uploader_id = file_data.get("uploader_id","")
+	file_type = file_data.get("file_type","")
+	file_id = file_data.get("file_id","")
+	thumb_file_id = file_data.get("thumb_file_id","")
+
+	
+	if not file_id:
+		await callback.answer("此菊花已失效", show_alert=True)
+		return
+
+	reader_user_id = int(callback.from_user.id)
+	# print(f"2439 reader_user_id = {reader_user_id}")
+
+	is_admin  = False
+	if reader_user_id in ADMIN_USER_IDS:
+		is_admin = True
+
+	requested_minutes = MEDIA_VIEW_CONSUMPTION_MINUTES
+	user_lock = TAKEOFF_USER_LOCKS.setdefault(reader_user_id, asyncio.Lock())
+
+	chat_id = callback.message.chat.id
+	message_id = callback.message.message_id
+
+	async with user_lock:
+		delivery_key = (reader_user_id, message_id)
+		if (
+			time.monotonic() - PEACH_LAST_DELIVERY_AT.get(delivery_key, 0.0)
+			< PEACH_REDELIVERY_MIN_INTERVAL
+		):
+			await callback.answer("刚刚已发送过，请稍后再试", show_alert=True, cache_time=0)
+			return
+		_prune_delivery_records()
+		now_timestamp = int(app_now().timestamp())
+		user_expire = user_expire_cache.get(reader_user_id)
+		# print(f"now_timestamp=>{now_timestamp}")
+		# print(f"user_expire=>{user_expire}")
+		if not is_admin:
+		
+			if (
+				not user_expire
+				or now_timestamp - user_expire.group_message_timestamp > 24 * 60 * 60
+			):
+
+				await callback.answer(
+					text=(
+						"📢 桃花村广播\n\n"
+						"每日至少发言一次才能采菊。"					
+					),
+					parse_mode="HTML",
+					show_alert=True,
+				)
+
+				return
+
+			available_minutes = max(
+				0,
+				((user_expire.expire_timestamp if user_expire else 0) - now_timestamp) // 60,
+			)
+
+			if available_minutes < requested_minutes:
+						
+				await callback.answer(
+					text=(
+						f"目前你的桃气值不足，无法进行采菊。\n\n"
+						f"你可以选择在桃花村发言 ( 1 分钟可得 1 桃气值 ) 或是分享资源，就可以获得桃气值。"
+					),
+					show_alert=True,
+					cache_time=0,
+				)
+				return
+
+			original_expire_timestamp = user_expire.expire_timestamp
+			if user_expire_cache.consume_minutes(reader_user_id, requested_minutes) is None:
+				await callback.answer("桃气值不足，请重新尝试", show_alert=True, cache_time=0)
+				return
+
+
+		#=========================================================================================
+		requested_human_time = FormatUtils.minutes_to_day_hour(requested_minutes)[0]
+		new_user_expire = user_expire_cache.get(reader_user_id)
+		expire_text = FormatUtils.format_timestamp_utc8(new_user_expire.expire_timestamp)
+		remaining_minutes = max(
+			0,
+			(new_user_expire.expire_timestamp - now_timestamp) // 60,
+		)
+
+		remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
+
+		cover_text = callback.message.text or callback.message.caption
+		cover_text = cover_text.replace('🌼',f'<a href="{url}">🌼</a>')
+		print(f"cover_text=>{cover_text}")
+
+		if act_type == "preview":
+			notify_text = (
+				f"{cover_text}"
+			)
+		else:
+			notify_text = (
+				f"{cover_text}\n\n"
+				f"✅ 采菊成功，消耗 {requested_minutes // HOURLY_CONSUMPTION_MINUTES} 点桃气值。\n"
+				f"🍑 剩余桃气值：{remaining_view_count} / {MAX_HP_CAPACITY_QUANTITY} 点\n"
+				f"🕒 预计耗尽：{expire_text}\n"
+			)
+
+		notify_keyboard_rows: list[list[InlineKeyboardButton]] = []
+
+
+		return_url = f"https://t.me/c/{str(chat_id).lstrip('-100')}/{message_id}"
+
+		notify_keyboard_rows.append([
+			InlineKeyboardButton(
+				text="🔙 返回",
+				url=f"{return_url}",
+			),
+		])
+
+		if act_type == "preview":
+			notify_keyboard_rows.append([
+				InlineKeyboardButton(
+					text="🍑 兑换",
+					callback_data=f"buy:link:{message_id}",
+				),
+			])
+
+		
+		if is_admin:
+			source_chat_id = int(callback.message.chat.id)
+			source_message_id = int(callback.message.message_id)
+			uploader_text = await FormatUtils.get_user_hyperlink(
+				bot,
+				{"id": uploader_id},
+				show_uid=True,
+			)
+			
+			notify_text += f"\n👤 上传者：{uploader_text}"
+			notify_keyboard_rows.extend(
+				_build_takeoff_admin_keyboard(
+					uploader_id,
+					source_chat_id,
+					source_message_id,
+				)
+			)
+
+		if act_type == "buy":
+			# 从点击的 callback 直接复制其 reply_markup 中的按钮组，排除原来的“兑换”按钮
+			source_markup = callback.message.reply_markup
+			if source_markup and getattr(source_markup, "inline_keyboard", None):
+				filtered_rows: list[list[InlineKeyboardButton]] = []
+				for row in source_markup.inline_keyboard:
+					filtered_row = [
+						button for button in row
+						if not (getattr(button, "callback_data", None) or "").startswith("buy:link:")
+					]
+					if filtered_row:
+						filtered_rows.append(filtered_row)
+				notify_markup = (
+					InlineKeyboardMarkup(inline_keyboard=filtered_rows)
+					if filtered_rows
+					else None
+				)
+			else:
+				notify_markup = (
+					InlineKeyboardMarkup(inline_keyboard=notify_keyboard_rows)
+					if notify_keyboard_rows
+					else None
+				)
+		else:
+			notify_markup = (
+				InlineKeyboardMarkup(inline_keyboard=notify_keyboard_rows)
+				if notify_keyboard_rows
+				else None
+			)
+
+		try:
+			if act_type == "preview":
+				if thumb_file_id:
+					await _telegram_call_with_retry(
+						"deliver peach cover (photo)",
+						lambda: bot.send_photo(
+							chat_id = callback.from_user.id,
+							photo =thumb_file_id,
+							parse_mode="HTML",
+							reply_markup=notify_markup,
+							caption=notify_text,
+						),
+						chat_id=callback.from_user.id,
+					)
+					
+				else:	
+					if DEFAULT_COVER_FILE_ID is None:
+						published_message = await _telegram_call_with_retry(
+							"send default cover",
+							lambda: bot.send_photo(
+								chat_id = callback.from_user.id,
+								photo=BufferedInputFile(
+									_get_default_image_bytes(),
+									filename="default_image.jpeg",
+								),
+								reply_markup=notify_markup,
+								caption=notify_text,
+								parse_mode="HTML" if notify_text else None,
+							),
+						)
+						DEFAULT_COVER_FILE_ID = (
+							published_message.photo[-1].file_id
+							if published_message.photo
+							else None
+						)
+					else:
+						published_message = await _telegram_call_with_retry(
+							"send cached default cover",
+							lambda: bot.send_photo(
+								chat_id = callback.from_user.id,
+								photo=DEFAULT_COVER_FILE_ID,
+								reply_markup=notify_markup,
+								caption=notify_text,
+								parse_mode="HTML" if notify_text else None,
+							),
+						)
+
+
+
+				await callback.answer(
+					url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
+					cache_time=0,
+				)
+
+
+			elif act_type == "peach":
+
+				if file_type == "video":
+					await _telegram_call_with_retry(
+						"deliver peach media (video)",
+						lambda: bot.send_video(
+							chat_id = callback.from_user.id,
+							video =file_id,
+							parse_mode="HTML",
+							reply_markup=notify_markup,
+							caption=notify_text,
+						),
+						chat_id=callback.from_user.id,
+					)
+				elif file_type == "document":
+					await _telegram_call_with_retry(
+						"deliver peach media (document)",
+						lambda: bot.send_document(
+							chat_id = callback.from_user.id,
+							document =file_id,
+							parse_mode="HTML",
+							reply_markup=notify_markup,
+							caption=notify_text,
+						),
+						chat_id=callback.from_user.id,
+					)
+
+				remember_peach_exchange_record(message_id, reader_user_id)
+				PEACH_LAST_DELIVERY_AT[delivery_key] = time.monotonic()
+
+				await callback.answer(
+					url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
+					cache_time=0,
+				)
+			elif act_type == "buy":
+				# todo 使用 edit 重新更新媒体, 视 file_type 和 file_id 确定
+				await bot.edit_message_media(
+					media=InputMediaDocument(
+						media=file_id,
+						parse_mode="HTML",
+						caption=notify_text,
+					),
+					reply_markup=notify_markup,
+					chat_id=callback.from_user.id,
+					message_id=message_id,
+				)
+				source_message_id = callback.data.split(":")[-1]
+				remember_peach_exchange_record(source_message_id, reader_user_id)
+				PEACH_LAST_DELIVERY_AT[delivery_key] = time.monotonic()
+
+
+		except TelegramRetryAfter as exc:
+			# 闸门已重试仍被限流：回滚桃气值并明确提示限流，避免用户立刻重试加剧 flood
+			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			print(f"[TAKEOFF] media delivery rate limited: {exc}", flush=True)
+			await callback.answer("⚠️ Telegram 限流中，请稍等几秒再试", show_alert=True, cache_time=0)
+			return
+		except Exception as exc:
+			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			if "Forbidden: bot can't initiate conversation with a user" in str(exc):
+				await callback.answer("🤖 请先和新的桃宝机器人私信对话过一次", show_alert=True, cache_time=0)
+				return
+			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
+			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
+			return
+
+@dp.callback_query(F.data.startswith("backup:peach:link"))
+async def on_backup_peach_link(callback: CallbackQuery) -> None:
 	if not callback.message:
 		await callback.answer("无法获取消息", show_alert=True)
 		return
@@ -1238,6 +1676,7 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 	uploader_id = file_data.get("uploader_id","")
 	file_type = file_data.get("file_type","")
 	file_id = file_data.get("file_id","")
+	thumb_file_id = file_data.get("thumb_file_id","")
 
 	
 	if not file_id:
@@ -1327,9 +1766,12 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 
 		remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
 
+		cover_text = callback.message.text
+		cover_text = cover_text.replace('🌼',f'<a href="{url}">🌼</a>')
+		# print(f"cover_text=>{cover_text}")
 
 		notify_text = (
-			f"{callback.message.text}\n\n"
+			f"{cover_text}\n\n"
 			f"✅ 采菊成功，消耗 {requested_minutes // HOURLY_CONSUMPTION_MINUTES} 点桃气值。\n"
 			f"🍑 剩余桃气值：{remaining_view_count} / {MAX_HP_CAPACITY_QUANTITY} 点\n"
 			f"🕒 预计耗尽：{expire_text}\n"
@@ -1446,8 +1888,8 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 
 # 删除「XXX 置顶了一条消息」服务消息
 @dp.message(
-    F.chat.id.in_({CHAT_SCHOOL_GROUP_ID, CHAT_PUBLIC_GROUP_ID}),
-    F.pinned_message
+	F.chat.id.in_({CHAT_SCHOOL_GROUP_ID, CHAT_PUBLIC_GROUP_ID}),
+	F.pinned_message
 )
 async def delete_pin_service_message(message: Message) -> None:
 	if message.pinned_message:

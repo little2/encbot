@@ -16,6 +16,12 @@ from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
 from utils.user_manager import UserManager
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
+from utils.peach_exchange_store import (
+	remember_peach_exchange_record,
+	has_peach_exchange_for_user,
+	remove_peach_exchange_for_user,
+	bump_alert_button_text,
+)
 from aiogram.exceptions import (
 	TelegramBadRequest,
 	TelegramNetworkError,
@@ -30,7 +36,7 @@ SharedConfig.load(True)
 
 from utils.emoji_utils import EmojiUtils
 
-PEACH_CHANNEL_ID = os.getenv("PEACH_CHANNEL_ID")
+PEACH_CHANNEL_ID = os.getenv("PEACH_CHANNEL_ID",0)
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
@@ -429,6 +435,11 @@ def parse_file_url(url: str) -> dict:
 	file_id = parts[4]
 	return {"file_type": file_type, "uploader_id": uploader_id, "file_id": file_id}
 
+
+
+
+
+
 @dp.message(IntroStates.waiting_intro, F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def on_intro_text(message: Message, state: FSMContext) -> None:
 	if not message.from_user:
@@ -453,32 +464,47 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		return
 	url = encode_file_url(data)
 	
-	await bot.send_message(
+	post_item = await bot.send_message(
 		CHAT_PUBLIC_GROUP_ID,
 		f'<a href="{html.escape(url, quote=True)}">🌼</a> {html.escape(text)}',
 		message_thread_id=CHAT_PUBLIC_THREAD_ID or None,
 		parse_mode=ParseMode.HTML,
 		reply_markup=InlineKeyboardMarkup(
-			inline_keyboard=[[InlineKeyboardButton(text="🍑", callback_data="peach:link")]]
+			inline_keyboard=[[
+				InlineKeyboardButton(text="👍", callback_data="alert:like"),
+				InlineKeyboardButton(text="🍑", callback_data="peach:link"),
+				InlineKeyboardButton(text="👎", callback_data="alert:dislike")
+				]]
 		),
 	)
 
+	# 将 post_item 置顶
+	try:
+		await bot.pin_chat_message(
+			chat_id=CHAT_PUBLIC_GROUP_ID,
+			message_id=post_item.message_id,
+			disable_notification=True,
+		)
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] pin post_item failed: {exc}", flush=True)
+
 
 	try:
-		if data['file_type'] == "video":
-			send_result = await bot.send_video(
-				chat_id = PEACH_CHANNEL_ID,
-				video =data['file_id'],
-				parse_mode="HTML",					
-				caption=f"{html.escape(text)}",
-			)
-		elif data['file_type'] == "document":
-			send_result = await bot.send_document(
-				chat_id = PEACH_CHANNEL_ID,
-				document =data['file_id'],
-				parse_mode="HTML",					
-				caption=f"{html.escape(text)}",
-			)
+		if PEACH_CHANNEL_ID and PEACH_CHANNEL_ID != 0:
+			if data['file_type'] == "video":
+				send_result = await bot.send_video(
+					chat_id = PEACH_CHANNEL_ID,
+					video =data['file_id'],
+					parse_mode="HTML",					
+					caption=f"{html.escape(text)}",
+				)
+			elif data['file_type'] == "document":
+				send_result = await bot.send_document(
+					chat_id = PEACH_CHANNEL_ID,
+					document =data['file_id'],
+					parse_mode="HTML",					
+					caption=f"{html.escape(text)}",
+				)
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] send to PEACH_CHANNEL failed: {exc}", flush=True)
 
@@ -543,6 +569,8 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		)
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] membership reward failed: {exc}", flush=True)
+
+
 
 
 	
@@ -1044,6 +1072,84 @@ async def on_takeoff_ban(callback: CallbackQuery) -> None:
 
 
 
+
+
+
+@dp.callback_query(F.data.startswith(("alert:like", "alert:dislike")))
+async def on_alert_dislike(callback: CallbackQuery) -> None:
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	reply_markup = callback.message.reply_markup
+	if not reply_markup or not getattr(reply_markup, "inline_keyboard", None):
+		await callback.answer("没有可更新的按钮组", show_alert=True)
+		return
+
+	if not has_peach_exchange_for_user(int(callback.from_user.id), int(callback.message.message_id)):
+		await callback.answer("只有在兑换后的三分钟内可以 👍 或 👎", show_alert=True)
+		return
+
+
+	updated_rows: list[list[InlineKeyboardButton]] = []
+	updated = False
+	for row in reply_markup.inline_keyboard:
+		new_row: list[InlineKeyboardButton] = []
+		for button in row:
+			button_callback = getattr(button, "callback_data", None)
+			if button_callback == callback.data:
+				not_updated = False
+				new_text = bump_alert_button_text(button.text, button_callback)
+				button = InlineKeyboardButton(
+					text=new_text,
+					callback_data=button_callback,
+					url=button.url,
+					web_app=button.web_app,
+					login_url=button.login_url,
+					switch_inline_query=button.switch_inline_query,
+					switch_inline_query_current_chat=button.switch_inline_query_current_chat,
+					switch_inline_query_chosen_chat=button.switch_inline_query_chosen_chat,
+					copy_text=button.copy_text,
+					callback_game=button.callback_game,
+					pay=button.pay,
+				)
+				updated = True
+			new_row.append(button)
+		updated_rows.append(new_row)
+
+	if not updated:
+		await callback.answer("未找到可更新的按钮", show_alert=True)
+		return
+
+	try:
+		await callback.message.edit_reply_markup(
+			reply_markup=InlineKeyboardMarkup(inline_keyboard=updated_rows)
+		)
+		remove_peach_exchange_for_user(int(callback.from_user.id), int(callback.message.message_id))
+	except Exception:
+		await callback.answer("更新按钮状态失败", show_alert=True)
+		return
+
+	await callback.answer("已更新", show_alert=False)
+	return
+
+
+@dp.callback_query(F.data.startswith(("click:like", "click:dislike")))
+async def on_click_dislike(callback: CallbackQuery) -> None:
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	user_id = int(callback.from_user.id)
+	message_id = int(callback.message.message_id)
+	if has_peach_exchange_for_user(user_id, message_id):
+		remove_peach_exchange_for_user(user_id, message_id)
+		await callback.answer("有值", show_alert=True)
+		return
+
+	await callback.answer("没有值", show_alert=True)
+	return
+
 @dp.callback_query(F.data.startswith("peach:link"))
 async def on_peach_link(callback: CallbackQuery) -> None:
 	if not callback.message:
@@ -1051,7 +1157,7 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 		return
 	message = callback.message
 
-	print(f"{callback.message.text}")
+	# print(f"{callback.message.text}")
 
 	if not message:
 		await callback.answer("无法获取消息", show_alert=True)
@@ -1169,6 +1275,17 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 			),
 		])
 
+		# notify_keyboard_rows.append([
+		# 	InlineKeyboardButton(
+		# 		text="👍",
+		# 		callback_data=f"click:like:{message_id}",
+		# 	),
+		# 	InlineKeyboardButton(
+		# 		text="👎",
+		# 		callback_data=f"click:dislike:{message_id}",
+		# 	),
+		# ])
+
 		if is_admin:
 			source_chat_id = int(callback.message.chat.id)
 			source_message_id = int(callback.message.message_id)
@@ -1223,6 +1340,8 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 			# 	MEDIA_VIEW_CONSUMPTION_MINUTES,
 			# )
 
+			remember_peach_exchange_record(message_id, reader_user_id)
+
 			await callback.answer(
 				url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
 				cache_time=0,
@@ -1236,8 +1355,22 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 			return
 
 
+
+# 删除「XXX 置顶了一条消息」服务消息
+@dp.message(
+    F.chat.id.in_({CHAT_SCHOOL_GROUP_ID, CHAT_PUBLIC_GROUP_ID}),
+    F.pinned_message
+)
+async def delete_pin_service_message(message: Message) -> None:
+	if message.pinned_message:
+		await message.delete()
+		return
+	
+
 @dp.message(F.chat.id.in_({CHAT_SCHOOL_GROUP_ID, CHAT_PUBLIC_GROUP_ID}), F.text)
 async def on_reward_group_message(message: Message) -> None:
+
+	
 	if not message.from_user or message.from_user.is_bot:
 		return
 	text = (message.text or "").strip()

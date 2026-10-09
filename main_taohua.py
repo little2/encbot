@@ -2038,7 +2038,8 @@ async def get_user_status(from_user_id):
 		f"🍑 桃气值：{available_view_count} / {MAX_HP_CAPACITY_QUANTITY} \n"
 		f"{hp_bar}\n\n"
 		f"⏳ 可维持：{FormatUtils.format_duration(remaining_seconds)}\n"
-		f"🕒 预计耗尽：{expire_text}"
+		f"🕒 预计耗尽：{expire_text}\n",
+		f"🎈 桃气值不足不能采菊，但不会被逐出桃花村",
 		
 	)
 	return status_text
@@ -2267,7 +2268,7 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 				"状态：✅ 有效",
 				f"剩余时限：{FormatUtils.format_duration(remaining_seconds)}",
 				f"目前可请求：{available_view_count} 个资源\n",
-				f"🎈 桃气值不足不能采菊，但不会被逐出桃花村",
+				
 			])
 		else:
 			lines.extend([

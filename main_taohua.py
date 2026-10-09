@@ -1447,7 +1447,7 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 
 		cover_text = callback.message.text or callback.message.caption
 		cover_text = cover_text.replace('🌼',f'<a href="{url}">🌼</a>')
-		print(f"cover_text=>{cover_text}")
+		# print(f"cover_text=>{cover_text}")
 
 		if act_type == "preview":
 			notify_text = (

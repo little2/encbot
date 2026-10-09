@@ -185,7 +185,7 @@ def _extract_media_dict(message: Message) -> dict:
 	file_id = None
 	file_name = None
 
-	print(f"Extracting media from message: {message}")
+	# print(f"Extracting media from message: {message}")
 	
 	if message.video:
 		file_type = "video"
@@ -582,11 +582,11 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			chat_id=from_user_id,
 		)
 
-		print(
-			f"[ENCODED_FORWARD] granted {actual_added_minutes}/{requested_minutes} "
-			f"minutes to user {from_user_id}",
-			flush=True,
-		)
+		# print(
+		# 	f"[ENCODED_FORWARD] granted {actual_added_minutes}/{requested_minutes} "
+		# 	f"minutes to user {from_user_id}",
+		# 	flush=True,
+		# )
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] membership reward failed: {exc}", flush=True)
 
@@ -1435,6 +1435,9 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 			return
 		except Exception as exc:
 			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			if "Forbidden: bot can't initiate conversation with a user" in str(exc):
+				await callback.answer("🤖 请先和新的桃宝机器人私信对话过一次", show_alert=True, cache_time=0)
+				return
 			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
 			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
 			return

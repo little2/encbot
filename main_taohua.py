@@ -3,6 +3,7 @@ import asyncio
 import html
 import os
 import re
+import time
 
 from aiogram import Dispatcher, Bot, F
 from aiogram.enums import ParseMode
@@ -11,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, CallbackQuery, ChatJoinRequest, CopyTextButton, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.types import ReplyKeyboardRemove
+from aiogram.types import ErrorEvent
 
 from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
@@ -106,50 +108,11 @@ dp = Dispatcher()
 
 
 
-ENCODED_FORWARD_SEND_LOCK = asyncio.Lock()
 INACTIVE_CLEANUP_LOCK = asyncio.Lock()
-async def _telegram_call_with_retry(
-	label: str,
-	operation,
-	max_attempts: int = 4,
-	on_retry=None,
-):
-	async with ENCODED_FORWARD_SEND_LOCK:
-		for attempt in range(max_attempts):
-			try:
-				return await operation()
-			except TelegramRetryAfter as exc:
-				if attempt + 1 >= max_attempts:
-					raise
 
-				delay = max(1, int(exc.retry_after)) + 1
-				print(
-					f"[TELEGRAM_RATE_LIMIT] {label}: "
-					f"retry in {delay}s ({attempt + 1}/{max_attempts})",
-					flush=True,
-				)
-				if on_retry is not None:
-					try:
-						await on_retry(attempt + 1, max_attempts, delay, exc)
-					except Exception as callback_exc:
-						print(f"[TELEGRAM_RETRY_STATUS] {label}: {callback_exc}", flush=True)
-				await asyncio.sleep(delay)
-			except TelegramNetworkError as exc:
-				if attempt + 1 >= max_attempts:
-					raise
-
-				delay = min(2 ** (attempt + 1), 10)
-				print(
-					f"[TELEGRAM_NETWORK] {label}: {exc}; "
-					f"retry in {delay}s ({attempt + 1}/{max_attempts})",
-					flush=True,
-				)
-				if on_retry is not None:
-					try:
-						await on_retry(attempt + 1, max_attempts, delay, exc)
-					except Exception as callback_exc:
-						print(f"[TELEGRAM_RETRY_STATUS] {label}: {callback_exc}", flush=True)
-				await asyncio.sleep(delay)
+# Telegram 出站调用统一走 utils/telegram_gate：
+# 全局并发上限 + 按 chat 限速 + 收到 429 只对当前 chat 冷却，避免一次限流拖死整个 bot。
+from utils.telegram_gate import telegram_call as _telegram_call_with_retry
 
 
 volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
@@ -198,13 +161,17 @@ class IntroStates(StatesGroup):
 
 async def _ask_intro(message: Message, state: FSMContext, text: str) -> None:
 	"""发送强制回复提示，并把它记录为当前要回复的消息。"""
-	prompt = await message.reply(
-		text,
-		parse_mode=ParseMode.HTML,
-		reply_markup=ForceReply(
-			force_reply=True,
-			input_field_placeholder=f"输入介绍内容（{INTRO_MIN_LEN}~{INTRO_MAX_LEN} 字）",
+	prompt = await _telegram_call_with_retry(
+		"send intro prompt",
+		lambda: message.reply(
+			text,
+			parse_mode=ParseMode.HTML,
+			reply_markup=ForceReply(
+				force_reply=True,
+				input_field_placeholder=f"输入介绍内容（{INTRO_MIN_LEN}~{INTRO_MAX_LEN} 字）",
+			),
 		),
+		chat_id=message.chat.id,
 	)
 	await state.update_data(prompt_message_id=prompt.message_id)
 
@@ -397,21 +364,24 @@ async def on_media(message: Message, state: FSMContext) -> None:
 
 
 
-		await bot.send_message(
-			message.chat.id,
-			f"<a href=\"https://t.me/{bot_name}?text={html.escape(chinese_name)}\">{html.escape(chinese_name)}</a>\n\n",
-			parse_mode="HTML",
-			reply_markup=InlineKeyboardMarkup(
-				inline_keyboard=[
-					[
-						InlineKeyboardButton(
-							text="📋 复制",
-							copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}")
-							
-						)
+		await _telegram_call_with_retry(
+			"send intro copy button",
+			lambda: bot.send_message(
+				message.chat.id,
+				f"<a href=\"https://t.me/{bot_name}?text={html.escape(chinese_name)}\">{html.escape(chinese_name)}</a>\n\n",
+				parse_mode="HTML",
+				reply_markup=InlineKeyboardMarkup(
+					inline_keyboard=[
+						[
+							InlineKeyboardButton(
+								text="📋 复制",
+								copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}"),
+							)
+						]
 					]
-				]
-			)
+				),
+			),
+			chat_id=message.chat.id,
 		)
 
 		lines.append(
@@ -440,6 +410,34 @@ def parse_file_url(url: str) -> dict:
 
 
 
+# 置顶节流：同一群组在间隔内只置顶一次，减少 pin/服务消息带来的 API 调用量
+PIN_MIN_INTERVAL_SECONDS = 60.0
+LAST_INTRO_PIN_AT: dict[int, float] = {}
+
+
+async def _pin_intro_post(message_id: int) -> None:
+	"""置顶投稿；同一群组在 PIN_MIN_INTERVAL_SECONDS 内只置顶一次。"""
+	now = time.monotonic()
+	last = LAST_INTRO_PIN_AT.get(CHAT_PUBLIC_GROUP_ID, 0.0)
+	if now - last < PIN_MIN_INTERVAL_SECONDS:
+		return
+	# 先占位再发请求，避免并发投稿同时通过检查
+	LAST_INTRO_PIN_AT[CHAT_PUBLIC_GROUP_ID] = now
+	try:
+		await _telegram_call_with_retry(
+			"pin intro post",
+			lambda: bot.pin_chat_message(
+				chat_id=CHAT_PUBLIC_GROUP_ID,
+				message_id=message_id,
+				disable_notification=True,
+			),
+			chat_id=CHAT_PUBLIC_GROUP_ID,
+			kind="edit",
+		)
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] pin post_item failed: {exc}", flush=True)
+
+
 @dp.message(IntroStates.waiting_intro, F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def on_intro_text(message: Message, state: FSMContext) -> None:
 	if not message.from_user:
@@ -464,46 +462,65 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		return
 	url = encode_file_url(data)
 	
-	post_item = await bot.send_message(
-		CHAT_PUBLIC_GROUP_ID,
-		f'<a href="{html.escape(url, quote=True)}">🌼</a> {html.escape(text)}',
-		message_thread_id=CHAT_PUBLIC_THREAD_ID or None,
-		parse_mode=ParseMode.HTML,
-		reply_markup=InlineKeyboardMarkup(
-			inline_keyboard=[[
-				InlineKeyboardButton(text="👍", callback_data="alert:like"),
-				InlineKeyboardButton(text="🍑", callback_data="peach:link"),
-				InlineKeyboardButton(text="👎", callback_data="alert:dislike")
-				]]
-		),
-	)
-
-	# 将 post_item 置顶
 	try:
-		await bot.pin_chat_message(
+		post_item = await _telegram_call_with_retry(
+			"publish intro post",
+			lambda: bot.send_message(
+				CHAT_PUBLIC_GROUP_ID,
+				f'<a href="{html.escape(url, quote=True)}">🌼</a> {html.escape(text)}',
+				message_thread_id=CHAT_PUBLIC_THREAD_ID or None,
+				parse_mode=ParseMode.HTML,
+				reply_markup=InlineKeyboardMarkup(
+					inline_keyboard=[[
+						InlineKeyboardButton(text="👍", callback_data="alert:like"),
+						InlineKeyboardButton(text="🍑", callback_data="peach:link"),
+						InlineKeyboardButton(text="👎", callback_data="alert:dislike")
+						]]
+				),
+			),
 			chat_id=CHAT_PUBLIC_GROUP_ID,
-			message_id=post_item.message_id,
-			disable_notification=True,
 		)
 	except Exception as exc:
-		print(f"[ENCODED_FORWARD] pin post_item failed: {exc}", flush=True)
+		# 发布失败（含限流）：清理 FSM 状态并提示重试，避免用户卡在介绍流程
+		print(f"[ENCODED_FORWARD] publish intro post failed: {exc}", flush=True)
+		await state.clear()
+		try:
+			await _telegram_call_with_retry(
+				"notify intro publish failure",
+				lambda: message.reply("❌ 发布失败（网络或 Telegram 限流），请稍后再试一次。"),
+				chat_id=message.chat.id,
+			)
+		except Exception as reply_exc:
+			print(f"[ENCODED_FORWARD] notify publish failure failed: {reply_exc}", flush=True)
+		return
+
+	# 将 post_item 置顶（带节流，见 _pin_intro_post）
+	await _pin_intro_post(post_item.message_id)
 
 
 	try:
 		if PEACH_CHANNEL_ID and PEACH_CHANNEL_ID != 0:
 			if data['file_type'] == "video":
-				send_result = await bot.send_video(
-					chat_id = PEACH_CHANNEL_ID,
-					video =data['file_id'],
-					parse_mode="HTML",					
-					caption=f"{html.escape(text)}",
+				await _telegram_call_with_retry(
+					"forward intro video to peach channel",
+					lambda: bot.send_video(
+						chat_id = PEACH_CHANNEL_ID,
+						video =data['file_id'],
+						parse_mode="HTML",
+						caption=f"{html.escape(text)}",
+					),
+					chat_id=PEACH_CHANNEL_ID,
 				)
 			elif data['file_type'] == "document":
-				send_result = await bot.send_document(
-					chat_id = PEACH_CHANNEL_ID,
-					document =data['file_id'],
-					parse_mode="HTML",					
-					caption=f"{html.escape(text)}",
+				await _telegram_call_with_retry(
+					"forward intro document to peach channel",
+					lambda: bot.send_document(
+						chat_id = PEACH_CHANNEL_ID,
+						document =data['file_id'],
+						parse_mode="HTML",
+						caption=f"{html.escape(text)}",
+					),
+					chat_id=PEACH_CHANNEL_ID,
 				)
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] send to PEACH_CHANNEL failed: {exc}", flush=True)
@@ -554,12 +571,15 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 
 
 		
-		await bot.send_message(
+		await _telegram_call_with_retry(
+			"notify upload reward",
+			lambda: bot.send_message(
+				chat_id=from_user_id,
+				text=notify_text,
+				parse_mode="HTML",
+				reply_markup=ReplyKeyboardRemove(),
+			),
 			chat_id=from_user_id,
-			text=notify_text,
-			parse_mode="HTML",
-			reply_markup=ReplyKeyboardRemove()
-			
 		)
 
 		print(
@@ -933,9 +953,14 @@ async def on_takeoff_admin_blacklist(callback: CallbackQuery) -> None:
 	)
 	delete_error = ""
 	try:
-		await bot.delete_message(
+		await _telegram_call_with_retry(
+			"delete source message (ban)",
+			lambda: bot.delete_message(
+				chat_id=source_chat_id,
+				message_id=source_message_id,
+			),
 			chat_id=source_chat_id,
-			message_id=source_message_id,
+			kind="delete",
 		)
 	except Exception as exc:
 		delete_error = str(exc)
@@ -994,9 +1019,14 @@ async def on_takeoff_admin_delete(callback: CallbackQuery) -> None:
 	source_chat_id = int(source_chat_text)
 
 	try:
-		await bot.delete_message(
+		await _telegram_call_with_retry(
+			"delete source message (admin)",
+			lambda: bot.delete_message(
+				chat_id=source_chat_id,
+				message_id=source_message_id,
+			),
 			chat_id=source_chat_id,
-			message_id=source_message_id,
+			kind="delete",
 		)
 	except Exception as exc:
 		print(
@@ -1045,7 +1075,12 @@ async def on_takeoff_ban(callback: CallbackQuery) -> None:
 			return
 
 		try:
-			await callback.message.delete()
+			await _telegram_call_with_retry(
+				"delete takeoff message",
+				lambda: callback.message.delete(),
+				chat_id=callback.message.chat.id,
+				kind="delete",
+			)
 		except Exception as delete_exc:
 			print(f"[TAKEOFF_BAN] delete failed: {delete_exc}", flush=True)
 			try:
@@ -1075,6 +1110,10 @@ async def on_takeoff_ban(callback: CallbackQuery) -> None:
 
 
 
+# 同一条群消息的 👍/👎 编辑锁：防止并发双击造成重复编辑与重复计数
+ALERT_EDIT_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+
+
 @dp.callback_query(F.data.startswith(("alert:like", "alert:dislike")))
 async def on_alert_dislike(callback: CallbackQuery) -> None:
 	if not callback.message:
@@ -1086,52 +1125,62 @@ async def on_alert_dislike(callback: CallbackQuery) -> None:
 		await callback.answer("没有可更新的按钮组", show_alert=True)
 		return
 
-	if not has_peach_exchange_for_user(int(callback.from_user.id), int(callback.message.message_id)):
-		await callback.answer("只有在兑换后的三分钟内可以 👍 或 👎", show_alert=True)
+	chat_id = int(callback.message.chat.id)
+	message_id = int(callback.message.message_id)
+	user_id = int(callback.from_user.id)
+	edit_lock = ALERT_EDIT_LOCKS.setdefault((chat_id, message_id), asyncio.Lock())
+	async with edit_lock:
+		if not has_peach_exchange_for_user(user_id, message_id):
+			await callback.answer("只有在兑换后的三分钟内可以 👍 或 👎", show_alert=True)
+			return
+
+		updated_rows: list[list[InlineKeyboardButton]] = []
+		updated = False
+		for row in reply_markup.inline_keyboard:
+			new_row: list[InlineKeyboardButton] = []
+			for button in row:
+				button_callback = getattr(button, "callback_data", None)
+				if button_callback == callback.data:
+					new_text = bump_alert_button_text(button.text, button_callback)
+					button = InlineKeyboardButton(
+						text=new_text,
+						callback_data=button_callback,
+						url=button.url,
+						web_app=button.web_app,
+						login_url=button.login_url,
+						switch_inline_query=button.switch_inline_query,
+						switch_inline_query_current_chat=button.switch_inline_query_current_chat,
+						switch_inline_query_chosen_chat=button.switch_inline_query_chosen_chat,
+						copy_text=button.copy_text,
+						callback_game=button.callback_game,
+						pay=button.pay,
+					)
+					updated = True
+				new_row.append(button)
+			updated_rows.append(new_row)
+
+		if not updated:
+			await callback.answer("未找到可更新的按钮", show_alert=True)
+			return
+
+		try:
+			await _telegram_call_with_retry(
+				"update alert button",
+				lambda: bot.edit_message_reply_markup(
+					chat_id=chat_id,
+					message_id=message_id,
+					reply_markup=InlineKeyboardMarkup(inline_keyboard=updated_rows),
+				),
+				chat_id=chat_id,
+				kind="edit",
+			)
+			remove_peach_exchange_for_user(user_id, message_id)
+		except Exception:
+			await callback.answer("更新按钮状态失败", show_alert=True)
+			return
+
+		await callback.answer("已更新", show_alert=False)
 		return
-
-
-	updated_rows: list[list[InlineKeyboardButton]] = []
-	updated = False
-	for row in reply_markup.inline_keyboard:
-		new_row: list[InlineKeyboardButton] = []
-		for button in row:
-			button_callback = getattr(button, "callback_data", None)
-			if button_callback == callback.data:
-				not_updated = False
-				new_text = bump_alert_button_text(button.text, button_callback)
-				button = InlineKeyboardButton(
-					text=new_text,
-					callback_data=button_callback,
-					url=button.url,
-					web_app=button.web_app,
-					login_url=button.login_url,
-					switch_inline_query=button.switch_inline_query,
-					switch_inline_query_current_chat=button.switch_inline_query_current_chat,
-					switch_inline_query_chosen_chat=button.switch_inline_query_chosen_chat,
-					copy_text=button.copy_text,
-					callback_game=button.callback_game,
-					pay=button.pay,
-				)
-				updated = True
-			new_row.append(button)
-		updated_rows.append(new_row)
-
-	if not updated:
-		await callback.answer("未找到可更新的按钮", show_alert=True)
-		return
-
-	try:
-		await callback.message.edit_reply_markup(
-			reply_markup=InlineKeyboardMarkup(inline_keyboard=updated_rows)
-		)
-		remove_peach_exchange_for_user(int(callback.from_user.id), int(callback.message.message_id))
-	except Exception:
-		await callback.answer("更新按钮状态失败", show_alert=True)
-		return
-
-	await callback.answer("已更新", show_alert=False)
-	return
 
 
 @dp.callback_query(F.data.startswith(("click:like", "click:dislike")))
@@ -1149,6 +1198,20 @@ async def on_click_dislike(callback: CallbackQuery) -> None:
 
 	await callback.answer("没有值", show_alert=True)
 	return
+
+# 采菊投递节流：同一用户对同一条消息在间隔内只投递一次，防止连点重复发送
+PEACH_REDELIVERY_MIN_INTERVAL = 10.0
+PEACH_LAST_DELIVERY_AT: dict[tuple[int, int], float] = {}
+
+
+def _prune_delivery_records() -> None:
+	if len(PEACH_LAST_DELIVERY_AT) < 512:
+		return
+	cutoff = time.monotonic() - PEACH_REDELIVERY_MIN_INTERVAL
+	for key, stamp in list(PEACH_LAST_DELIVERY_AT.items()):
+		if stamp < cutoff:
+			PEACH_LAST_DELIVERY_AT.pop(key, None)
+
 
 @dp.callback_query(F.data.startswith("peach:link"))
 async def on_peach_link(callback: CallbackQuery) -> None:
@@ -1200,6 +1263,14 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 	message_id = callback.message.message_id
 
 	async with user_lock:
+		delivery_key = (reader_user_id, message_id)
+		if (
+			time.monotonic() - PEACH_LAST_DELIVERY_AT.get(delivery_key, 0.0)
+			< PEACH_REDELIVERY_MIN_INTERVAL
+		):
+			await callback.answer("刚刚已发送过，请稍后再试", show_alert=True, cache_time=0)
+			return
+		_prune_delivery_records()
 		now_timestamp = int(app_now().timestamp())
 		user_expire = user_expire_cache.get(reader_user_id)
 		# print(f"now_timestamp=>{now_timestamp}")
@@ -1311,22 +1382,29 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 
 
 		try:
-			
 			if file_type == "video":
-				send_result = await bot.send_video(
-					chat_id = callback.from_user.id,
-					video =file_id,
-					parse_mode="HTML",					
-					reply_markup=notify_markup,
-					caption=notify_text,
+				await _telegram_call_with_retry(
+					"deliver peach media (video)",
+					lambda: bot.send_video(
+						chat_id = callback.from_user.id,
+						video =file_id,
+						parse_mode="HTML",
+						reply_markup=notify_markup,
+						caption=notify_text,
+					),
+					chat_id=callback.from_user.id,
 				)
 			elif file_type == "document":
-				send_result = await bot.send_document(
-					chat_id = callback.from_user.id,
-					document =file_id,
-					parse_mode="HTML",					
-					reply_markup=notify_markup,
-					caption=notify_text,
+				await _telegram_call_with_retry(
+					"deliver peach media (document)",
+					lambda: bot.send_document(
+						chat_id = callback.from_user.id,
+						document =file_id,
+						parse_mode="HTML",
+						reply_markup=notify_markup,
+						caption=notify_text,
+					),
+					chat_id=callback.from_user.id,
 				)
 
 			# print(f"send_result: {send_result}")
@@ -1341,6 +1419,7 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 			# )
 
 			remember_peach_exchange_record(message_id, reader_user_id)
+			PEACH_LAST_DELIVERY_AT[delivery_key] = time.monotonic()
 
 			await callback.answer(
 				url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
@@ -1348,6 +1427,12 @@ async def on_peach_link(callback: CallbackQuery) -> None:
 			)
 
 
+		except TelegramRetryAfter as exc:
+			# 闸门已重试仍被限流：回滚桃气值并明确提示限流，避免用户立刻重试加剧 flood
+			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			print(f"[TAKEOFF] media delivery rate limited: {exc}", flush=True)
+			await callback.answer("⚠️ Telegram 限流中，请稍等几秒再试", show_alert=True, cache_time=0)
+			return
 		except Exception as exc:
 			user_expire_cache.update(reader_user_id, original_expire_timestamp)
 			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
@@ -1423,7 +1508,15 @@ async def on_join_request(join_request: ChatJoinRequest) -> None:
 		if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 
 			text = f"🚧 为避免坏份子混入桃花村，入村前请先交一份「投名状」——传送一份正太资源（文件或视频）给我，确认你我是否是同路人。\n\n📤 传送完成后，再重新申请加入群组。\n\n🍑 确认是同路人，方可入村。"
-			await bot.send_message(chat_id=join_request.from_user.id, text=text)
+			try:
+				await _telegram_call_with_retry(
+					"join request notice dm",
+					lambda: bot.send_message(chat_id=join_request.from_user.id, text=text),
+					chat_id=join_request.from_user.id,
+				)
+			except Exception as exc:
+				# DM 失败（含限流）不阻断拒绝流程，避免申请悬挂
+				print(f"[JOIN_REQUEST] dm failed for {join_request.from_user.id}: {exc}", flush=True)
 			await join_request.decline()
 
 			return
@@ -1763,6 +1856,51 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 		])
 
 	await message.reply("\n".join(lines))
+
+# 常见良性 BadRequest：重复编辑同一内容、查询过期、消息已不存在等，静默处理即可
+BENIGN_BAD_REQUEST_MARKERS = (
+	"message is not modified",
+	"query is too old",
+	"message can't be deleted",
+	"message to delete not found",
+	"message not found",
+	"message_id_invalid",
+)
+
+
+@dp.errors()
+async def on_telegram_error(event: ErrorEvent) -> None:
+	"""全局错误兜底：限流提示、良性错误静默，并保证 callback 不悬空（按钮不转圈）。"""
+	exception = event.exception
+	update = event.update
+	callback = update.callback_query if update else None
+
+	if isinstance(exception, TelegramRetryAfter):
+		retry_after = int(getattr(exception, "retry_after", 0) or 0)
+		print(
+			f"[TELEGRAM_RATE_LIMIT] unhandled flood error, "
+			f"retry_after={retry_after}s: {exception}",
+			flush=True,
+		)
+		if callback is not None:
+			try:
+				await callback.answer("⚠️ 操作太频繁，请稍后再试", show_alert=True, cache_time=0)
+			except Exception:
+				pass
+		return
+
+	if isinstance(exception, TelegramBadRequest):
+		error_text = str(exception).lower()
+		if any(marker in error_text for marker in BENIGN_BAD_REQUEST_MARKERS):
+			return
+
+	print(f"[TG_UPDATE_ERROR] {type(exception).__name__}: {exception}", flush=True)
+	if callback is not None:
+		try:
+			await callback.answer("❌ 操作失败，请稍后重试", show_alert=True, cache_time=0)
+		except Exception:
+			pass
+
 
 async def main() -> None:
 	global bot_name

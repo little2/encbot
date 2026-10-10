@@ -203,6 +203,7 @@ batch_view_store = BatchViewStore(db_path=user_expire_db_path)
 received_media_store = ReceivedMediaStore(db_path=user_expire_db_path)
 shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
 
+from utils.telegram_gate import telegram_call as _telegram_call_with_retry
 
 from textwrap import dedent
 

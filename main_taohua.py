@@ -508,6 +508,10 @@ async def _pin_intro_post(message_id: int) -> None:
 async def on_intro_text(message: Message, state: FSMContext) -> None:
 	if not message.from_user:
 		return
+	if blacklist_store.is_blocked(int(message.from_user.id)):
+		print("黑名单用户 {message.from_user.id}", flush=True)
+		return
+
 	text = (message.text or "").strip()
 
 	data = await state.get_data()

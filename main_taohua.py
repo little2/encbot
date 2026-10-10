@@ -2072,29 +2072,29 @@ async def cmd_show_candidate(message: Message, command: CommandObject) -> None:
 		await message.reply("目前没有未逾期的用户")
 		return
 
-	for user_id, user_expire in active_candidates:
-		print(f"{user_id}: {user_expire}")
-		remaining_seconds = user_expire.expire_timestamp - now_timestamp
-		now_timestamp = int(app_now().timestamp())
-		new_expire_timestamp  = user_expire.expire_timestamp + remaining_seconds
-		user_expire_cache.update(
-			user_id,
-			new_expire_timestamp,
-			group_message_timestamp=now_timestamp,
-		)
+	# for user_id, user_expire in active_candidates:
+	# 	print(f"{user_id}: {user_expire}")
+	# 	remaining_seconds = user_expire.expire_timestamp - now_timestamp
+	# 	now_timestamp = int(app_now().timestamp())
+	# 	new_expire_timestamp  = user_expire.expire_timestamp + remaining_seconds
+	# 	user_expire_cache.update(
+	# 		user_id,
+	# 		new_expire_timestamp,
+	# 		group_message_timestamp=now_timestamp,
+	# 	)
 
 		
 
-		try:
-			val = remaining_seconds // (60*60)
-			await bot.send_message(
-				user_id,
-				f"{val} 小时后，您的机器人将不再可用。请及时充值。",
-			)
-		except Exception:
-			pass
+	# 	try:
+	# 		val = remaining_seconds // (60*60)
+	# 		await bot.send_message(
+	# 			user_id,
+	# 			f"{val} 感谢。",
+	# 		)
+	# 	except Exception:
+	# 		pass
 
-		await asyncio.sleep(0.3)
+	# 	await asyncio.sleep(0.3)
 
 
 

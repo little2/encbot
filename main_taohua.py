@@ -105,16 +105,16 @@ from functools import lru_cache
 from pathlib import Path
 
 DEFAULT_IMAGE_PATHS = (
-    Path(__file__).resolve().parent / "default_image.jpeg",
+	Path(__file__).resolve().parent / "default_image.jpeg",
 )
 
 _WHITE_JPEG_BASE64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
-    "//////////////////////////////////////////////////////////////////////////////////////////////"
-    "//////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////"
-    "//////////////////////////////////////////////////////////////////////////////////////////////"
-    "//////////////wAARCAAQABADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAA"
-    "AAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AMf/AP/Z"
+	"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
+	"//////////////////////////////////////////////////////////////////////////////////////////////"
+	"//////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////"
+	"//////////////////////////////////////////////////////////////////////////////////////////////"
+	"//////////////wAARCAAQABADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAA"
+	"AAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AMf/AP/Z"
 )
 
 _WHITE_JPEG_BYTES = base64.b64decode(_WHITE_JPEG_BASE64)
@@ -122,13 +122,13 @@ _WHITE_JPEG_BYTES = base64.b64decode(_WHITE_JPEG_BASE64)
 
 @lru_cache(maxsize=1)
 def _get_default_image_bytes() -> bytes:
-    image_path = DEFAULT_IMAGE_PATHS[0]
+	image_path = DEFAULT_IMAGE_PATHS[0]
 
-    if image_path.is_file():
-        return image_path.read_bytes()
+	if image_path.is_file():
+		return image_path.read_bytes()
 
-    image_path.write_bytes(_WHITE_JPEG_BYTES)
-    return _WHITE_JPEG_BYTES
+	image_path.write_bytes(_WHITE_JPEG_BYTES)
+	return _WHITE_JPEG_BYTES
 
 if not BOT_TOKEN:
 	raise RuntimeError("Missing bot token. Please set ENCBOT_TOKEN or BOT_TOKEN.")
@@ -2013,7 +2013,7 @@ def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
 	user_expire = user_expire_cache.get(user_id)
 	return bool(
 		user_expire
-		and user_expire.expire_timestamp <= _inactive_cutoff_timestamp(now_timestamp)
+		and user_expire.expire_timestamp >= _inactive_cutoff_timestamp(now_timestamp)
 	)
 
 def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]:
@@ -2031,6 +2031,103 @@ def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]
 Command
 '''
 
+@dp.message(Command("show_candidate"))
+async def cmd_show_candidate(message: Message, command: CommandObject) -> None:
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		return
+
+	page_text = str(command.args or "").strip()
+	page = ParseUtils._parse_positive_user_id(page_text) if page_text else 1
+	if page is None:
+		await message.reply("用法：/show_candidate [页码]")
+		return
+
+	now_timestamp = int(app_now().timestamp())
+	# 获取所有未逾期的用户（排除管理员和黑名单用户）
+	active_candidates = []
+	bot_user_id = int(getattr(bot, "id", 0) or 0)
+	
+	for user_id, user_expire in list(user_expire_cache.users.items()):
+		# 跳过管理员
+		if user_id in ADMIN_USER_IDS:
+			continue
+		# 跳过黑名单用户
+		if blacklist_store.is_blocked(user_id):
+			continue
+		# 跳过 bot 自己
+		if bot_user_id and user_id == bot_user_id:
+			continue
+		# 只包含未逾期的用户
+		if user_expire and user_expire.expire_timestamp > now_timestamp:
+			active_candidates.append((user_id, user_expire))
+	
+	# 按过期时间排序（从早到晚）
+	active_candidates = sorted(
+		active_candidates,
+		key=lambda item: (item[1].expire_timestamp, item[0]),
+		reverse=True,
+	)
+	
+	if not active_candidates:
+		await message.reply("目前没有未逾期的用户")
+		return
+
+	for user_id, user_expire in active_candidates:
+		print(f"{user_id}: {user_expire}")
+		remaining_seconds = user_expire.expire_timestamp - now_timestamp
+		now_timestamp = int(app_now().timestamp())
+		new_expire_timestamp  = user_expire.expire_timestamp + remaining_seconds
+		user_expire_cache.update(
+			user_id,
+			new_expire_timestamp,
+			group_message_timestamp=now_timestamp,
+		)
+
+		
+
+		try:
+			val = remaining_seconds // (60*60)
+			await bot.send_message(
+				user_id,
+				f"{val} 小时后，您的机器人将不再可用。请及时充值。",
+			)
+		except Exception:
+			pass
+
+		await asyncio.sleep(0.3)
+
+
+
+	total = len(active_candidates)
+	total_pages = (total + PER_PAGE_SIZE - 1) // PER_PAGE_SIZE
+	if page > total_pages:
+		await message.reply(f"❌ 页码超出范围，共 {total_pages} 页")
+		return
+
+	start = (page - 1) * PER_PAGE_SIZE
+	page_candidates = active_candidates[start:start + PER_PAGE_SIZE]
+	lines = [
+		f"👥 未逾期用户名单（第 {page}/{total_pages} 页，共 {total} 人）",
+	]
+	for user_id, user_expire in page_candidates:
+		remaining_seconds = user_expire.expire_timestamp - now_timestamp
+		remaining_days = remaining_seconds // (24 * 60 * 60)
+		remaining_hours = (remaining_seconds % (24 * 60 * 60)) // (60 * 60)
+		remaining_minutes = (remaining_seconds % (60 * 60)) // 60
+		
+		# 格式化剩余时间
+		if remaining_days > 0:
+			time_text = f"{remaining_days} 天 {remaining_hours} 小时"
+		elif remaining_hours > 0:
+			time_text = f"{remaining_hours} 小时 {remaining_minutes} 分钟"
+		else:
+			time_text = f"{remaining_minutes} 分钟"
+		
+		lines.append(
+			f"\n{user_id}｜剩余 {time_text}｜"
+			f"到期: {FormatUtils.format_timestamp_utc8(user_expire.expire_timestamp)}"
+		)
+	await message.reply("\n".join(lines))
 
 @dp.message(Command("inactive_candidate"))
 async def cmd_inactive_candidate(message: Message, command: CommandObject) -> None:

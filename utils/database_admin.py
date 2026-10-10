@@ -86,20 +86,20 @@ class DatabaseAdminCommands:
         "user_expire": {
             "user_id", "expire_timestamp", "update_timestamp", "group_message_timestamp",
         },
-        "user_blacklist": {"user_id", "reason", "created_by", "created_at"},
-        "received_media": {
-            "file_unique_id", "file_id", "file_type", "first_user_id",
-            "source_chat_id", "source_message_id", "status", "created_at",
-            "accepted_at", "batch_id",
-        },
-        "batch": {
-            "batch_id", "channel_chat_id", "channel_message_id",
-            "discussion_chat_id", "discussion_message_id", "batch_content",
-            "created_at", "updated_at",
-        },
-        "shared_invite_link": {
-            "link_key", "chat_id", "invite_link", "name", "created_at", "validated_at",
-        },
+        # "user_blacklist": {"user_id", "reason", "created_by", "created_at"},
+        # # "received_media": {
+        # #     "file_unique_id", "file_id", "file_type", "first_user_id",
+        # #     "source_chat_id", "source_message_id", "status", "created_at",
+        # #     "accepted_at", "batch_id",
+        # # },
+        # "batch": {
+        #     "batch_id", "channel_chat_id", "channel_message_id",
+        #     "discussion_chat_id", "discussion_message_id", "batch_content",
+        #     "created_at", "updated_at",
+        # },
+        # "shared_invite_link": {
+        #     "link_key", "chat_id", "invite_link", "name", "created_at", "validated_at",
+        # },
     }
 
     @classmethod

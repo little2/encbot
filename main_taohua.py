@@ -367,6 +367,11 @@ async def on_media(message: Message, state: FSMContext) -> None:
 		print(f"只接受视频或文件消息", flush=True)
 		return
 
+	if blacklist_store.is_blocked(int(message.from_user.id)):
+		print("黑名单用户 {message.from_user.id}", flush=True)
+		return
+
+
 	media_info = _extract_media_dict(message)
 	file_type = media_info.get("file_type")
 	file_id = media_info.get("file_id")
@@ -1421,7 +1426,8 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 				await callback.answer(
 					text=(
 						f"目前你的桃气值不足，无法进行采菊。\n\n"
-						f"你可以选择在桃花村发言 ( 1 分钟可得 1 桃气值 ) 或是分享资源，就可以获得桃气值。"
+						f"你可以选择在桃花村发言 ( 1 分钟可得 1 桃气值 ) 或是分享资源，就可以获得桃气值。\n\n"
+						f"🎈 至少有 2 句有效发言，且需要间隔 1 分钟"
 					),
 					show_alert=True,
 					cache_time=0,
@@ -2047,6 +2053,11 @@ async def get_user_status(from_user_id):
 async def cmd_me(message: Message) -> None:
 	if not message.from_user:
 		return
+
+	if blacklist_store.is_blocked(int(message.from_user.id)):
+		print("黑名单用户 {message.from_user.id}", flush=True)
+		return
+
 	status_text = await get_user_status(message.from_user.id)
 	await message.reply(status_text, parse_mode="HTML")
 		
@@ -2055,6 +2066,10 @@ async def cmd_me(message: Message) -> None:
 # 同时监听 /home 和 /rule 命令
 @dp.message(F.chat.type == "private", Command("home", "rule"))
 async def cmd_rule(message: Message) -> None:
+	if blacklist_store.is_blocked(int(message.from_user.id)):
+		print("黑名单用户 {message.from_user.id}", flush=True)
+		return
+
 	
 	media_upload_extend_text = FormatUtils.minutes_to_day_hour(MEDIA_UPLOAD_EXTEND_MINUTES)[0]
 

@@ -20,6 +20,7 @@ from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
 from utils.user_manager import UserManager
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
+from utils.database_admin import DatabaseAdminCommands
 from utils.peach_exchange_store import (
 	remember_peach_exchange_record,
 	has_peach_exchange_for_user,
@@ -63,7 +64,7 @@ ADMIN_USER_IDS.update(ParseUtils.parse_user_ids([KEY_MAN_ID]))
 
 
 
-from utils.user_utils import UserExpireCache
+from utils.user_utils import UserExpireCache, UserExpire
 TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
 TAKEOFF_KICK_LOCKS: dict[int, asyncio.Lock] = {}
 TAKEOFF_KICK_ACTION_STATE: dict[tuple[int, int, int], str] = {}
@@ -141,7 +142,7 @@ bot = Bot(
 dp = Dispatcher()
 
 
-
+INACTIVE_EXPIRE_DAYS = 0
 INACTIVE_CLEANUP_LOCK = asyncio.Lock()
 
 # Telegram 出站调用统一走 utils/telegram_gate：
@@ -160,6 +161,19 @@ user_expire_db_path = Path(
 )
 user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
 blacklist_store = BlacklistStore(db_path=user_expire_db_path)
+
+database_admin_commands = DatabaseAdminCommands(
+	bot=bot,
+	backup_lock=asyncio.Lock(),
+	database_path=user_expire_db_path,
+	key_man_id=KEY_MAN_ID,
+	admin_user_ids=ADMIN_USER_IDS,
+	telegram_call=_telegram_call_with_retry,
+	app_now=app_now,
+	user_expire_cache=user_expire_cache,
+	blacklist_store=blacklist_store,
+)
+database_admin_commands.register(dp)
 
 
 ''''
@@ -188,6 +202,7 @@ INTRO_MIN_LEN = 2
 INTRO_MAX_LEN = 100
 CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 
+PER_PAGE_SIZE = 10
 
 class IntroStates(StatesGroup):
 	waiting_intro = State()
@@ -1983,11 +1998,82 @@ async def on_join_request(join_request: ChatJoinRequest) -> None:
 		print(f"[JOIN_REQUEST] failed to approve join request: {exc}", flush=True)
 
 
+def _inactive_cutoff_timestamp(now_timestamp: int | None = None) -> int:
+	now_timestamp = now_timestamp or int(app_now().timestamp())
+	return now_timestamp - INACTIVE_EXPIRE_DAYS * 24 * 60 * 60
+
+
+def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
+	user_id = int(user_id)
+	if user_id in ADMIN_USER_IDS or blacklist_store.is_blocked(user_id):
+		return False
+	bot_user_id = int(getattr(bot, "id", 0) or 0)
+	if bot_user_id and user_id == bot_user_id:
+		return False
+	user_expire = user_expire_cache.get(user_id)
+	return bool(
+		user_expire
+		and user_expire.expire_timestamp <= _inactive_cutoff_timestamp(now_timestamp)
+	)
+
+def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]:
+	candidates = [
+		(user_id, user_expire)
+		for user_id, user_expire in list(user_expire_cache.users.items())
+		if _is_inactive_candidate(user_id, now_timestamp)
+	]
+	return sorted(
+		candidates,
+		key=lambda item: (item[1].expire_timestamp, item[0]),
+	)
+
 '''
 Command
 '''
 
 
+@dp.message(Command("inactive_candidate"))
+async def cmd_inactive_candidate(message: Message, command: CommandObject) -> None:
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		return
+
+	page_text = str(command.args or "").strip()
+	page = ParseUtils._parse_positive_user_id(page_text) if page_text else 1
+	if page is None:
+		await message.reply("用法：/inactive_candidate [页码]")
+		return
+
+	now_timestamp = int(app_now().timestamp())
+	candidates = _get_inactive_candidates(now_timestamp)
+	if not candidates:
+		await message.reply(
+			f"目前没有通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天的用户"
+		)
+		return
+
+	total = len(candidates)
+	total_pages = (total + PER_PAGE_SIZE - 1) // PER_PAGE_SIZE
+	if page > total_pages:
+		await message.reply(f"❌ 页码超出范围，共 {total_pages} 页")
+		return
+
+	start = (page - 1) * PER_PAGE_SIZE
+	page_candidates = candidates[start:start + PER_PAGE_SIZE]
+	lines = [
+		f"🧹 不活跃候选名单（第 {page}/{total_pages} 页，共 {total} 人）",
+		f"条件：通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天",
+	]
+	for user_id, user_expire in page_candidates:
+		expired_days = max(
+			0,
+			(now_timestamp - user_expire.expire_timestamp) // (24 * 60 * 60),
+		)
+		lines.append(
+			f"\n{user_id}｜过期 {expired_days} 天｜"
+			f"{FormatUtils.format_timestamp_utc8(user_expire.expire_timestamp)}\n"
+			
+		)
+	await message.reply("\n".join(lines))
 
 @dp.message(F.chat.type == "private", Command("start"))
 async def cmd_start(message: Message, command: CommandObject) -> None:

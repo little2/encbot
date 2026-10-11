@@ -204,6 +204,19 @@ CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 
 PER_PAGE_SIZE = 10
 
+
+'''
+关键字审核
+'''
+from utils.speech_censor_utils import SpeechCensor
+
+censor = SpeechCensor({
+    "delete": (),
+    "ban": ("ZTFX8", "ai_919198_bot"),
+    "ignored": IGNORED_TEXT_SUBSTRINGS,
+})
+
+
 class IntroStates(StatesGroup):
 	waiting_intro = State()
 
@@ -551,6 +564,22 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		)
 		return
 
+
+	check_result = censor.check_content(text)
+	if check_result == "ban":
+		print(f"[BAN] message banned: {text}")
+		await message.delete()
+		entry, group_ban_error = await _ban_user(
+			user_id=message.from_user.id,
+			reason=f"投稿违规内容:{text} ",
+			created_by=0,
+			target_chats=TARGET_CHATS,
+		)
+		return
+	else:
+		print(f"[ENCODED_FORWARD] message passed: {text}, check_result={check_result}")
+	
+
 	preview = None
 	thumb_file_id = ""
 
@@ -567,7 +596,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		
 			
 		except Exception as exc:
-			print(f"[ENCODED_FORWARD] send thumb to X_MAN_BOT_ID failed: {exc}", flush=True)
+			# print(f"[ENCODED_FORWARD] send thumb to X_MAN_BOT_ID failed: {exc}", flush=True)
 
 			try:
 				buffer = BytesIO()
@@ -1932,8 +1961,29 @@ async def on_reward_group_message(message: Message) -> None:
 	if len(text) < 2 or text.startswith("/"):
 		return
 
-	if any(ignored_text in text for ignored_text in IGNORED_TEXT_SUBSTRINGS):
+	check_result = censor.check_content(text)
+	if check_result == "delete":
+		print(f"[DELETE] message deleted: {text}")
+		await message.delete()
 		return
+	elif check_result == "ban":
+		print(f"[BAN] message banned: {text}")
+		await message.delete()
+		entry, group_ban_error = await _ban_user(
+			user_id=message.from_user.id,
+			reason=f"违规内容:{text} ",
+			created_by=0,
+			target_chats=TARGET_CHATS,
+		)
+		return
+	elif check_result == "ignored":
+		print(f"[IGNORED] message ignored: {text}")
+		return
+	else:
+		print(f"[UNKNOWN] message with unknown check result: {text}")
+
+
+
 
 
 	user_id = int(message.from_user.id)
@@ -2183,7 +2233,8 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 			print(f"[START] failed to fly: {exc}", flush=True)
 		
 		return
-
+	elif not args:
+		await cmd_rule(message)
 	else:			
 		return
 
@@ -2251,7 +2302,16 @@ async def cmd_me(message: Message) -> None:
 
 
 # 同时监听 /home 和 /rule 命令
-@dp.message(F.chat.type == "private", Command("home", "rule"))
+@dp.message(F.chat.type == "private", Command("home"))
+async def cmd_home(message: Message) -> None:
+	if blacklist_store.is_blocked(int(message.from_user.id)):
+		print("黑名单用户 {message.from_user.id}", flush=True)
+		return
+	await message.reply(
+		"https://t.me/thlgohome"
+	)
+# 同时监听 /home 和 /rule 命令
+@dp.message(F.chat.type == "private", Command("rule"))
 async def cmd_rule(message: Message) -> None:
 	if blacklist_store.is_blocked(int(message.from_user.id)):
 		print("黑名单用户 {message.from_user.id}", flush=True)

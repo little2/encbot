@@ -199,7 +199,7 @@ _is_current_chat_member = UserManager.is_current_chat_member
 
 
 INTRO_MIN_LEN = 2
-INTRO_MAX_LEN = 100
+INTRO_MAX_LEN = 200
 CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 
 PER_PAGE_SIZE = 10
@@ -423,6 +423,8 @@ async def on_media(message: Message, state: FSMContext) -> None:
 
 
 	lines = []
+	menu_content = []
+	button_set = []
 	if had_pending:
 		lines.append("⚠️ 上一个媒体尚未填写介绍内容，已被放弃。")
 
@@ -435,44 +437,81 @@ async def on_media(message: Message, state: FSMContext) -> None:
 		chinese_name = ""
 	
 	if chinese_name:
-		
-		# keyboard = ReplyKeyboardMarkup(
-		# 	keyboard=[
+		menu_content.append(f"<a href=\"https://t.me/{bot_name}?text={html.escape(chinese_name)}\">{html.escape(chinese_name)}</a>\n")
+
+		# reply_markup=InlineKeyboardMarkup(
+		# 	inline_keyboard=[
 		# 		[
-		# 			KeyboardButton(text=f"{html.escape(chinese_name)}"),
-					
+		# 			InlineKeyboardButton(
+		# 				text="📋 复制",
+		# 				copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}"),
+		# 			)
 		# 		]
-		# 	],
-		# 	resize_keyboard=True,
-		# 	one_time_keyboard=True,
-		# 	input_field_placeholder="请选择操作",
-		# 	selective=False,
-		# )
+		# 	]
+		# ),
+
+
+
+		button_set.append([
+			InlineKeyboardButton(
+				text="📋 复制",
+				copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}"),
+			)
+		])
+
+		button_set.append([
+			InlineKeyboardButton(
+				text="⬇️  标签  ⬇️",
+				callback_data="tag_select",
+				style="primary",  # 蓝色
+				
+			)
+		])
+
+
+		TAG_ROWS = ["享受","喊痛或哭","婴幼儿","偷拍","网路调教","监视器"]
+		rows = []
+		for tag in TAG_ROWS:
+			rows.append(InlineKeyboardButton(text=f"#{tag}", callback_data=f"tag:{tag}"))
+			if len(rows) >= 3:
+				button_set.append(rows)
+				rows = []
+		if rows:
+			button_set.append(rows)		
+		# 
 		
+		# rows = [
+		# 	[
+		# 		InlineKeyboardButton(
+		# 			text=reason,
+		# 			callback_data=(
+		# 				f"ta:kr:{code}:{uploader_id}:"
+		# 				f"{source_chat_id}:{source_message_id}"
+		# 			),
+		# 		)
+		# 	]
+		# 	for code, reason in TAKEOFF_KICK_REASONS.items()
+		# ]
 
-		# await message.answer(
-		# 	"可点击下方按钮复制文字作为介绍：",
-		# 	reply_markup=keyboard
-		# )
-
-
-
+		# rows.append(
+		# 	[
+		# 		InlineKeyboardButton(
+		# 			text="📋 复制",
+		# 			copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}"),
+		# 		)
+		# 	])
+		
+		
+		
+		
+		
 		await _telegram_call_with_retry(
 			"send intro copy button",
 			lambda: bot.send_message(
 				message.chat.id,
-				f"<a href=\"https://t.me/{bot_name}?text={html.escape(chinese_name)}\">{html.escape(chinese_name)}</a>\n\n",
+				"\n".join(menu_content),
 				parse_mode="HTML",
-				reply_markup=InlineKeyboardMarkup(
-					inline_keyboard=[
-						[
-							InlineKeyboardButton(
-								text="📋 复制",
-								copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}"),
-							)
-						]
-					]
-				),
+				reply_markup=InlineKeyboardMarkup(inline_keyboard=button_set),
 			),
 			chat_id=message.chat.id,
 		)
@@ -623,13 +662,22 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 
 	
 	url = encode_file_url(data)
+	selected_tags = data.get("tags", [])
+	tags_string = " ".join(
+		f"#{str(tag).lstrip('#')}"
+		for tag in selected_tags
+		if str(tag).strip()
+	)
+	post_text = f'<a href="{html.escape(url, quote=True)}">🌼</a> {html.escape(text)}'
+	if tags_string:
+		post_text = f"{post_text}\n{html.escape(tags_string)}"
 	
 	try:
 		post_item = await _telegram_call_with_retry(
 			"publish intro post",
 			lambda: bot.send_message(
 				CHAT_PUBLIC_GROUP_ID,
-				f'<a href="{html.escape(url, quote=True)}">🌼</a> {html.escape(text)}',
+				post_text,
 				message_thread_id=CHAT_PUBLIC_THREAD_ID or None,
 				parse_mode=ParseMode.HTML,
 				reply_markup=InlineKeyboardMarkup(
@@ -701,8 +749,15 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			else 0
 		)
 		base_timestamp = max(now_timestamp, previous_expire_timestamp)
-		requested_minutes = MEDIA_UPLOAD_EXTEND_MINUTES
-		peach_count = MEDIA_UPLOAD_EXTEND_MINUTES // MEDIA_VIEW_CONSUMPTION_MINUTES
+		action_notify_text = ""
+		if "石头汤享受" in tags_string:
+			requested_minutes = MEDIA_UPLOAD_EXTEND_MINUTES * 4
+			action_notify_text = "🗿 活动奖励馈赠成功！"
+		else:
+			requested_minutes = MEDIA_UPLOAD_EXTEND_MINUTES
+			action_notify_text = "🌿 灵韵馈赠成功"
+		
+		peach_count = requested_minutes // MEDIA_VIEW_CONSUMPTION_MINUTES
 		max_peach_count = MAX_HP_CAPACITY_MINUTES // MEDIA_VIEW_CONSUMPTION_MINUTES
 
 
@@ -726,7 +781,8 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		status_text = await get_user_status(from_user_id)
 		
 		notify_text = (
-			f"🌿 灵韵馈赠成功！你获得了 {peach_count} 点桃气值。 \n"
+			f"{action_notify_text}！你获得了 {peach_count} 点桃气值。 \n\n"
+			f"<i>🎈 桃气先发，珍惜信任，若欺骗，必逐出并拉黑。</i> \n"
 			f"\n\n{status_text}"
 		)
 
@@ -1359,6 +1415,93 @@ async def on_click_dislike(callback: CallbackQuery) -> None:
 		return
 
 	await callback.answer("没有值", show_alert=True)
+	return
+
+
+@dp.callback_query(F.data.startswith("tag:"))
+async def on_tag_button_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+	if not callback.message:
+		await callback.answer("无法获取消息", show_alert=True)
+		return
+
+	reply_markup = callback.message.reply_markup
+	if not reply_markup or not getattr(reply_markup, "inline_keyboard", None):
+		await callback.answer("没有可更新的按钮组", show_alert=True)
+		return
+
+	updated_rows: list[list[InlineKeyboardButton]] = []
+	updated = False
+	for row in reply_markup.inline_keyboard:
+		new_row: list[InlineKeyboardButton] = []
+		for button in row:
+			button_callback = getattr(button, "callback_data", None)
+			if button_callback == callback.data:
+				button_text = button.text or ""
+				new_text = (
+					button_text.removeprefix("✅ ").removeprefix("✅")
+					if button_text.startswith("✅")
+					else f"✅ {button_text}"
+				)
+				button = InlineKeyboardButton(
+					text=new_text,
+					callback_data=button_callback,
+					url=button.url,
+					web_app=button.web_app,
+					login_url=button.login_url,
+					switch_inline_query=button.switch_inline_query,
+					switch_inline_query_current_chat=button.switch_inline_query_current_chat,
+					switch_inline_query_chosen_chat=button.switch_inline_query_chosen_chat,
+					copy_text=button.copy_text,
+					callback_game=button.callback_game,
+					pay=button.pay,
+				)
+				updated = True
+			new_row.append(button)
+		updated_rows.append(new_row)
+
+	if not updated:
+		await callback.answer("未找到可更新的按钮", show_alert=True)
+		return
+
+	selected_tags = [
+		str(button_callback).removeprefix("tag:")
+		for row in updated_rows
+		for button in row
+		for button_callback in [getattr(button, "callback_data", None)]
+		if (
+			button_callback
+			and str(button_callback).startswith("tag:")
+			and (button.text or "").startswith("✅")
+		)
+	]
+
+	try:
+		await _telegram_call_with_retry(
+			"toggle tag button",
+			lambda: bot.edit_message_reply_markup(
+				chat_id=int(callback.message.chat.id),
+				message_id=int(callback.message.message_id),
+				reply_markup=InlineKeyboardMarkup(inline_keyboard=updated_rows),
+			),
+			chat_id=int(callback.message.chat.id),
+			kind="edit",
+		)
+		await state.update_data(tags=selected_tags)
+	except Exception:
+		await callback.answer("更新按钮状态失败", show_alert=True)
+		return
+
+	await callback.answer("已更新", show_alert=False)
+	return
+
+
+@dp.callback_query(F.data == "tag_select")
+async def on_tag_select_info(callback: CallbackQuery) -> None:
+	await callback.answer(
+		"标签为选填，可根据内容选择合适的标签，也可以不选。",
+		show_alert=True,
+		cache_time=1000,
+	)
 	return
 
 # 采菊投递节流：同一用户对同一条消息在间隔内只投递一次，防止连点重复发送

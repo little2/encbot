@@ -458,69 +458,49 @@ async def on_media(message: Message, state: FSMContext) -> None:
 				copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}"),
 			)
 		])
-
-		button_set.append([
-			InlineKeyboardButton(
-				text="⬇️  标签  ⬇️",
-				callback_data="tag_select",
-				style="primary",  # 蓝色
-				
-			)
-		])
-
-
-		TAG_ROWS = ["享受","喊痛或哭","婴幼儿","偷拍","网路调教","监视器"]
-		rows = []
-		for tag in TAG_ROWS:
-			rows.append(InlineKeyboardButton(text=f"#{tag}", callback_data=f"tag:{tag}"))
-			if len(rows) >= 3:
-				button_set.append(rows)
-				rows = []
-		if rows:
-			button_set.append(rows)		
-		# 
-		
-		# rows = [
-		# 	[
-		# 		InlineKeyboardButton(
-		# 			text=reason,
-		# 			callback_data=(
-		# 				f"ta:kr:{code}:{uploader_id}:"
-		# 				f"{source_chat_id}:{source_message_id}"
-		# 			),
-		# 		)
-		# 	]
-		# 	for code, reason in TAKEOFF_KICK_REASONS.items()
-		# ]
-
-		# rows.append(
-		# 	[
-		# 		InlineKeyboardButton(
-		# 			text="📋 复制",
-		# 			copy_text=CopyTextButton(text=f"{html.escape(chinese_name)}"),
-		# 		)
-		# 	])
-		
-		
-		
-		
-		
-		await _telegram_call_with_retry(
-			"send intro copy button",
-			lambda: bot.send_message(
-				message.chat.id,
-				"\n".join(menu_content),
-				parse_mode="HTML",
-				reply_markup=InlineKeyboardMarkup(inline_keyboard=button_set),
-			),
-			chat_id=message.chat.id,
-		)
-
-		lines.append(
-			"请回复此消息并输入介绍内容（2~100 字）。"
-		)
 	else:
-		lines.append("请回复此消息并自行输入介绍内容（2~100 字）。")
+		menu_content.append(f"请为该媒体添加标签\n")
+
+
+	button_set.append([
+		InlineKeyboardButton(
+			text="⬇️  标签  ⬇️",
+			callback_data="tag_select",
+			style="primary",  # 蓝色
+			
+		)
+	])
+
+
+	TAG_ROWS = ["享受","喊痛或哭","婴幼儿","偷拍","网路调教","监视器"]
+	rows = []
+	for tag in TAG_ROWS:
+		rows.append(InlineKeyboardButton(text=f"#{tag}", callback_data=f"tag:{tag}"))
+		if len(rows) >= 3:
+			button_set.append(rows)
+			rows = []
+	if rows:
+		button_set.append(rows)		
+	
+		
+		
+		
+		
+	await _telegram_call_with_retry(
+		"send intro copy button",
+		lambda: bot.send_message(
+			message.chat.id,
+			"\n".join(menu_content),
+			parse_mode="HTML",
+			reply_markup=InlineKeyboardMarkup(inline_keyboard=button_set),
+		),
+		chat_id=message.chat.id,
+	)
+
+	lines.append(
+		"请回复此消息并输入介绍内容（2~100 字）。"
+	)
+		 
 
 	await _ask_intro(message, state, "\n\n".join(lines))
 

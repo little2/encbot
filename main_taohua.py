@@ -212,7 +212,7 @@ from utils.speech_censor_utils import SpeechCensor
 
 censor = SpeechCensor({
     "delete": (),
-    "ban": ("ZTFX8", "ai_919198_bot"),
+    "ban": ("ZTFX8", "ai_919198_bot","中央架控","陈紫铭"),
     "ignored": IGNORED_TEXT_SUBSTRINGS,
 })
 

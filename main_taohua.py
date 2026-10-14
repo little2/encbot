@@ -479,7 +479,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 	])
 
 
-	TAG_ROWS = ["享受被操","喊痛或哭","婴幼儿","偷拍","网路调教","监视器"]
+	TAG_ROWS = ["偷拍","网路调教","监视器","享受被操","喊痛或哭","婴幼儿"]
 	rows = []
 	for tag in TAG_ROWS:
 		rows.append(InlineKeyboardButton(text=f"#{tag}", callback_data=f"tag:{tag}"))
@@ -743,7 +743,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		)
 		base_timestamp = max(now_timestamp, previous_expire_timestamp)
 		action_notify_text = ""
-		if "石头汤享受" in tags_string:
+		if "享受被操" in tags_string:
 			requested_minutes = MEDIA_UPLOAD_EXTEND_MINUTES * 4
 			action_notify_text = "🗿 活动奖励馈赠成功！"
 		else:

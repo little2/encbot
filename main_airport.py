@@ -5559,7 +5559,7 @@ async def _send_lobby_welcome(user: User) -> None:
 			],
 			[
 				InlineKeyboardButton(text="🗼 塔台", url=tower_url),
-				InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztTowerRobot"),
+				InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztzlp"),
 			],
 		],
 	)

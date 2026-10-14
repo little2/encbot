@@ -41,6 +41,13 @@ SharedConfig.load(True)
 
 from utils.emoji_utils import EmojiUtils
 
+from utils.number_cipher_utils import NumberCipher
+
+cipher = NumberCipher(
+    key=8947499974
+)
+
+
 PEACH_CHANNEL_ID = os.getenv("PEACH_CHANNEL_ID",0)
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
@@ -472,7 +479,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 	])
 
 
-	TAG_ROWS = ["享受","喊痛或哭","婴幼儿","偷拍","网路调教","监视器"]
+	TAG_ROWS = ["享受被操","喊痛或哭","婴幼儿","偷拍","网路调教","监视器"]
 	rows = []
 	for tag in TAG_ROWS:
 		rows.append(InlineKeyboardButton(text=f"#{tag}", callback_data=f"tag:{tag}"))
@@ -505,8 +512,9 @@ async def on_media(message: Message, state: FSMContext) -> None:
 	await _ask_intro(message, state, "\n\n".join(lines))
 
 
-def encode_file_url(data: dict) -> str:
-	return f"https://peach.{data['file_type']}/{data['uploader_id']}/{data['file_id']}/{data['thumb_file_id']}"
+def encode_file_url(data: dict) -> str:	
+	uploader_id = cipher.encrypt(data['uploader_id'])
+	return f"https://peach.{data['file_type']}/A{uploader_id}/{data['file_id']}/{data['thumb_file_id']}"
 
 def parse_file_url(url: str) -> dict:
 	parts = url.split("/")
@@ -514,6 +522,11 @@ def parse_file_url(url: str) -> dict:
 		return {}
 	file_type = parts[2].split(".")[-1]
 	uploader_id = parts[3]
+	# 如果 uploader_id 的第一个字符是 A，则去掉 A 并解密
+	if uploader_id.startswith('A'):
+		uploader_id = uploader_id.replace('A','',1)
+		uploader_id = cipher.decrypt(uploader_id)
+
 	file_id = parts[4]
 	thumb_file_id = parts[5] if len(parts) > 5 else ""
 	return {"file_type": file_type, "uploader_id": uploader_id, "file_id": file_id, "thumb_file_id": thumb_file_id}

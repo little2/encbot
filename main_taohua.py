@@ -205,7 +205,7 @@ _delete_inactive_user_data = user_manager.delete_inactive_user_data
 _is_current_chat_member = UserManager.is_current_chat_member
 
 
-INTRO_MIN_LEN = 2
+INTRO_MIN_LEN = 5
 INTRO_MAX_LEN = 200
 CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 

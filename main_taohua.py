@@ -245,9 +245,6 @@ async def _ask_intro(message: Message, state: FSMContext, text: str) -> None:
 	await state.update_data(prompt_message_id=prompt.message_id)
 
 
-
-
-
 def _extract_media_dict(message: Message) -> dict:
 	file_type = None
 	caption = None
@@ -2115,8 +2112,8 @@ async def on_reward_group_message(message: Message) -> None:
 	elif check_result == "ignored":
 		print(f"[IGNORED] message ignored: {text}")
 		return
-	else:
-		print(f"[UNKNOWN] message with unknown check result: {text}")
+	# else:
+	# 	print(f"[UNKNOWN] message with unknown check result: {text}")
 
 
 

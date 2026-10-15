@@ -1825,12 +1825,14 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 
 		except TelegramRetryAfter as exc:
 			# 闸门已重试仍被限流：回滚桃气值并明确提示限流，避免用户立刻重试加剧 flood
-			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			if not is_admin:
+				user_expire_cache.update(reader_user_id, original_expire_timestamp)
 			print(f"[TAKEOFF] media delivery rate limited: {exc}", flush=True)
 			await callback.answer("⚠️ Telegram 限流中，请稍等几秒再试", show_alert=True, cache_time=0)
 			return
 		except Exception as exc:
-			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			if not is_admin:
+				user_expire_cache.update(reader_user_id, original_expire_timestamp)
 			if "Forbidden: bot can't initiate conversation with a user" in str(exc):
 				await callback.answer("🤖 请先和新的桃宝机器人私信对话过一次", show_alert=True, cache_time=0)
 				return

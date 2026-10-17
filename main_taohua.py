@@ -1057,7 +1057,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 				lambda: bot.send_message(
 					chat_id=CHAT_SCHOOL_GROUP_ID,
 					text=(
-						"🦶 成员移除公告\n\n"
+						"🦶 村民移除公告\n\n"
 						f'<a href="tg://user?id={uploader_id}">{uploader_id}</a> '
 						"将被移出「桃花林」与「桃花源」。\n"
 						f"理由：{reason}"

@@ -735,13 +735,42 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			else:
 				target_id = X_MAN_BOT_ID
 				
-			print(f"line:738 :{target_id}")
+			# print(f"line:738 :{target_id}")
+
+			# thumb_result = await _telegram_call_with_retry(
+			# 	"send intro thumbnail",
+			# 	lambda: bot.send_photo(
+			# 		chat_id=target_id,
+			# 		photo=thumb_file_id,
+			# 		caption=thumb_caption,
+			# 		parse_mode="HTML",
+			# 		reply_markup=thumb_reply_markup,
+			# 		protect_content=True,
+			# 	),
+			# 	chat_id=target_id,
+			# )
+
+			# print(f"thumb_result={thumb_result}", flush=True)
+
+			# print(f"thumb_result_file_id={thumb_result.photo[-1].file_id}", flush=True)
+		
+
+			# print(f"line:768 :{exc}")
+			buffer = BytesIO()
+
+			await bot.download(
+				thumb_file_id,
+				destination=buffer,
+			)
 
 			thumb_result = await _telegram_call_with_retry(
-				"send intro thumbnail",
+				"upload intro thumbnail fallback",
 				lambda: bot.send_photo(
 					chat_id=target_id,
-					photo=thumb_file_id,
+					photo=BufferedInputFile(
+						buffer.getvalue(),
+						filename="thumbnail.jpg",
+					),
 					caption=thumb_caption,
 					parse_mode="HTML",
 					reply_markup=thumb_reply_markup,
@@ -750,9 +779,13 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 				chat_id=target_id,
 			)
 
-			print(f"thumb_result_file_id={thumb_result.photo[-1].file_id}", flush=True)
-		
+			print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
+			thumb_file_id = thumb_result.photo[-1].file_id
+			data["thumb_file_id"] = thumb_file_id
 			
+
+
+
 		except TelegramRetryAfter as exc:
 			# The retry wrapper already respected retry_after and exhausted its
 			# attempts. Do not immediately resend via the upload fallback.
@@ -764,36 +797,9 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		except TelegramBadRequest as exc:
 			# A cross-bot file_id may be invalid; upload the bytes as a fallback.
 
-			try:
-				print(f"line:768 :{exc}")
-				buffer = BytesIO()
-
-				await bot.download(
-					thumb_file_id,
-					destination=buffer,
-				)
-
-				thumb_result = await _telegram_call_with_retry(
-					"upload intro thumbnail fallback",
-					lambda: bot.send_photo(
-						chat_id=target_id,
-						photo=BufferedInputFile(
-							buffer.getvalue(),
-							filename="thumbnail.jpg",
-						),
-						caption=thumb_caption,
-						parse_mode="HTML",
-						reply_markup=thumb_reply_markup,
-						protect_content=True,
-					),
-					chat_id=target_id,
-				)
-
-				print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
-				thumb_file_id = thumb_result.photo[-1].file_id
-				data["thumb_file_id"] = thumb_file_id
-			except Exception as exc:
-				print(f"[ENCODED_FORWARD] download and send thumb failed: {exc}", flush=True)
+			print(f"[ENCODED_FORWARD] thumbnail bad request: {exc}", flush=True)
+		except Exception as exc:
+			print(f"[ENCODED_FORWARD] download and send thumb failed: {exc}", flush=True)
 
 
 	

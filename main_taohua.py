@@ -735,6 +735,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			else:
 				target_id = X_MAN_BOT_ID
 				
+			print(f"line:738 :{target_id}")
 
 			thumb_result = await _telegram_call_with_retry(
 				"send intro thumbnail",
@@ -764,6 +765,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			# A cross-bot file_id may be invalid; upload the bytes as a fallback.
 
 			try:
+				print(f"line:768 :{exc}")
 				buffer = BytesIO()
 
 				await bot.download(

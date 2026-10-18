@@ -17,6 +17,7 @@ from aiogram.types import ReplyKeyboardRemove
 from aiogram.types import ErrorEvent
 
 from utils.format_utils import FormatUtils
+from utils.media_text_sender import MediaTextSender
 from utils.parse_utils import ParseUtils
 from utils.user_manager import UserManager
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
@@ -126,6 +127,9 @@ _WHITE_JPEG_BASE64 = (
 
 _WHITE_JPEG_BYTES = base64.b64decode(_WHITE_JPEG_BASE64)
 
+
+BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "").strip()
+BACKUP_BOT_NAME = ""
 
 @lru_cache(maxsize=1)
 def _get_default_image_bytes() -> bytes:
@@ -311,7 +315,7 @@ async def say_hello_to_x_man(bot_name):
 		)
 		try:
 			await switchbot.send_message(X_MAN_BOT_ID, f"|_kick_|@{bot_name}")
-			print("✅ Sent hello to X-Man bot", flush=True)
+			print(f"✅ {bot_name} Sent hello to X-Man bot", flush=True)
 		except Exception as exc:
 			print(f"❌ Failed to send hello to X-Man bot: {exc}", flush=True)
 		finally:
@@ -373,6 +377,17 @@ async def _check_bot_group_admin_permissions() -> str:
 		if int(KEY_MAN_ID or 0) > 0:
 			try:
 				await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
+			except TelegramBadRequest as exc:
+				print(
+					f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
+					flush=True,
+				)
+				if "chat not found" in str(exc).lower():
+					print(
+						"請確認 KEY_MAN_ID 是正確的使用者 ID，並由該帳號開啟"
+						f" @{bot_name} 私訊，按下 Start 或傳送 /start。",
+						flush=True,
+					)
 			except Exception as exc:
 				print(
 					f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
@@ -384,6 +399,40 @@ async def _check_bot_group_admin_permissions() -> str:
 				flush=True,
 			)
 	return notice_text
+
+
+async def _send_media_to_backup_bot(message: Message) -> None:
+	"""将完整媒体消息复制给 BACKUP_BOT_NAME，保留原媒体和说明文字。"""
+	global BACKUP_BOT_NAME
+	if not BACKUP_BOT_TOKEN:
+		return
+	try:
+		if not BACKUP_BOT_NAME:
+			# 备份轮询可能尚未完成启动，先获取目标用户名。
+			async with Bot(token=BACKUP_BOT_TOKEN) as backup_client:
+				me = await backup_client.get_me()
+				BACKUP_BOT_NAME = str(me.username or "")
+		if not BACKUP_BOT_NAME:
+			raise RuntimeError("备份机器人没有可用的用户名")
+		target = f"@{BACKUP_BOT_NAME.lstrip('@')}"
+		await _telegram_call_with_retry(
+			"copy media to backup bot",
+			lambda: message.copy_to(chat_id=target),
+			chat_id=target,
+		)
+	except Exception as exc:
+		if "USER_BOT_TO_BOT_DISABLED" in str(exc):
+			print(
+				f"⚠️ [BACKUP_BOT] 媒体复制失败 - 未开启机器人之间的媒体通信 botfather -> bot -> bot settings -> bot to bot communication mode 打开"
+				f"chat_id={message.chat.id} message_id={message.message_id}: {exc}",
+				flush=True,
+			)
+			return
+		print(
+			f"⚠️ [BACKUP_BOT] 媒体复制失败 "
+			f"chat_id={message.chat.id} message_id={message.message_id}: {exc}",
+			flush=True,
+		)
 
 
 @dp.message(
@@ -405,6 +454,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 
 
 	media_info = _extract_media_dict(message)
+	await _send_media_to_backup_bot(message)
 	file_type = media_info.get("file_type")
 	file_id = media_info.get("file_id")
 	file_name = media_info.get("file_name")
@@ -607,7 +657,14 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 		return
 	else:
 		print(f"[ENCODED_FORWARD] message passed: {text}, check_result={check_result}")
-	
+
+
+	selected_tags = data.get("tags", [])
+	tags_string = " ".join(
+		f"#{str(tag).lstrip('#')}"
+		for tag in selected_tags
+		if str(tag).strip()
+	)	
 
 	preview = None
 	thumb_file_id = ""
@@ -615,10 +672,38 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 
 	thumb_file_id = data.get("thumb_file_id")
 	if thumb_file_id:
+		file_type = data.get("file_type","")
+		file_hash = file_type[0:1]+"_"+data.get("file_id")
+		thumb_reply_markup = InlineKeyboardMarkup(
+			inline_keyboard=[[
+				InlineKeyboardButton(
+					text="📋 复制",
+					copy_text=CopyTextButton(text=file_hash),
+				),
+				InlineKeyboardButton(
+					text="🌿 采菊",
+					url=f"https://t.me/share/url?url={file_hash}",
+				),
+			]]
+		)
+		thumb_caption = ""
+		thumb_caption = f'🌼 {html.escape(text)} '
+		if tags_string:
+			thumb_caption = f"{thumb_caption}\n\n{html.escape(tags_string)}"
+
 		try:
+			if PEACH_CHANNEL_ID:
+				target_id = PEACH_CHANNEL_ID
+			else:
+				target_id = X_MAN_BOT_ID
+				
+
 			thumb_result = await bot.send_photo(
-				chat_id=X_MAN_BOT_ID,
+				chat_id=target_id,
 				photo=thumb_file_id,
+				caption=thumb_caption,
+				parse_mode="HTML",
+				reply_markup=thumb_reply_markup,
 			)
 
 			print(f"thumb_result_file_id={thumb_result.photo[-1].file_id}", flush=True)
@@ -636,11 +721,14 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 				)
 
 				thumb_result = await bot.send_photo(
-					chat_id=X_MAN_BOT_ID,
+					chat_id=target_id,
 					photo=BufferedInputFile(
 						buffer.getvalue(),
 						filename="thumbnail.jpg",
 					),
+					caption=thumb_caption,
+					parse_mode="HTML",
+					reply_markup=thumb_reply_markup,
 				)
 
 				print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
@@ -652,13 +740,8 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 
 	
 	url = encode_file_url(data)
-	selected_tags = data.get("tags", [])
-	tags_string = " ".join(
-		f"#{str(tag).lstrip('#')}"
-		for tag in selected_tags
-		if str(tag).strip()
-	)
-	post_text = f'<a href="{html.escape(url, quote=True)}">🌼</a> {html.escape(text)}'
+
+	post_text = f'🌼 {html.escape(text)}<a href="{html.escape(url, quote=True)}">ㅤ</a> '
 	if tags_string:
 		post_text = f"{post_text}\n{html.escape(tags_string)}"
 	
@@ -698,32 +781,33 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 	await _pin_intro_post(post_item.message_id)
 
 
-	try:
-		if PEACH_CHANNEL_ID and int(PEACH_CHANNEL_ID) != 0:
-			if data['file_type'] == "video":
-				await _telegram_call_with_retry(
-					"forward intro video to peach channel",
-					lambda: bot.send_video(
-						chat_id = PEACH_CHANNEL_ID,
-						video =data['file_id'],
-						parse_mode="HTML",
-						caption=f"{html.escape(text)}",
-					),
-					chat_id=PEACH_CHANNEL_ID,
-				)
-			elif data['file_type'] == "document":
-				await _telegram_call_with_retry(
-					"forward intro document to peach channel",
-					lambda: bot.send_document(
-						chat_id = PEACH_CHANNEL_ID,
-						document =data['file_id'],
-						parse_mode="HTML",
-						caption=f"{html.escape(text)}",
-					),
-					chat_id=PEACH_CHANNEL_ID,
-				)
-	except Exception as exc:
-		print(f"[ENCODED_FORWARD] send to PEACH_CHANNEL failed: {exc}", flush=True)
+	# 因为初期已复制给 backup bot > xman, 因此媒体不直接到 peach_channel,而是用 thumb 送到 peach_channel
+	# try:
+	# 	if PEACH_CHANNEL_ID and int(PEACH_CHANNEL_ID) != 0:
+	# 		if data['file_type'] == "video":
+	# 			await _telegram_call_with_retry(
+	# 				"forward intro video to peach channel",
+	# 				lambda: bot.send_video(
+	# 					chat_id = PEACH_CHANNEL_ID,
+	# 					video =data['file_id'],
+	# 					parse_mode="HTML",
+	# 					caption=f"{html.escape(text)}",
+	# 				),
+	# 				chat_id=PEACH_CHANNEL_ID,
+	# 			)
+	# 		elif data['file_type'] == "document":
+	# 			await _telegram_call_with_retry(
+	# 				"forward intro document to peach channel",
+	# 				lambda: bot.send_document(
+	# 					chat_id = PEACH_CHANNEL_ID,
+	# 					document =data['file_id'],
+	# 					parse_mode="HTML",
+	# 					caption=f"{html.escape(text)}",
+	# 				),
+	# 				chat_id=PEACH_CHANNEL_ID,
+	# 			)
+	# except Exception as exc:
+	# 	print(f"[ENCODED_FORWARD] send to PEACH_CHANNEL failed: {exc}", flush=True)
 
 
 	await state.clear()
@@ -1633,7 +1717,10 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 		remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
 
 		cover_text = callback.message.text or callback.message.caption
-		cover_text = cover_text.replace('🌼',f'<a href="{url}">🌼</a>')
+		cover_text = f'{cover_text} <a href="{url}">ㅤ</a>'
+
+		
+
 		# print(f"cover_text=>{cover_text}")
 
 		if act_type == "preview":
@@ -1806,6 +1893,9 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 					url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
 					cache_time=0,
 				)
+
+
+
 			elif act_type == "buy":
 				# todo 使用 edit 重新更新媒体, 视 file_type 和 file_id 确定
 				await bot.edit_message_media(
@@ -1956,7 +2046,8 @@ async def on_backup_peach_link(callback: CallbackQuery) -> None:
 		remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
 
 		cover_text = callback.message.text
-		cover_text = cover_text.replace('🌼',f'<a href="{url}">🌼</a>')
+		# cover_text = cover_text.replace('🌼',f'<a href="{url}">🌼</a>')
+		cover_text = f'{cover_text} <a href="{url}">ㅤ</a>'
 		# print(f"cover_text=>{cover_text}")
 
 		notify_text = (
@@ -2701,6 +2792,21 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 
 	await message.reply("\n".join(lines))
 
+media_text_sender = MediaTextSender()
+
+
+@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def on_private_text_message(message: Message) -> None:
+	if not message.from_user or message.from_user.is_bot:
+		return
+	if blacklist_store.is_blocked(int(message.from_user.id)):
+		return
+	await fetch_media_from_text(message)
+
+
+async def fetch_media_from_text(message: Message) -> None:
+	await media_text_sender.send(bot, message.chat.id, message.text or "")
+
 # 常见良性 BadRequest：重复编辑同一内容、查询过期、消息已不存在等，静默处理即可
 BENIGN_BAD_REQUEST_MARKERS = (
 	"message is not modified",
@@ -2738,7 +2844,17 @@ async def on_telegram_error(event: ErrorEvent) -> None:
 		if any(marker in error_text for marker in BENIGN_BAD_REQUEST_MARKERS):
 			return
 
-	print(f"[TG_UPDATE_ERROR] {type(exception).__name__}: {exception}", flush=True)
+	if isinstance(exception, TelegramNetworkError):
+		method = getattr(exception, "method", None)
+		print(
+			f"[TG_UPDATE_NETWORK_ERROR] bot=@{bot_name} "
+			f"method={type(method).__name__} "
+			f"chat_id={getattr(method, 'chat_id', None)}: {exception}; "
+			"請檢查執行主機連往 api.telegram.org:443 的網路、DNS 與代理設定。",
+			flush=True,
+		)
+	else:
+		print(f"[TG_UPDATE_ERROR] {type(exception).__name__}: {exception}", flush=True)
 	if callback is not None:
 		try:
 			await callback.answer("❌ 操作失败，请稍后重试", show_alert=True, cache_time=0)
@@ -2746,28 +2862,64 @@ async def on_telegram_error(event: ErrorEvent) -> None:
 			pass
 
 
+def _report_backup_bot_exit(task: asyncio.Task) -> None:
+	if task.cancelled():
+		return
+	exception = task.exception()
+	if exception is not None:
+		print(
+			f"[BACKUP_BOT_ERROR] {type(exception).__name__}: {exception}",
+			flush=True,
+		)
+
+
 async def main() -> None:
 	global bot_name
-	me = await bot.get_me()
-	bot_name = str(getattr(me, "username", "") or "")
-	print(f"🤖 Bot started as @{bot_name}", flush=True)
-
-	await say_hello_to_x_man(bot_name)
-	await _check_bot_group_admin_permissions()
-
-
-	await bot.set_my_commands(
-		[
-			BotCommand(command="me", description="查询我的信息"),
-			BotCommand(command="rule", description="查看村规"),
-			BotCommand(command="home", description="回村"),
-		],
-		scope=BotCommandScopeAllPrivateChats(),
-	)
-
+	backup_bot_task = None
 	try:
+		me = await _telegram_call_with_retry("main bot get_me", bot.get_me)
+		bot_name = str(getattr(me, "username", "") or "")
+		print(f"🤖 Bot started as @{bot_name}", flush=True)
+
+		await say_hello_to_x_man(bot_name)
+		await _check_bot_group_admin_permissions()
+
+		await _telegram_call_with_retry(
+			"main bot set_my_commands",
+			lambda: bot.set_my_commands(
+				[
+					BotCommand(command="me", description="查询我的信息"),
+					BotCommand(command="rule", description="查看村规"),
+					BotCommand(command="home", description="回村"),
+				],
+				scope=BotCommandScopeAllPrivateChats(),
+			),
+		)
+
+		if BACKUP_BOT_TOKEN:
+			
+			from backup_bot import start_backup_bot
+
+			async def update_backup_bot_name(username: str) -> None:
+				global BACKUP_BOT_NAME
+				BACKUP_BOT_NAME = username
+				
+				await say_hello_to_x_man(username)
+
+			backup_bot_task = asyncio.create_task(
+				start_backup_bot(
+					on_ready=update_backup_bot_name,
+					x_man_bot_id=X_MAN_BOT_ID,
+				),
+				name="backup_bot",
+			)
+			backup_bot_task.add_done_callback(_report_backup_bot_exit)
+
 		await dp.start_polling(bot)
 	finally:
+		if backup_bot_task is not None:
+			backup_bot_task.cancel()
+			await asyncio.gather(backup_bot_task, return_exceptions=True)
 		await bot.session.close()
 
 

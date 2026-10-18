@@ -74,6 +74,7 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
             "BotCommand": Mock(),
             "BotCommandScopeAllPrivateChats": Mock(),
             "BACKUP_BOT_TOKEN": "test",
+            "bkbot": SimpleNamespace(session=SimpleNamespace(close=AsyncMock())),
             "X_MAN_BOT_ID": 1,
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
@@ -97,6 +98,7 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
             await namespace["main"]()
         self.assertTrue(stopped.is_set())
         namespace["bot"].session.close.assert_awaited_once()
+        namespace["bkbot"].session.close.assert_awaited_once()
 
     async def test_main_closes_session_when_initialization_fails(self):
         namespace = self._main_namespace()

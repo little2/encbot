@@ -2,11 +2,16 @@ import asyncio
 import inspect
 import time
 import unittest
+from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
-from utils.telegram_gate import TelegramGate, telegram_call
+from utils.telegram_gate import (
+    TelegramGate,
+    TelegramRateLimitMiddleware,
+    telegram_call,
+)
 
 
 def _retry_after(retry_after: int) -> TelegramRetryAfter:
@@ -28,7 +33,9 @@ class TelegramGateTests(unittest.TestCase):
         params = dict(
             max_concurrent=5,
             send_min_interval=0.0,
+            group_send_min_interval=0.0,
             edit_delete_min_interval=0.0,
+            global_min_interval=0.0,
             max_attempts=3,
         )
         params.update(kwargs)
@@ -69,7 +76,7 @@ class TelegramGateTests(unittest.TestCase):
         self.assertGreater(observed["remaining"], 0)
         self.assertEqual(gate.cooldown_remaining(111), 0.0)
 
-    def test_cooldown_blocks_same_chat_but_not_others(self) -> None:
+    def test_retry_after_sets_global_cooldown(self) -> None:
         gate = self._fast_gate(max_attempts=1)
 
         async def failing():
@@ -89,15 +96,11 @@ class TelegramGateTests(unittest.TestCase):
             with self.assertRaises(asyncio.TimeoutError):
                 await asyncio.wait_for(blocked, timeout=0.3)
 
-            # 其它 chat 不受影响
-            started = time.monotonic()
-            result = await asyncio.wait_for(
-                gate.call("other chat", ok, chat_id=2), timeout=1.0
-            )
-            elapsed = time.monotonic() - started
-            self.assertEqual(result, "ok")
-            self.assertLess(elapsed, 0.3)
-            self.assertEqual(gate.cooldown_remaining(2), 0.0)
+            # 429 的作用域无法可靠判断；其它 chat 也必须服从 bot 全局冷却。
+            blocked_other = gate.call("other chat", ok, chat_id=2)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(blocked_other, timeout=0.3)
+            self.assertGreater(gate.cooldown_remaining(2), 0)
 
         _run(scenario())
 
@@ -115,6 +118,38 @@ class TelegramGateTests(unittest.TestCase):
 
         _run(scenario())
         self.assertEqual(len(calls), 2)
+
+    def test_retry_after_is_never_truncated(self) -> None:
+        gate = self._fast_gate(max_attempts=1)
+
+        async def scenario():
+            with self.assertRaises(TelegramRetryAfter):
+                await gate.call(
+                    "long cooldown", lambda: _raise(_retry_after(300)), chat_id=8
+                )
+
+        _run(scenario())
+        self.assertGreater(gate.cooldown_remaining(999), 300)
+
+    def test_transport_middleware_paces_direct_group_sends(self) -> None:
+        gate = TelegramGate(
+            send_min_interval=0.0,
+            group_send_min_interval=0.03,
+            edit_delete_min_interval=0.0,
+            global_min_interval=0.0,
+        )
+        middleware = TelegramRateLimitMiddleware(gate)
+        make_request = AsyncMock(return_value="ok")
+        method = SendMessage(chat_id=-100123, text="x")
+
+        async def scenario():
+            start = time.monotonic()
+            await middleware(make_request, object(), method)
+            await middleware(make_request, object(), method)
+            return time.monotonic() - start
+
+        self.assertGreaterEqual(_run(scenario()), 0.025)
+        self.assertEqual(make_request.await_count, 2)
 
     def test_network_error_backoff_then_success(self) -> None:
         gate = self._fast_gate(max_attempts=3)
@@ -136,7 +171,9 @@ class TelegramGateTests(unittest.TestCase):
         gate = TelegramGate(
             max_concurrent=5,
             send_min_interval=0.0,
+            group_send_min_interval=0.0,
             edit_delete_min_interval=0.4,
+            global_min_interval=0.0,
             max_attempts=2,
         )
 
@@ -176,3 +213,7 @@ class TelegramGateTests(unittest.TestCase):
 
 async def _async_value(value):
     return value
+
+
+async def _raise(exc):
+    raise exc

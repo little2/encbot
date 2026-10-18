@@ -100,6 +100,7 @@ async def start_backup_bot(
 		token=token,
 		default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 	)
+	username = ""
 	try:
 		me = await telegram_call("backup bot get_me", video_bot.get_me)
 		username = str(getattr(me, "username", "") or "")
@@ -119,6 +120,7 @@ async def start_backup_bot(
 		await dispatcher.start_polling(video_bot, handle_signals=False)
 	except Exception as e:
 		_safe_print(f"❌ [VIDEO_BOT] 启动失败：@{username} :{e}")
+		raise
 	finally:
 		await video_bot.session.close()
 

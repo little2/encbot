@@ -17,7 +17,7 @@ from aiogram.types import ReplyKeyboardRemove
 from aiogram.types import ErrorEvent
 
 from utils.format_utils import FormatUtils
-from utils.media_text_sender import MediaTextSender
+from utils.media_text_sender import MediaTextSender, RECOVERY_CAPTION_PREFIX
 from utils.parse_utils import ParseUtils
 from utils.user_manager import UserManager
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
@@ -86,7 +86,7 @@ TAKEOFF_KICK_ORIGINAL_MARKUPS: dict[
 ] = {}
 
 TAKEOFF_KICK_REASONS = {
-	"not_shota": "非正太资源，例如萝莉、男同。",
+	"not_shota": "非资源，例如萝莉、男同。",
 	"other": "其他不符合要求的内容",
 }
 
@@ -155,6 +155,14 @@ bot = Bot(
 	token=BOT_TOKEN,
 	default=DefaultBotProperties(link_preview_is_disabled=True),
 )
+
+bkbot = None
+if BACKUP_BOT_TOKEN:
+	bkbot = Bot(
+		token=BACKUP_BOT_TOKEN,
+		default=DefaultBotProperties(link_preview_is_disabled=True),
+	)
+
 dp = Dispatcher()
 
 
@@ -162,8 +170,18 @@ INACTIVE_EXPIRE_DAYS = 0
 INACTIVE_CLEANUP_LOCK = asyncio.Lock()
 
 # Telegram 出站调用统一走 utils/telegram_gate：
-# 全局并发上限 + 按 chat 限速 + 收到 429 只对当前 chat 冷却，避免一次限流拖死整个 bot。
-from utils.telegram_gate import telegram_call as _telegram_call_with_retry
+# Bot 全局速率 + 按 chat/群组限速 + 完整遵守 429 retry_after。
+from utils.telegram_gate import (
+	TelegramRateLimitMiddleware,
+	telegram_call as _telegram_call_with_retry,
+)
+
+# Enforce Telegram traffic limits at the transport layer.  This also covers
+# convenience methods such as message.reply/delete and callback operations,
+# which otherwise bypass the explicit retry wrapper below.
+bot.session.middleware(TelegramRateLimitMiddleware())
+if bkbot is not None:
+	bkbot.session.middleware(TelegramRateLimitMiddleware())
 
 
 volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
@@ -381,7 +399,11 @@ async def _check_bot_group_admin_permissions() -> str:
 		print(notice_text, flush=True)
 		if int(KEY_MAN_ID or 0) > 0:
 			try:
-				await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
+				await _telegram_call_with_retry(
+					"send startup permission report",
+					lambda: bot.send_message(chat_id=KEY_MAN_ID, text=notice_text),
+					chat_id=KEY_MAN_ID,
+				)
 			except TelegramBadRequest as exc:
 				print(
 					f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
@@ -438,6 +460,17 @@ async def _send_media_to_backup_bot(message: Message) -> None:
 			f"chat_id={message.chat.id} message_id={message.message_id}: {exc}",
 			flush=True,
 		)
+
+
+@dp.message(
+	F.chat.type == "private",
+	F.from_user.id == (bkbot.id if bkbot else 0),
+	F.caption.startswith(RECOVERY_CAPTION_PREFIX),
+	F.video | F.document | F.photo,
+)
+async def on_backup_media_recovery(message: Message) -> None:
+	# Consume late/duplicate recovery updates too, keeping them out of submissions.
+	media_text_sender.accept_recovery(message)
 
 
 @dp.message(
@@ -703,20 +736,32 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 				target_id = X_MAN_BOT_ID
 				
 
-			thumb_result = await bot.send_photo(
+			thumb_result = await _telegram_call_with_retry(
+				"send intro thumbnail",
+				lambda: bot.send_photo(
+					chat_id=target_id,
+					photo=thumb_file_id,
+					caption=thumb_caption,
+					parse_mode="HTML",
+					reply_markup=thumb_reply_markup,
+					protect_content=True,
+				),
 				chat_id=target_id,
-				photo=thumb_file_id,
-				caption=thumb_caption,
-				parse_mode="HTML",
-				reply_markup=thumb_reply_markup,
-				protect_content = True
 			)
 
 			print(f"thumb_result_file_id={thumb_result.photo[-1].file_id}", flush=True)
 		
 			
-		except Exception as exc:
-			# print(f"[ENCODED_FORWARD] send thumb to X_MAN_BOT_ID failed: {exc}", flush=True)
+		except TelegramRetryAfter as exc:
+			# The retry wrapper already respected retry_after and exhausted its
+			# attempts. Do not immediately resend via the upload fallback.
+			print(f"[ENCODED_FORWARD] thumbnail rate limited: {exc}", flush=True)
+		except TelegramNetworkError as exc:
+			# Re-uploading cannot repair an exhausted network retry and would only
+			# add more traffic while Telegram is unreachable.
+			print(f"[ENCODED_FORWARD] thumbnail network failure: {exc}", flush=True)
+		except TelegramBadRequest as exc:
+			# A cross-bot file_id may be invalid; upload the bytes as a fallback.
 
 			try:
 				buffer = BytesIO()
@@ -726,16 +771,20 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 					destination=buffer,
 				)
 
-				thumb_result = await bot.send_photo(
-					chat_id=target_id,
-					photo=BufferedInputFile(
-						buffer.getvalue(),
-						filename="thumbnail.jpg",
+				thumb_result = await _telegram_call_with_retry(
+					"upload intro thumbnail fallback",
+					lambda: bot.send_photo(
+						chat_id=target_id,
+						photo=BufferedInputFile(
+							buffer.getvalue(),
+							filename="thumbnail.jpg",
+						),
+						caption=thumb_caption,
+						parse_mode="HTML",
+						reply_markup=thumb_reply_markup,
+						protect_content=True,
 					),
-					caption=thumb_caption,
-					parse_mode="HTML",
-					reply_markup=thumb_reply_markup,
-					protect_content = True
+					chat_id=target_id,
 				)
 
 				print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
@@ -1127,13 +1176,14 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 			await _telegram_call_with_retry(
 				f"notify kicked uploader {uploader_id}",
 				lambda: bot.send_message(
-					chat_id=uploader_id,
+				chat_id=uploader_id,
 					text=(
 						"🦶 桃花村移除通知\n\n"
 						"你将被移出「桃花林」与「桃花源」。\n"
 						f"移除理由：{reason}\n\n"						
 					),
 				),
+					chat_id=uploader_id,
 			)
 		except Exception as exc:
 			notice_errors.append(f"私聊通知失败：{exc}")
@@ -1146,7 +1196,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 			await _telegram_call_with_retry(
 				f"broadcast kicked uploader {uploader_id}",
 				lambda: bot.send_message(
-					chat_id=CHAT_SCHOOL_GROUP_ID,
+				chat_id=CHAT_SCHOOL_GROUP_ID,
 					text=(
 						"🦶 村民移除公告\n\n"
 						f'<a href="tg://user?id={uploader_id}">{uploader_id}</a> '
@@ -1155,6 +1205,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 					),
 					parse_mode="HTML",
 				),
+					chat_id=CHAT_SCHOOL_GROUP_ID,
 			)
 		except Exception as exc:
 			notice_errors.append(f"桃花林公告失败：{exc}")
@@ -1840,6 +1891,7 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 								caption=notify_text,
 								parse_mode="HTML" if notify_text else None,
 							),
+							chat_id=callback.from_user.id,
 						)
 						DEFAULT_COVER_FILE_ID = (
 							published_message.photo[-1].file_id
@@ -1856,6 +1908,7 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 								caption=notify_text,
 								parse_mode="HTML" if notify_text else None,
 							),
+							chat_id=callback.from_user.id,
 						)
 
 
@@ -2260,7 +2313,7 @@ async def on_join_request(join_request: ChatJoinRequest) -> None:
 		user_expire = user_expire_cache.get(int(join_request.from_user.id))
 		if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 
-			text = f"🚧 为避免坏份子混入桃花村，入村前请先交一份「投名状」——传送一份正太资源（文件或视频）给我，确认你我是否是同路人。\n\n📤 传送完成后，再重新申请加入群组。\n\n🍑 确认是同路人，方可入村。"
+			text = f"🚧 为避免坏份子混入桃花村，入村前请先交一份「投名状」——传送一份资源（文件或视频）给我，确认你我是否是同路人。\n\n📤 传送完成后，再重新申请加入群组。\n\n🍑 确认是同路人，方可入村。"
 			try:
 				await _telegram_call_with_retry(
 					"join request notice dm",
@@ -2812,7 +2865,7 @@ async def on_private_text_message(message: Message) -> None:
 
 
 async def fetch_media_from_text(message: Message) -> None:
-	await media_text_sender.send(bot, message.chat.id, message.text or "")
+	await media_text_sender.send(bot, message.chat.id, message.text or "", bkbot=bkbot)
 
 # 常见良性 BadRequest：重复编辑同一内容、查询过期、消息已不存在等，静默处理即可
 BENIGN_BAD_REQUEST_MARKERS = (
@@ -2928,6 +2981,8 @@ async def main() -> None:
 			backup_bot_task.cancel()
 			await asyncio.gather(backup_bot_task, return_exceptions=True)
 		await bot.session.close()
+		if bkbot is not None:
+			await bkbot.session.close()
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ cipher = NumberCipher(
 )
 
 
-PEACH_CHANNEL_ID = os.getenv("PEACH_CHANNEL_ID",0)
+SUBSRCIBE_PREVIEW_CHANNEL_ID = os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID",0)
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
@@ -65,6 +65,11 @@ if CHAT_ROW:
 	CHAT_PUBLIC_GROUP_ID = int(os.getenv("CHAT_PUBLIC_GROUP_ID", CHAT_PUBLIC.get("chat_id"))) 
 	CHAT_PUBLIC_THREAD_ID = int(os.getenv("CHAT_PUBLIC_THREAD_ID", CHAT_PUBLIC.get("thread_id")))
 	CHAT_PUBLIC_LINK = os.getenv("CHAT_PUBLIC_LINK", CHAT_PUBLIC.get("invite_link"))
+
+	SUBSRCIBE_PREVIEW = CHAT_ROW.get("subscribe_preview")
+	SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW.get("chat_id"))) 
+
+
 
 ADMIN_USER_IDS = ParseUtils.parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
 # 主要用户始终保留访问权限，避免共享配置遗漏时意外将其排除。
@@ -328,7 +333,7 @@ async def _check_bot_group_admin_permissions() -> str:
 	groups = (
 		("CHAT_PUBLIC_GROUP_ID", CHAT_PUBLIC_GROUP_ID),
 		("CHAT_SCHOOL_GROUP_ID", CHAT_SCHOOL_GROUP_ID),
-		("PEACH_CHANNEL_ID", PEACH_CHANNEL_ID),
+		("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW_CHANNEL_ID),
 		
 	)
 	notice_text = ""
@@ -692,8 +697,8 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			thumb_caption = f"{thumb_caption}\n\n{html.escape(tags_string)}"
 
 		try:
-			if PEACH_CHANNEL_ID:
-				target_id = PEACH_CHANNEL_ID
+			if SUBSRCIBE_PREVIEW_CHANNEL_ID:
+				target_id = SUBSRCIBE_PREVIEW_CHANNEL_ID
 			else:
 				target_id = X_MAN_BOT_ID
 				
@@ -704,6 +709,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 				caption=thumb_caption,
 				parse_mode="HTML",
 				reply_markup=thumb_reply_markup,
+				protect_content = True
 			)
 
 			print(f"thumb_result_file_id={thumb_result.photo[-1].file_id}", flush=True)
@@ -729,6 +735,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 					caption=thumb_caption,
 					parse_mode="HTML",
 					reply_markup=thumb_reply_markup,
+					protect_content = True
 				)
 
 				print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
@@ -783,28 +790,28 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 
 	# 因为初期已复制给 backup bot > xman, 因此媒体不直接到 peach_channel,而是用 thumb 送到 peach_channel
 	# try:
-	# 	if PEACH_CHANNEL_ID and int(PEACH_CHANNEL_ID) != 0:
+	# 	if SUBSRCIBE_PREVIEW_CHANNEL_ID and int(SUBSRCIBE_PREVIEW_CHANNEL_ID) != 0:
 	# 		if data['file_type'] == "video":
 	# 			await _telegram_call_with_retry(
 	# 				"forward intro video to peach channel",
 	# 				lambda: bot.send_video(
-	# 					chat_id = PEACH_CHANNEL_ID,
+	# 					chat_id = SUBSRCIBE_PREVIEW_CHANNEL_ID,
 	# 					video =data['file_id'],
 	# 					parse_mode="HTML",
 	# 					caption=f"{html.escape(text)}",
 	# 				),
-	# 				chat_id=PEACH_CHANNEL_ID,
+	# 				chat_id=SUBSRCIBE_PREVIEW_CHANNEL_ID,
 	# 			)
 	# 		elif data['file_type'] == "document":
 	# 			await _telegram_call_with_retry(
 	# 				"forward intro document to peach channel",
 	# 				lambda: bot.send_document(
-	# 					chat_id = PEACH_CHANNEL_ID,
+	# 					chat_id = SUBSRCIBE_PREVIEW_CHANNEL_ID,
 	# 					document =data['file_id'],
 	# 					parse_mode="HTML",
 	# 					caption=f"{html.escape(text)}",
 	# 				),
-	# 				chat_id=PEACH_CHANNEL_ID,
+	# 				chat_id=SUBSRCIBE_PREVIEW_CHANNEL_ID,
 	# 			)
 	# except Exception as exc:
 	# 	print(f"[ENCODED_FORWARD] send to PEACH_CHANNEL failed: {exc}", flush=True)

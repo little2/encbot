@@ -8,7 +8,7 @@
 - 全局 asyncio.Semaphore 限制并发，并限制 Bot Token 的总体请求速率；
 - 同一 chat 的连续调用保持最小间隔，群组发送使用更严格的每分钟额度；
 - 收到 TelegramRetryAfter 后完整遵守等待时间，并保守应用 Bot 全局冷却；
-- TelegramNetworkError 指数退避重试。
+- 网络错误默认向上抛出，只有明确可安全重复的操作才启用退避重试。
 
 仅依赖标准库与 aiogram 异常类型。
 """
@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from typing import Any, Awaitable, Callable, Optional
+from weakref import WeakKeyDictionary
 
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
@@ -47,6 +49,11 @@ class TelegramGate:
         global_min_interval: float = DEFAULT_GLOBAL_MIN_INTERVAL,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     ) -> None:
+        if max_concurrent < 1 or max_attempts < 1:
+            raise ValueError("max_concurrent and max_attempts must be positive")
+        if min(send_min_interval, group_send_min_interval,
+               edit_delete_min_interval, global_min_interval) < 0:
+            raise ValueError("rate limit intervals must not be negative")
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._send_min_interval = send_min_interval
         self._group_send_min_interval = group_send_min_interval
@@ -66,7 +73,7 @@ class TelegramGate:
         try:
             return int(chat_id)
         except (TypeError, ValueError):
-            return chat_id
+            return chat_id.lower() if isinstance(chat_id, str) else chat_id
 
     def _min_interval(self, kind: str, key: Any) -> float:
         if kind in {"edit", "delete"}:
@@ -74,7 +81,9 @@ class TelegramGate:
         if kind != "send":
             return 0.0
         # Telegram numeric group, supergroup and channel IDs are negative.
-        if isinstance(key, int) and key < 0:
+        if (isinstance(key, int) and key < 0) or (
+            isinstance(key, str) and key.startswith("@")
+        ):
             return self._group_send_min_interval
         return self._send_min_interval
 
@@ -116,14 +125,14 @@ class TelegramGate:
             now = time.monotonic()
             cooldown = max(
                 self._global_cooldown_until,
-                self._cooldown_until.get(key, 0.0) if key is not None else 0.0,
+                self._cooldown_until.get(key, 0.0),
             )
             if cooldown > now:
                 await asyncio.sleep(cooldown - now)
                 continue
             next_allowed = max(
                 self._global_next_allowed,
-                self._next_allowed.get(key, 0.0) if key is not None else 0.0,
+                self._next_allowed.get(key, 0.0),
             )
             if next_allowed > now:
                 await asyncio.sleep(next_allowed - now)
@@ -131,10 +140,11 @@ class TelegramGate:
             self._global_next_allowed = (
                 now + self._global_min_interval * max(1, int(global_weight))
             )
-            if key is not None:
-                self._next_allowed[key] = (
-                    now + min_interval * max(1, int(global_weight))
-                )
+            # Unknown send destinations share a conservative bucket as well.
+            self._next_allowed[key] = (
+                now + min_interval * max(1, int(global_weight))
+            )
+            self._maybe_prune()
             return
 
     async def call(
@@ -147,6 +157,7 @@ class TelegramGate:
         global_weight: int = 1,
         max_attempts: Optional[int] = None,
         on_retry: Optional[Callable[..., Any]] = None,
+        retry_network_errors: bool = False,
     ) -> Any:
         attempts = (
             max_attempts
@@ -155,12 +166,21 @@ class TelegramGate:
         )
         key = self._key(chat_id)
         for attempt in range(attempts):
-            await self._wait_turn(
-                key, self._min_interval(kind, key), global_weight=global_weight
-            )
             try:
                 async with self._semaphore:
-                    return await operation()
+                    # Reserve the rate slot only after acquiring capacity.
+                    # No await may intervene between this check and dispatch.
+                    await self._wait_turn(
+                        key, self._min_interval(kind, key),
+                        global_weight=global_weight,
+                    )
+                    try:
+                        return await operation()
+                    except TelegramRetryAfter as exc:
+                        # Publish cooldown before releasing capacity to queued
+                        # calls. Already in-flight HTTP requests cannot be recalled.
+                        self._set_cooldown(key, max(1, int(exc.retry_after)) + 1)
+                        raise
             except TelegramRetryAfter as exc:
                 delay = max(1, int(exc.retry_after)) + 1
                 # 等待统一交给下一轮 _wait_turn。
@@ -176,6 +196,9 @@ class TelegramGate:
                 if attempt + 1 >= attempts:
                     raise
             except TelegramNetworkError as exc:
+                # A timeout does not prove that a message was not delivered.
+                if not retry_network_errors:
+                    raise
                 delay = min(2 ** (attempt + 1), 10)
                 print(
                     f"[TELEGRAM_NETWORK] {label}: {exc}; "
@@ -202,12 +225,25 @@ class TelegramGate:
 
 _default_gate = TelegramGate()
 
+# Shared by clients using the same token and event loop, including independent
+# Bot/session objects. This is in-process only, not a distributed limiter.
+_token_gates = WeakKeyDictionary()
+
+
+def _get_token_gate(bot) -> TelegramGate:
+    loop = asyncio.get_running_loop()
+    gates = _token_gates.setdefault(loop, {})
+    token_key = hashlib.sha256(bot.token.encode("utf-8")).digest()
+    if token_key not in gates:
+        gates[token_key] = TelegramGate()
+    return gates[token_key]
+
 
 class TelegramRateLimitMiddleware:
     """Apply one transport-level gate to every request made by a Bot token."""
 
     def __init__(self, gate: Optional[TelegramGate] = None) -> None:
-        self.gate = gate or TelegramGate()
+        self.gate = gate
 
     async def __call__(self, make_request, bot, method):
         method_name = type(method).__name__
@@ -223,8 +259,15 @@ class TelegramRateLimitMiddleware:
             kind = "other"
 
         media = getattr(method, "media", None)
-        weight = len(media) if lowered == "sendmediagroup" and media else 1
-        return await self.gate.call(
+        message_ids = getattr(method, "message_ids", None)
+        if lowered == "sendmediagroup" and media:
+            weight = len(media)
+        elif lowered in {"copymessages", "forwardmessages"} and message_ids:
+            weight = len(message_ids)
+        else:
+            weight = 1
+        gate = self.gate if self.gate is not None else _get_token_gate(bot)
+        return await gate.call(
             method_name,
             lambda: make_request(bot, method),
             chat_id=chat_id,
@@ -243,6 +286,7 @@ async def telegram_call(
     chat_id: Any = None,
     kind: str = "send",
     global_weight: int = 1,
+    retry_network_errors: bool = False,
 ) -> Any:
     """兼容旧 `_telegram_call_with_retry(label, operation, ...)` 的模块级入口。"""
     return await _default_gate.call(
@@ -253,4 +297,5 @@ async def telegram_call(
         global_weight=global_weight,
         max_attempts=max_attempts,
         on_retry=on_retry,
+        retry_network_errors=retry_network_errors,
     )

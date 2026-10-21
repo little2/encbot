@@ -22,7 +22,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from utils.time_utils import app_now
-from utils.telegram_gate import telegram_call
+from utils.telegram_gate import TelegramRateLimitMiddleware, telegram_call
 from utils.video_store import VideoStore
 
 
@@ -102,7 +102,10 @@ async def start_backup_bot(
 	)
 	username = ""
 	try:
-		me = await telegram_call("backup bot get_me", video_bot.get_me)
+		video_bot.session.middleware(TelegramRateLimitMiddleware())
+		me = await telegram_call(
+			"backup bot get_me", video_bot.get_me, retry_network_errors=True
+		)
 		username = str(getattr(me, "username", "") or "")
 		if on_ready is not None:
 			ready_result = on_ready(username)

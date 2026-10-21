@@ -2,10 +2,12 @@ import asyncio
 import inspect
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from aiogram.methods import SendMessage
+from aiogram.methods import CopyMessages, ForwardMessages, SendMediaGroup, SendMessage
+from aiogram.types import InputMediaPhoto
 
 from utils.telegram_gate import (
     TelegramGate,
@@ -162,10 +164,127 @@ class TelegramGateTests(unittest.TestCase):
             return "ok"
 
         async def scenario():
-            return await gate.call("net", flaky_network, chat_id=4)
+            return await gate.call(
+                "net", flaky_network, chat_id=4, retry_network_errors=True
+            )
 
         self.assertEqual(_run(scenario()), "ok")
         self.assertEqual(len(calls), 2)
+
+    def test_network_failure_does_not_replay_send_by_default(self):
+        gate = self._fast_gate()
+        operation = AsyncMock(side_effect=_network_error())
+
+        async def scenario():
+            with self.assertRaises(TelegramNetworkError):
+                await gate.call("uncertain send", operation, chat_id=1)
+
+        _run(scenario())
+        operation.assert_awaited_once()
+
+    def test_queued_requests_keep_actual_dispatch_spacing(self):
+        async def scenario():
+            gate = self._fast_gate(max_concurrent=1, global_min_interval=0.02)
+            entered, release = asyncio.Event(), asyncio.Event()
+            sent = []
+
+            async def first():
+                entered.set()
+                await release.wait()
+
+            async def queued():
+                sent.append(time.monotonic())
+
+            first_task = asyncio.create_task(gate.call("first", first, chat_id=1))
+            await entered.wait()
+            pending = [asyncio.create_task(gate.call("queued", queued, chat_id=i))
+                       for i in range(2, 6)]
+            # Longer than all rate reservations in the old implementation.
+            await asyncio.sleep(0.12)
+            release.set()
+            await asyncio.gather(first_task, *pending)
+            for before, after in zip(sent, sent[1:]):
+                self.assertGreaterEqual(after - before, 0.018)
+
+        _run(scenario())
+
+    def test_queued_request_obeys_new_429_cooldown(self):
+        async def scenario():
+            gate = self._fast_gate(max_concurrent=1, max_attempts=1)
+            entered, release = asyncio.Event(), asyncio.Event()
+            operation = AsyncMock()
+
+            async def first():
+                entered.set()
+                await release.wait()
+                raise _retry_after(300)
+
+            first_task = asyncio.create_task(gate.call("first", first, chat_id=1))
+            await entered.wait()
+            pending = asyncio.create_task(gate.call("queued", operation, chat_id=2))
+            await asyncio.sleep(0)
+            release.set()
+            with self.assertRaises(TelegramRetryAfter):
+                await first_task
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(pending, timeout=0.03)
+            operation.assert_not_awaited()
+            self.assertGreater(gate.cooldown_remaining(2), 300)
+            # Cancellation while cooling must release concurrency capacity.
+            self.assertFalse(gate._semaphore.locked())
+
+        _run(scenario())
+
+    def test_username_and_unknown_destinations_are_paced(self):
+        async def scenario():
+            gate = self._fast_gate(
+                send_min_interval=0.02, group_send_min_interval=0.03
+            )
+            for first, second, minimum in (
+                ("@Example", "@example", 0.025), (None, None, 0.018)
+            ):
+                start = time.monotonic()
+                await gate.call("first", lambda: _async_value(None), chat_id=first)
+                await gate.call("second", lambda: _async_value(None), chat_id=second)
+                self.assertGreaterEqual(time.monotonic() - start, minimum)
+
+        _run(scenario())
+
+    def test_clients_using_same_token_share_cooldown(self):
+        async def scenario():
+            first, second = TelegramRateLimitMiddleware(), TelegramRateLimitMiddleware()
+            bot1 = SimpleNamespace(token="123:test-only-token")
+            bot2 = SimpleNamespace(token="123:test-only-token")
+            method = SendMessage(chat_id=1, text="x")
+            failing = AsyncMock(side_effect=_retry_after(300))
+            with self.assertRaises(TelegramRetryAfter):
+                await first(failing, bot1, method)
+            next_request = AsyncMock()
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(second(next_request, bot2, method), timeout=0.03)
+            next_request.assert_not_awaited()
+            # A different token has independent quotas and cooldowns.
+            await second(next_request, SimpleNamespace(token="456:other-token"), method)
+            next_request.assert_awaited_once()
+
+        _run(scenario())
+
+    def test_batch_methods_charge_each_message(self):
+        async def scenario():
+            gate = self._fast_gate()
+            gate.call = AsyncMock(return_value="ok")
+            middleware = TelegramRateLimitMiddleware(gate)
+            methods = [
+                CopyMessages(chat_id=1, from_chat_id=2, message_ids=[1, 2, 3]),
+                ForwardMessages(chat_id=1, from_chat_id=2, message_ids=[1, 2, 3]),
+                SendMediaGroup(chat_id=1, media=[InputMediaPhoto(media=str(i))
+                                               for i in range(3)]),
+            ]
+            for method in methods:
+                await middleware(AsyncMock(), object(), method)
+                self.assertEqual(gate.call.await_args.kwargs["global_weight"], 3)
+
+        _run(scenario())
 
     def test_min_interval_and_kind_tiers(self) -> None:
         gate = TelegramGate(

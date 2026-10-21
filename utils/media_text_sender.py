@@ -6,7 +6,7 @@ from functools import partial
 from uuid import uuid4
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 
 from utils.telegram_gate import TelegramGate
@@ -130,6 +130,10 @@ class MediaTextSender:
             operation = self._operation(bot, chat_id, batch)
             try:
                 await self.gate.call("send parsed media", operation, chat_id=chat_id)
+            except (TelegramNetworkError, TelegramRetryAfter):
+                # An uncertain delivery or exhausted flood wait must not trigger
+                # a second delivery via the backup recovery path.
+                raise
             except TelegramAPIError as exc:
                 print(f"[MEDIA_TEXT_SEND_FAILED] chat_id={chat_id}: {exc}", flush=True)
                 if bkbot is not None:

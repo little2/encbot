@@ -94,20 +94,23 @@ class MediaTextSenderTests(unittest.IsolatedAsyncioTestCase):
         self.bot.send_document.assert_awaited_once()
         self.assertIn("2", self.bot.send_message.await_args.kwargs["text"])
 
-    async def test_network_retry_does_not_replay_successful_album(self):
+    async def test_uncertain_network_failure_does_not_replay_album(self):
         method = SendMediaGroup(chat_id=42, media=[
             InputMediaPhoto(media="a"), InputMediaPhoto(media="b"),
         ])
         self.bot.send_media_group.side_effect = [
             None, TelegramNetworkError(method, "offline"), None,
         ]
-        with patch("utils.telegram_gate.asyncio.sleep", new=AsyncMock()):
-            await self.sender.send(self.bot, 42, " ".join(f"p_id{i}" for i in range(10)))
+        with self.assertRaises(TelegramNetworkError):
+            await self.sender.send(
+                self.bot, 42, " ".join(f"p_id{i}" for i in range(10)), self.backup_bot
+            )
         attempts = self.bot.send_media_group.await_args_list
-        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(attempts), 2)
         self.assertEqual(attempts[0].kwargs["media"][0].media, "id0")
         self.assertEqual(attempts[1].kwargs["media"][0].media, "id5")
-        self.assertEqual(attempts[2].kwargs["media"][0].media, "id5")
+        self.backup_bot.send_photo.assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
 
     async def test_concurrent_requests_share_chat_pacing(self):
         self.sender.gate = TelegramGate(send_min_interval=0.03)

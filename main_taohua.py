@@ -86,7 +86,8 @@ TAKEOFF_KICK_ORIGINAL_MARKUPS: dict[
 ] = {}
 
 TAKEOFF_KICK_REASONS = {
-	"not_shota": "非资源，例如萝莉、男同。",
+	"not_shota": "并非资源，请勿上传萝莉、男同此类的资源。",
+	"not_correct": "内容描述不符合实际内容",
 	"other": "其他不符合要求的内容",
 }
 
@@ -2321,7 +2322,7 @@ async def on_join_request(join_request: ChatJoinRequest) -> None:
 		user_expire = user_expire_cache.get(int(join_request.from_user.id))
 		if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 
-			text = f"🚧 为避免坏份子混入桃花村，入村前请先交一份「投名状」——传送一份资源（文件或视频）给我，确认你我是否是同路人。\n\n📤 传送完成后，再重新申请加入群组。\n\n🍑 确认是同路人，方可入村。"
+			text = f"🚧 为避免验证您是同好身份，请入村前先交一份——传送一份资源（文件或视频）给我，确认你我是否志同道同。\n\n📤 传送完成后，再重新申请加入群组。\n\n🍑 确认完成后，方可入村。"
 			try:
 				await _telegram_call_with_retry(
 					"join request notice dm",
@@ -2945,7 +2946,9 @@ async def main() -> None:
 	global bot_name
 	backup_bot_task = None
 	try:
-		me = await _telegram_call_with_retry("main bot get_me", bot.get_me)
+		me = await _telegram_call_with_retry(
+			"main bot get_me", bot.get_me, retry_network_errors=True
+		)
 		bot_name = str(getattr(me, "username", "") or "")
 		print(f"🤖 Bot started as @{bot_name}", flush=True)
 

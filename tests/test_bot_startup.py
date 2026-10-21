@@ -20,7 +20,7 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(username="backup_test"),
             ]),
             set_my_commands=AsyncMock(),
-            session=SimpleNamespace(close=AsyncMock()),
+            session=SimpleNamespace(close=AsyncMock(), middleware=Mock()),
         )
         dispatcher = SimpleNamespace(start_polling=AsyncMock())
         ready = AsyncMock()
@@ -38,11 +38,12 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
         ready.assert_awaited_once_with("backup_test")
         dispatcher.start_polling.assert_awaited_once_with(bot, handle_signals=False)
         bot.session.close.assert_awaited_once()
+        bot.session.middleware.assert_called_once()
 
     async def test_backup_closes_session_when_startup_fails(self):
         bot = SimpleNamespace(
             get_me=AsyncMock(side_effect=RuntimeError("invalid credentials")),
-            session=SimpleNamespace(close=AsyncMock()),
+            session=SimpleNamespace(close=AsyncMock(), middleware=Mock()),
         )
         with (
             patch.dict("os.environ", {"BACKUP_BOT_TOKEN": "test"}),

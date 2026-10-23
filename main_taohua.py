@@ -136,6 +136,42 @@ _WHITE_JPEG_BYTES = base64.b64decode(_WHITE_JPEG_BASE64)
 
 BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "").strip()
 BACKUP_BOT_NAME = ""
+BACKUP_BOT_NAME_LOCK = asyncio.Lock()
+OPERATIONAL_NOTIFICATION_COOLDOWN_SECONDS = 600.0
+OPERATIONAL_NOTIFICATION_LAST_SENT: dict[str, float] = {}
+OPERATIONAL_NOTIFICATION_TASKS: set[asyncio.Task] = set()
+
+
+async def _send_operational_notification(text: str) -> None:
+	try:
+		await asyncio.to_thread(
+			SharedConfig._download_from_api,
+			{"text": text},
+		)
+	except asyncio.CancelledError:
+		raise
+	except Exception as exc:
+		print(f"[OPERATIONAL_NOTIFICATION_ERROR] {exc}", flush=True)
+
+
+def _schedule_operational_notification(text: str, *, cooldown_key: str) -> bool:
+	"""在背景发送运维通知；相同错误于冷却期间只发送一次。"""
+	now = time.monotonic()
+	last_sent = OPERATIONAL_NOTIFICATION_LAST_SENT.get(cooldown_key)
+	if (
+		last_sent is not None
+		and now - last_sent < OPERATIONAL_NOTIFICATION_COOLDOWN_SECONDS
+	):
+		return False
+
+	OPERATIONAL_NOTIFICATION_LAST_SENT[cooldown_key] = now
+	task = asyncio.create_task(
+		_send_operational_notification(text),
+		name=f"operational-notification:{cooldown_key}",
+	)
+	OPERATIONAL_NOTIFICATION_TASKS.add(task)
+	task.add_done_callback(OPERATIONAL_NOTIFICATION_TASKS.discard)
+	return True
 
 @lru_cache(maxsize=1)
 def _get_default_image_bytes() -> bytes:
@@ -436,10 +472,12 @@ async def _send_media_to_backup_bot(message: Message) -> None:
 		return
 	try:
 		if not BACKUP_BOT_NAME:
-			# 备份轮询可能尚未完成启动，先获取目标用户名。
-			async with Bot(token=BACKUP_BOT_TOKEN) as backup_client:
-				me = await backup_client.get_me()
-				BACKUP_BOT_NAME = str(me.username or "")
+			async with BACKUP_BOT_NAME_LOCK:
+				if not BACKUP_BOT_NAME:
+					# 备份轮询可能尚未完成启动，先获取目标用户名。
+					async with Bot(token=BACKUP_BOT_TOKEN) as backup_client:
+						me = await backup_client.get_me()
+						BACKUP_BOT_NAME = str(me.username or "")
 		if not BACKUP_BOT_NAME:
 			raise RuntimeError("备份机器人没有可用的用户名")
 		target = f"@{BACKUP_BOT_NAME.lstrip('@')}"
@@ -451,15 +489,25 @@ async def _send_media_to_backup_bot(message: Message) -> None:
 	except Exception as exc:
 		if "USER_BOT_TO_BOT_DISABLED" in str(exc):
 			print(
-				f"⚠️ [BACKUP_BOT] 媒体复制失败 - 未开启机器人之间的媒体通信 botfather -> bot -> bot settings -> bot to bot communication mode 打开"
+				"⚠️ [BACKUP_BOT] 媒体复制失败 - 未开启机器人之间的媒体通信 "
+				"botfather -> bot -> bot settings -> bot to bot communication mode 打开；"
 				f"chat_id={message.chat.id} message_id={message.message_id}: {exc}",
 				flush=True,
+			)
+			_schedule_operational_notification(
+				f"Bot {BACKUP_BOT_NAME or 'unknown'} - media copy failed: "
+				"USER_BOT_TO_BOT_DISABLED",
+				cooldown_key="backup-media:user-bot-to-bot-disabled",
 			)
 			return
 		print(
 			f"⚠️ [BACKUP_BOT] 媒体复制失败 "
 			f"chat_id={message.chat.id} message_id={message.message_id}: {exc}",
 			flush=True,
+		)
+		_schedule_operational_notification(
+			f"Bot {BACKUP_BOT_NAME or 'unknown'} - media copy failed: {exc}",
+			cooldown_key="backup-media:other",
 		)
 
 
@@ -799,6 +847,26 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			# A cross-bot file_id may be invalid; upload the bytes as a fallback.
 
 			print(f"[ENCODED_FORWARD] thumbnail bad request: {exc}", flush=True)
+			'''
+			[ENCODED_FORWARD] thumbnail bad request: Telegram server says - Bad Request: chat not found
+Failed to fetch updates - TelegramUnauthorizedError: Telegram server says - Unauthorized
+Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 8792766907)
+			'''
+			if "Unauthorized" in str(exc):
+				try:
+					await asyncio.to_thread(
+						SharedConfig._download_from_api,
+						{"text": f"Bot {target_id} - unauthorized error"},
+					)
+				except asyncio.CancelledError:
+					raise
+				except Exception as notification_exc:
+					print(
+						f"[ENCODED_FORWARD] unauthorized notification failed: {notification_exc}",
+						flush=True,
+					)
+
+
 		except Exception as exc:
 			print(f"[ENCODED_FORWARD] download and send thumb failed: {exc}", flush=True)
 
@@ -2985,12 +3053,31 @@ async def main() -> None:
 				name="backup_bot",
 			)
 			backup_bot_task.add_done_callback(_report_backup_bot_exit)
-
+		try:
+			await asyncio.to_thread(
+				SharedConfig._download_from_api,
+				{"text": "Bot started"},
+			)
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			print(
+				f"[STARTUP_NOTIFICATION_ERROR] {type(exc).__name__}: {exc}",
+				flush=True,
+			)
 		await dp.start_polling(bot)
 	finally:
 		if backup_bot_task is not None:
 			backup_bot_task.cancel()
 			await asyncio.gather(backup_bot_task, return_exceptions=True)
+		if OPERATIONAL_NOTIFICATION_TASKS:
+			pending_notifications = tuple(OPERATIONAL_NOTIFICATION_TASKS)
+			for task in pending_notifications:
+				task.cancel()
+			await asyncio.gather(
+				*pending_notifications,
+				return_exceptions=True,
+			)
 		await bot.session.close()
 		if bkbot is not None:
 			await bkbot.session.close()

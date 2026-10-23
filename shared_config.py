@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib import error, request
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 SETTING_URL = os.getenv('SETTING_URL')
 
@@ -23,12 +24,23 @@ class SharedConfig:
         cls.CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     @classmethod
-    def _download_from_api(cls) -> Dict[str, Any]:
+    def _download_from_api(cls, param:dict|None = None) -> Dict[str, Any]:
         """
         从远端 API 下载 JSON
+        param: 可选的 URL 参数字典，会附加到 API_URL 后添加为查询参数
+        返回: 配置数据
         """
+        request_url = cls.API_URL
+        if param:
+            url_parts = urlsplit(request_url)
+            query = parse_qsl(url_parts.query, keep_blank_values=True)
+            query.extend((str(key), str(value)) for key, value in param.items())
+            request_url = urlunsplit(
+                url_parts._replace(query=urlencode(query))
+            )
+
         try:
-            with request.urlopen(cls.API_URL, timeout=10) as response:
+            with request.urlopen(request_url, timeout=10) as response:
                 payload = response.read().decode("utf-8", errors="ignore")
         except error.URLError:
             raise

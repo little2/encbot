@@ -77,6 +77,8 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
             "BACKUP_BOT_TOKEN": "test",
             "bkbot": SimpleNamespace(session=SimpleNamespace(close=AsyncMock())),
             "X_MAN_BOT_ID": 1,
+            "SharedConfig": SimpleNamespace(_download_from_api=Mock(return_value={})),
+            "OPERATIONAL_NOTIFICATION_TASKS": set(),
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
         return namespace
@@ -98,8 +100,23 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(backup_bot, "start_backup_bot", side_effect=backup):
             await namespace["main"]()
         self.assertTrue(stopped.is_set())
+        namespace["SharedConfig"]._download_from_api.assert_called_once_with(
+            {"text": "Bot started"}
+        )
         namespace["bot"].session.close.assert_awaited_once()
         namespace["bkbot"].session.close.assert_awaited_once()
+
+    async def test_main_continues_when_startup_notification_fails(self):
+        namespace = self._main_namespace()
+        namespace["BACKUP_BOT_TOKEN"] = ""
+        namespace["SharedConfig"]._download_from_api.side_effect = RuntimeError(
+            "notification unavailable"
+        )
+
+        await namespace["main"]()
+
+        namespace["dp"].start_polling.assert_awaited_once_with(namespace["bot"])
+        namespace["bot"].session.close.assert_awaited_once()
 
     async def test_main_closes_session_when_initialization_fails(self):
         namespace = self._main_namespace()

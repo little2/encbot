@@ -57,7 +57,7 @@ from aiogram.types import (
 
 from html import escape
 from typing import Union
-
+from utils.control_panel import ControlPanel
 from utils.utf_utils import UtfConverter
 from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
@@ -5123,74 +5123,6 @@ async def _is_member_of_chat(chat_id: int, user_id: int) -> bool:
 	return _is_current_chat_member(status)
 
 
-async def _check_bot_group_admin_permissions() -> str:
-	groups = (
-		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
-		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
-		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
-		("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
-		*(
-			(f"APRON_CHANNEL_ID[{index}]", chat_id)
-			for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
-		),
-	)
-	notice_text = ""
-	for setting_name, chat_id in groups:
-		if chat_id == 0:
-			print(
-				f"❌[群組設定錯誤] {setting_name} 尚未配置。",
-				flush=True,
-			)
-			continue
-
-		try:
-			bot_status = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
-		except TelegramBadRequest as exc:
-			if "chat not found" in str(exc).lower():
-
-				notice_text += (
-					f"❌[群組設定錯誤]  {setting_name} = {chat_id}  找不到群組。"
-					"請確認群組 ID 正確，並將機器人加入群組及設為管理員。\n"
-				)
-				continue
-
-			notice_text += (
-				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
-			)
-			continue
-		except Exception as exc:
-			notice_text += (
-				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
-			)
-			continue
-
-		if bot_status.status not in ("administrator", "creator"):
-
-			notice_text += (
-				f"❌[群組權限不足] 機器人在 {setting_name}={chat_id} 中的身分為 "
-				f"{bot_status.status}，請將機器人設為管理員。\n"
-			)
-			continue
-		notice_text += (
-			f"✅[群組檢查成功] 機器人已在 {setting_name}={chat_id} 中並具有管理員權限。\n"
-		)
-
-	if notice_text:
-		print(notice_text, flush=True)
-		if int(KEY_MAN_ID or 0) > 0:
-			try:
-				await bot.send_message(chat_id=KEY_MAN_ID, text=notice_text)
-			except Exception as exc:
-				print(
-					f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
-					flush=True,
-				)
-		else:
-			print(
-				"⚠️ [群組檢查通知未送出] KEY_MAN_ID 尚未配置。",
-				flush=True,
-			)
-	return notice_text
 
 
 async def _get_join_rejection_reason(
@@ -7375,8 +7307,24 @@ async def main() -> None:
 	print(f"🤖 Bot started as @{bot_name}", flush=True)
 
 	await say_hello_to_x_man(bot_name)
-	await _check_bot_group_admin_permissions()
-	
+
+	groups = (
+		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
+		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
+		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+		("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
+		*(
+			(f"APRON_CHANNEL_ID[{index}]", chat_id)
+			for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
+		),
+	)
+
+	await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
+		bot=bot,
+		bot_name=bot_name,
+		groups=groups,
+		telegram_call=_telegram_call_with_retry,
+	)	
 
 
 	await bot.set_my_commands(

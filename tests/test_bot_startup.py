@@ -71,13 +71,21 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
             "dp": SimpleNamespace(start_polling=AsyncMock()),
             "_telegram_call_with_retry": TelegramGate(send_min_interval=0).call,
             "say_hello_to_x_man": AsyncMock(),
-            "_check_bot_group_admin_permissions": AsyncMock(),
+            "ControlPanel": Mock(return_value=SimpleNamespace(
+                check_bot_group_admin_permissions=AsyncMock()
+            )),
             "BotCommand": Mock(),
             "BotCommandScopeAllPrivateChats": Mock(),
             "BACKUP_BOT_TOKEN": "test",
             "bkbot": SimpleNamespace(session=SimpleNamespace(close=AsyncMock())),
             "X_MAN_BOT_ID": 1,
-            "SharedConfig": SimpleNamespace(_download_from_api=Mock(return_value={})),
+            "CHAT_PUBLIC_GROUP_ID": 0,
+            "CHAT_SCHOOL_GROUP_ID": 0,
+            "SUBSRCIBE_PREVIEW_CHANNEL_ID": 0,
+            "SharedConfig": SimpleNamespace(
+                _download_from_api=Mock(return_value={}),
+                get_all=Mock(return_value={}),
+            ),
             "OPERATIONAL_NOTIFICATION_TASKS": set(),
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)

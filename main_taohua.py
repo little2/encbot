@@ -17,6 +17,7 @@ from aiogram.types import ReplyKeyboardRemove
 from aiogram.types import ErrorEvent
 
 from utils.format_utils import FormatUtils
+from utils.control_panel import ControlPanel
 from utils.media_text_sender import MediaTextSender, RECOVERY_CAPTION_PREFIX
 from utils.parse_utils import ParseUtils
 from utils.user_manager import UserManager
@@ -49,7 +50,7 @@ cipher = NumberCipher(
 )
 
 
-SUBSRCIBE_PREVIEW_CHANNEL_ID = os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID",0)
+SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID",0))
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
@@ -383,87 +384,6 @@ async def say_hello_to_x_man(bot_name):
 			await switchbot.session.close()
 	else:
 		print("❌ No SWITCHBOT_TOKEN found, skipping hello to X-Man bot.", flush=True)
-
-async def _check_bot_group_admin_permissions() -> str:
-	groups = (
-		("CHAT_PUBLIC_GROUP_ID", CHAT_PUBLIC_GROUP_ID),
-		("CHAT_SCHOOL_GROUP_ID", CHAT_SCHOOL_GROUP_ID),
-		("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW_CHANNEL_ID),
-		
-	)
-	notice_text = ""
-	for setting_name, chat_id in groups:
-		if chat_id == 0:
-			print(
-				f"❌[群組設定錯誤] {setting_name} 尚未配置。",
-				flush=True,
-			)
-			continue
-
-		try:
-			bot_status = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
-		except TelegramBadRequest as exc:
-			if "chat not found" in str(exc).lower():
-
-				notice_text += (
-					f"❌[群組設定錯誤] {setting_name}={chat_id} 找不到群組。"
-					"請確認群組 ID 正確，並將機器人加入群組及設為管理員。\n"
-				)
-				continue
-
-			notice_text += (
-				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
-			)
-			continue
-		except Exception as exc:
-			notice_text += (
-				f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
-			)
-			continue
-
-		if bot_status.status not in ("administrator", "creator"):
-
-			notice_text += (
-				f"❌[群組權限不足] 機器人在 {setting_name}={chat_id} 中的身分為 "
-				f"{bot_status.status}，請將機器人設為管理員。\n"
-			)
-			continue
-		notice_text += (
-			f"✅[群組檢查成功] 機器人已在 {setting_name}={chat_id} 中並具有管理員權限。\n"
-		)
-
-	if notice_text:
-		print(notice_text, flush=True)
-		if int(KEY_MAN_ID or 0) > 0:
-			try:
-				await _telegram_call_with_retry(
-					"send startup permission report",
-					lambda: bot.send_message(chat_id=KEY_MAN_ID, text=notice_text),
-					chat_id=KEY_MAN_ID,
-				)
-			except TelegramBadRequest as exc:
-				print(
-					f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
-					flush=True,
-				)
-				if "chat not found" in str(exc).lower():
-					print(
-						"請確認 KEY_MAN_ID 是正確的使用者 ID，並由該帳號開啟"
-						f" @{bot_name} 私訊，按下 Start 或傳送 /start。",
-						flush=True,
-					)
-			except Exception as exc:
-				print(
-					f"⚠️ [群組檢查通知未送出] KEY_MAN_ID={KEY_MAN_ID}: {exc}",
-					flush=True,
-				)
-		else:
-			print(
-				"⚠️ [群組檢查通知未送出] KEY_MAN_ID 尚未配置。",
-				flush=True,
-			)
-	return notice_text
-
 
 async def _send_media_to_backup_bot(message: Message) -> None:
 	"""将完整媒体消息复制给 BACKUP_BOT_NAME，保留原媒体和说明文字。"""
@@ -3014,14 +2934,28 @@ async def main() -> None:
 	global bot_name
 	backup_bot_task = None
 	try:
-		me = await _telegram_call_with_retry(
-			"main bot get_me", bot.get_me, retry_network_errors=True
-		)
+		try:
+			me = await _telegram_call_with_retry(
+				"main bot get_me", bot.get_me, retry_network_errors=True
+			)
+		except Exception as e:
+			print(f"[TELEGRAM_ERROR] {type(e).__name__}: {e}", flush=True)
+			return
+
 		bot_name = str(getattr(me, "username", "") or "")
 		print(f"🤖 Bot started as @{bot_name}", flush=True)
 
 		await say_hello_to_x_man(bot_name)
-		await _check_bot_group_admin_permissions()
+		await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
+			bot=bot,
+			bot_name=bot_name,
+			groups=(
+				("CHAT_PUBLIC_GROUP_ID", CHAT_PUBLIC_GROUP_ID),
+				("CHAT_SCHOOL_GROUP_ID", CHAT_SCHOOL_GROUP_ID),
+				("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW_CHANNEL_ID),
+			),
+			telegram_call=_telegram_call_with_retry,
+		)
 
 		await _telegram_call_with_retry(
 			"main bot set_my_commands",
@@ -3053,19 +2987,22 @@ async def main() -> None:
 				name="backup_bot",
 			)
 			backup_bot_task.add_done_callback(_report_backup_bot_exit)
-		try:
-			await asyncio.to_thread(
-				SharedConfig._download_from_api,
-				{"text": "Bot started"},
-			)
-		except asyncio.CancelledError:
-			raise
-		except Exception as exc:
-			print(
-				f"[STARTUP_NOTIFICATION_ERROR] {type(exc).__name__}: {exc}",
-				flush=True,
-			)
+		# try:
+		# 	await asyncio.to_thread(
+		# 		SharedConfig._download_from_api,
+		# 		{"text": "Bot started"},
+		# 	)
+		# except asyncio.CancelledError:
+		# 	raise
+		# except Exception as exc:
+		# 	print(
+		# 		f"[STARTUP_NOTIFICATION_ERROR] {type(exc).__name__}: {exc}",
+		# 		flush=True,
+		# 	)
 		await dp.start_polling(bot)
+	except Exception as exception:
+		print(f"[STARTUP_ERROR] {type(exception).__name__}: {exception}", flush=True)
+	
 	finally:
 		if backup_bot_task is not None:
 			backup_bot_task.cancel()

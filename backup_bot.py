@@ -119,10 +119,10 @@ async def start_backup_bot(
 			BotCommand(command="check", description="查看資源分享情況"),
 			BotCommand(command="board", description="班机时刻表"),
 		]))
-		_safe_print(f"✅ [VIDEO_BOT] 已启动：@{username}")
+		_safe_print(f"✅ [BACKUP_BOT] 已启动：@{username}")
 		await dispatcher.start_polling(video_bot, handle_signals=False)
 	except Exception as e:
-		_safe_print(f"❌ [VIDEO_BOT] 启动失败：@{username} :{e}")
+		_safe_print(f"❌ [BACKUP_BOT] 启动失败：@{username} :{e}")
 		raise
 	finally:
 		await video_bot.session.close()

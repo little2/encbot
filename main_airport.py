@@ -125,7 +125,10 @@ from config import (
 from shared_config import SharedConfig
 SharedConfig.load(True)
 
-BACKUP_TOKEN = os.getenv("BACKUP_TOKEN", "")
+BACKUP_TOKEN = os.getenv("BACKUP_TOKEN", "") #用于同一个频道来做
+
+BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "")
+BACKUP_BOT_NAME = None  #用于接收
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
@@ -169,7 +172,7 @@ AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(AIRPORT_FLIGHT_BOARD_CHANNEL_ID or 0)
 AIRPORT_FLIGHT_BOARD_CHANNEL_URL = str(zttower_airport_flight_board_channel.get("invite_link", ""))
 
 
-PEACH_CHAT_ID = 0
+
 
 
 #发言可以增加通行证时间的群组
@@ -1462,6 +1465,7 @@ def _enqueue_media_forward(task: MediaForwardTask) -> None:
 
 async def _forward_media_in_background(task: MediaForwardTask) -> None:
 	seen_destination_ids: set[int] = set()
+	
 	remaining_apron_ids = list(APRON_CHANNEL_IDS)
 	while remaining_apron_ids:
 		selected_apron_id = secrets.choice(remaining_apron_ids)
@@ -1490,6 +1494,21 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 			task,
 			"X_MAN_BOT_ID",
 			X_MAN_BOT_ID,
+		)
+	finally:
+		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
+
+	if BACKUP_BOT_NAME is None:
+		return
+	backup_bot_username = str(BACKUP_BOT_NAME).strip().lstrip("@")
+	if not backup_bot_username:
+		return
+	try:
+		print("发送至备用机器人")
+		await _send_media_forward_to_destination(
+			task,
+			"BACKUP_BOT_NAME",
+			f"@{backup_bot_username}",
 		)
 	finally:
 		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
@@ -1561,7 +1580,7 @@ def _remove_invalid_apron_channel(chat_id: int, exc: Exception) -> None:
 	)
 
 
-async def _send_file_id_with_switchbot(
+async def _send_file_id_with_backupbot(
 	task: MediaForwardTask,
 	*,
 	file_id: str | None = None,
@@ -1576,16 +1595,16 @@ async def _send_file_id_with_switchbot(
 
 	media_file_id = file_id or task.file_id
 	media_type = file_type or task.file_type
-	switchbot = Bot(token=BACKUP_TOKEN)
+	backupbot = Bot(token=BACKUP_TOKEN)
 	try:
 		send_method = {
-			"document": switchbot.send_document,
-			"photo": switchbot.send_photo,
-			"video": switchbot.send_video,
-			"audio": switchbot.send_audio,
-			"voice": switchbot.send_voice,
-			"animation": switchbot.send_animation,
-			"sticker": switchbot.send_sticker,
+			"document": backupbot.send_document,
+			"photo": backupbot.send_photo,
+			"video": backupbot.send_video,
+			"audio": backupbot.send_audio,
+			"voice": backupbot.send_voice,
+			"animation": backupbot.send_animation,
+			"sticker": backupbot.send_sticker,
 		}.get(media_type)
 		if send_method is None:
 			raise ValueError(f"Unsupported media type: {media_type}")
@@ -1603,16 +1622,16 @@ async def _send_file_id_with_switchbot(
 			**{media_argument: media_file_id},
 		)
 	except Exception as exc:
-		print(f"[MEDIA_FORWARD] switchbot send failed: {exc}", flush=True)
+		print(f"[MEDIA_FORWARD] backupbot send failed: {exc}", flush=True)
 		return None
 	finally:
-		await switchbot.session.close()
+		await backupbot.session.close()
 
 
 async def _send_media_forward_to_destination(
 	task: MediaForwardTask,
 	destination_name: str,
-	destination_id: int,
+	destination_id: int | str,
 ) -> bool:
 	print(
 		f"[MEDIA_FORWARD] 开始发送至 {destination_name}={destination_id}",
@@ -1650,7 +1669,7 @@ async def _send_media_forward_to_destination(
 				f"的临时媒体 message_id={copy_result.message_id}",
 				flush=True,
 			)
-		await _send_file_id_with_switchbot(task)
+		# await _send_file_id_with_backupbot(task)
 
 	if not task.thumb_bytes:
 		return True
@@ -1681,7 +1700,7 @@ async def _send_media_forward_to_destination(
 	# 		chat_id=destination_id,
 	# 		message_id=thumb_message.message_id,
 	# 	)
-	# 	await _send_file_id_with_switchbot(
+	# 	await _send_file_id_with_backupbot(
 	# 		task,
 	# 		file_id=thumb_file_id,
 	# 		file_type="photo",
@@ -2343,16 +2362,30 @@ async def _notify_duty_free_new_batch(
 		tag_text = ""
 	
 	tower_bot_name = str(bot_name or "ztTowerRobot").strip().lstrip("@")
+	# new_flight_keyboard = InlineKeyboardMarkup(
+	# 	inline_keyboard=[[
+	# 		InlineKeyboardButton(
+	# 			text="🛫 新航班",
+	# 			url=(
+	# 				f"https://t.me/{tower_bot_name}"
+	# 				f"?start={normalized_batch_id}"
+	# 			),
+	# 		),
+		
+	# 	]],
+	# )
+
 	new_flight_keyboard = InlineKeyboardMarkup(
 		inline_keyboard=[[
 			InlineKeyboardButton(
-				text="🛫 新航班",
-				url=(
-					f"https://t.me/{tower_bot_name}"
-					f"?start={normalized_batch_id}"
-				),
+				text="📋 复制",
+				copy_text=CopyTextButton(text=normalized_batch_id),
 			),
-		]],
+			InlineKeyboardButton(
+				text="🛫 起飞",
+				url=f"https://t.me/share/url?url={normalized_batch_id}",
+			),
+		]]
 	)
 
 
@@ -2377,38 +2410,9 @@ async def _notify_duty_free_new_batch(
 			flush=True,
 		)
 
-	if PEACH_CHAT_ID and False:
+	
 
-		new_peach_keyboard = InlineKeyboardMarkup(
-			inline_keyboard=[[
-				InlineKeyboardButton(
-					text="🍑 新桃子",
-					url=(
-						f"https://t.me/{tower_bot_name}"
-						f"?start={normalized_batch_id}"
-					),
-				),
-			]],
-		)
-
-		try:
-			await _telegram_call_with_retry(
-				"send new batch to peach chat",
-				lambda: bot.send_message(
-					chat_id=PEACH_CHAT_ID,
-					text=(
-						f"{tag_text}"
-					),
-					parse_mode="HTML",
-					reply_markup=new_peach_keyboard,
-				),
-			)
-		except Exception as exc:
-			print(
-				f"[PEACH] new batch notification failed "
-				f"(batch_id={normalized_batch_id}): {exc}",
-				flush=True,
-			)
+		
 
 
 async def _send_encoded_snapshot(
@@ -3165,7 +3169,7 @@ async def cmd_reload_config(message: Message) -> None:
 
 	await reload_config()
 
-	await message.reply("✅ 共享配置已强制重新载入。\nPEACH_CHAT_ID=" + str(PEACH_CHAT_ID))
+	await message.reply("✅ 共享配置已强制重新载入。")
 
 
 def _create_sqlite_backup(source_path: Path, destination_path: Path) -> None:
@@ -5491,7 +5495,7 @@ async def _send_lobby_welcome(user: User) -> None:
 			],
 			[
 				InlineKeyboardButton(text="🗼 塔台", url=tower_url),
-				InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztzlp"),
+				InlineKeyboardButton(text="🪧 指路牌", url="https://telegra.ph/zfly-10-27"),
 			],
 		],
 	)
@@ -5668,7 +5672,7 @@ async def on_lobby_channel_auto_forward(message: Message) -> None:
 	)
 
 
-@dp.message(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID, AIRPORT_DUTY_FREE_GROUP_ID, PEACH_CHAT_ID}), F.text)
+@dp.message(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID, AIRPORT_DUTY_FREE_GROUP_ID}), F.text)
 async def on_reward_group_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
 		return
@@ -7290,15 +7294,21 @@ async def say_hello_to_x_man(bot_name):
 		print("❌ No SWITCHBOT_TOKEN found, skipping hello to X-Man bot.", flush=True)
 
 async def reload_config():
-	global PEACH_CHAT_ID
+
 	# 从 table shared_invite_link 取得 key = peach	
 	record = shared_invite_link_store.get("peach")
-	if record is not None:
-		PEACH_CHAT_ID = record.chat_id
-		print(f"PEACH_CHAT_ID set to {PEACH_CHAT_ID}", flush=True)
-	else:
-		PEACH_CHAT_ID = 0
-		print(f"PEACH_CHAT_ID set to default value {PEACH_CHAT_ID}", flush=True)
+
+
+
+def _report_backup_bot_exit(task: asyncio.Task) -> None:
+	if task.cancelled():
+		return
+	exception = task.exception()
+	if exception is not None:
+		print(
+			f"[BACKUP_BOT_ERROR] {type(exception).__name__}: {exception}",
+			flush=True,
+		)
 
 async def main() -> None:
 	global bot_name
@@ -7346,6 +7356,7 @@ async def main() -> None:
 	maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
 	hot_worker = asyncio.create_task(_daily_hot_worker())
 	video_bot_task: asyncio.Task[None] | None = None
+	
 	video_bot_enabled = str(
 		os.getenv("VIDEO_BOT_ENABLED", "false") or "false"
 	).strip().lower() in {"1", "true", "yes", "on"}
@@ -7371,6 +7382,31 @@ async def main() -> None:
 				print(f"❌[VIDEO_BOT] stopped with error: {exception}", flush=True)
 
 		video_bot_task.add_done_callback(report_video_bot_result)
+	
+	
+
+	if BACKUP_BOT_TOKEN is not None:
+		
+		from backup_bot import start_backup_bot
+
+		async def update_backup_bot_name(username: str) -> None:
+			global BACKUP_BOT_NAME
+			BACKUP_BOT_NAME = username
+			
+			await say_hello_to_x_man(username)
+
+		backup_bot_task = asyncio.create_task(
+			start_backup_bot(
+				on_ready=update_backup_bot_name,
+				x_man_bot_id=X_MAN_BOT_ID,
+			),
+			name="backup_bot",
+		)
+		backup_bot_task.add_done_callback(_report_backup_bot_exit)	
+	
+	
+	
+	
 	await reload_config()
 	try:
 		await dp.start_polling(bot)

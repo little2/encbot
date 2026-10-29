@@ -690,6 +690,10 @@ async def _prepare_thumbnail(thumb_file_id: str) -> tuple[str, bytes | None]:
 			f"(file_id={thumb_file_id}): {exc}",
 			flush=True,
 		)
+		'''
+		查找 media_text_sender.py 是否有适当的函式，没有就新增
+		当发生错误时，则让 backup_bot 将 file_id 发送给当前的机器人
+		'''
 		return "", None
 
 
@@ -765,6 +769,14 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 	bot_name_lack = bot_name[:-1] if bot_name else ""
 	start_char = "⟦["
 	end_char = "]⟧"
+	# 以json 的方式打印 data (dict)
+	print(json.dumps(data, ensure_ascii=False, indent=2))
+
+	
+	batch_id = data.get('batch_id', '')
+	board_code = f"{bot_name}_{batch_id}"
+
+	print(f"data={data} board_code={board_code} valid_until_display={valid_until_display} bot_name={bot_name}")
 
 	return_text=""
 
@@ -783,6 +795,9 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 		user_url = "[匿名]"
 	else:
 		user_url = await FormatUtils.get_user_hyperlink(bot, {"id":data.get("user_id", 0)}, show_uid=False)
+
+	if batch_id:
+		return_text += f"🎫 <code>{board_code}</code>\n\n"
 
 	return_text += f"<a href=\"https://b.oy/{encoded}\">👤</a> {user_url} | "
 
@@ -1845,7 +1860,30 @@ def _process_preview_batch(
 	return processed
 
 
-async def _download_preview(cache_key: tuple[str, str], file_id: str) -> tuple[tuple[str, str], bytes | None]:
+async def _send_preview_from_backup_bot(file_id: str, chat_id: int) -> None:
+	if not BACKUP_BOT_TOKEN or chat_id <= 0:
+		return
+	try:
+		async with Bot(token=BACKUP_BOT_TOKEN) as backup_bot:
+			await _telegram_call_with_retry(
+				"send preview from backup bot",
+				lambda: backup_bot.send_photo(chat_id=chat_id, photo=file_id),
+				chat_id=chat_id,
+			)
+	except Exception as exc:
+		print(
+			f"[ENCODED_FORWARD] backup bot could not send preview "
+			f"(chat_id={chat_id}, file_id={file_id}): {exc}",
+			flush=True,
+		)
+
+
+async def _download_preview(
+	cache_key: tuple[str, str],
+	file_id: str,
+	*,
+	recipient_chat_id: int | None = None,
+) -> tuple[tuple[str, str], bytes | None]:
 	try:
 		async with PREVIEW_DOWNLOAD_LIMIT:
 			buffer = BytesIO()
@@ -1853,11 +1891,21 @@ async def _download_preview(cache_key: tuple[str, str], file_id: str) -> tuple[t
 			return cache_key, buffer.getvalue()
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] preview download failed: {exc}", flush=True)
+		if (
+			isinstance(exc, TelegramBadRequest)
+			and "wrong file_id" in str(exc).lower()
+		):
+			print(f"❌{file_id}")
+			
+			result = await _send_preview_from_backup_bot(file_id, bot.id)
+			print(f"{result}")
 		return cache_key, None
 
 
 async def _prepare_batch_preview_payloads(
 	items: list[dict[str, Any]],
+	*,
+	recipient_chat_id: int | None = None,
 ) -> list[tuple[bytes, str]]:
 	preview_entries: list[tuple[tuple[str, str], str]] = []
 	download_requests: dict[tuple[str, str], str] = {}
@@ -1873,6 +1921,7 @@ async def _prepare_batch_preview_payloads(
 		)
 		if not preview_file_id:
 			continue
+
 		preview_unique_id = str(
 			item.get("thumb_file_unique_id", "")
 			or item.get("preview_unique_id", "")
@@ -1893,7 +1942,7 @@ async def _prepare_batch_preview_payloads(
 			download_requests.setdefault(cache_key, preview_file_id)
 
 	downloaded = dict(await asyncio.gather(*[
-		_download_preview(cache_key, file_id)
+		_download_preview(cache_key, file_id, recipient_chat_id=recipient_chat_id)
 		for cache_key, file_id in download_requests.items()
 	])) if download_requests else {}
 	jobs = [
@@ -1919,6 +1968,9 @@ async def _prepare_batch_preview_payloads(
 async def _send_encoded_preview_message(
 	batch_settings: dict[str, Any],
 ) -> Message:
+
+	# print(f"batch_settings=>{batch_settings}")
+
 	preview_payloads = list(batch_settings.get("preview_payloads", []))
 	if not preview_payloads:
 		raise ValueError("preview_payloads is required")
@@ -2003,21 +2055,26 @@ async def _get_batch_preview_message_settings(
 	if not normalized_batch_id:
 		raise ValueError("batch_id is required")
 
-	print(f"normalized_batch_id=>{normalized_batch_id}", flush=True)
+	# print(f"normalized_batch_id=>{normalized_batch_id}", flush=True)
 
 	batch_record = batch_store.get(normalized_batch_id)
 	if not batch_record:
 		raise ValueError("找不到此批次。")
 
-	print(f"batch_record=>{batch_record}", flush=True)
+	# print(f"batch_record=>{batch_record}", flush=True)
 
 	items = received_media_store.get_media_by_batch_id(normalized_batch_id)
 	if not items:
 		raise ValueError("找不到此批次的媒體。")
 
+	print(f"\n\n items=>{items}", flush=True)
+
 	preview_payloads = await _prepare_batch_preview_payloads(items)
 	if not preview_payloads:
 		raise ValueError("此批次沒有可用的媒體縮圖。")
+
+	# print(f"\n\n preview_payloads=>{preview_payloads}", flush=True)
+
 
 	batch_content = str(batch_record.get("batch_content", "") or "").strip()
 	token = UtfConverter.build_media_token(
@@ -2098,6 +2155,8 @@ async def _forward_encoded_if_whitelisted(
 			)
 		parsed["batch_content"] = str(batch_content or "").strip()
 		parsed["tag"] = ",".join(_ordered_tags(_normalize_tag_list(selected_tags or [])))
+		parsed['batch_id'] = batch_id
+
 		parsed_items = list(parsed.get("items", []))
 		if not parsed_items:
 			raise ValueError("encoded 中没有媒体")
@@ -2374,16 +2433,16 @@ async def _notify_duty_free_new_batch(
 		
 	# 	]],
 	# )
-
+	enc_code = f"{tower_bot_name}_{normalized_batch_id}"
 	new_flight_keyboard = InlineKeyboardMarkup(
 		inline_keyboard=[[
 			InlineKeyboardButton(
 				text="📋 复制",
-				copy_text=CopyTextButton(text=normalized_batch_id),
+				copy_text=CopyTextButton(text=enc_code),
 			),
 			InlineKeyboardButton(
 				text="🛫 起飞",
-				url=f"https://t.me/share/url?url={normalized_batch_id}",
+				url=f"https://t.me/share/url?url={enc_code}",
 			),
 		]]
 	)
@@ -7187,15 +7246,17 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 		return None
 	first_line = normalized_text.splitlines()[0]
 	match = re.fullmatch(
-		r"zttower\d+bot_([A-Za-z0-9_-]{16})",
+		r"(?:zttower|afu)\d+bot_([A-Za-z0-9_-]{16})",
 		first_line.strip(),
 		flags=re.IGNORECASE,
 	)
 	return match.group(1) if match else None
 
 
-# 机器人收到私信文字
+#
 @dp.message(F.chat.type == "private", F.text)
+async def on_text(message: Message) -> None:
+	"""处理私聊文本：保存编辑中的内容介绍、发送批次预览，或解析并编码文本。"""
 	text = (message.text or "").strip()
 
 	if message.from_user:
@@ -7243,7 +7304,7 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 
 	batch_id = _extract_takeoff_batch_id(text)
 	if batch_id:
-		print(f"batch_id={batch_id}", flush=True)
+		# print(f"batch_id={batch_id}", flush=True)
 		try:
 			preview_settings = await _get_batch_preview_message_settings(batch_id)
 			preview_settings["chat_id"] = int(message.chat.id)
@@ -7259,7 +7320,11 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 	if len(text) < 15:
 		return
 
+	
+
+
 	try:
+		print(f"[ENCODED_TEXT] text={text}", flush=True)
 		parse_text = text
 		START = "⟦["
 		END = "]⟧"
@@ -7385,7 +7450,7 @@ async def main() -> None:
 	
 	
 
-	if BACKUP_BOT_TOKEN is not None:
+	if BACKUP_BOT_TOKEN:
 		
 		from backup_bot import start_backup_bot
 
@@ -7418,12 +7483,15 @@ async def main() -> None:
 		hot_worker.cancel()
 		if video_bot_task is not None:
 			video_bot_task.cancel()
+		if backup_bot_task is not None:
+			backup_bot_task.cancel()
 		await asyncio.gather(
 			*workers,
 			forward_worker,
 			maintenance_worker,
 			hot_worker,
 			*([video_bot_task] if video_bot_task is not None else []),
+			*([backup_bot_task] if backup_bot_task is not None else []),
 			return_exceptions=True,
 		)
 		blacklist_store.close()

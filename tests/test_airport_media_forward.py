@@ -24,6 +24,23 @@ def load_function(name, namespace):
 
 
 class AirportMediaForwardTests(unittest.TestCase):
+    def test_takeoff_batch_id_accepts_supported_bot_names(self):
+        extract = load_function(
+            "_extract_takeoff_batch_id", {"re": __import__("re")}
+        )
+        batch_id = "Ab3_kL9-xY2pQr7Z"
+
+        self.assertEqual(extract(f"zttower12bot_{batch_id}"), batch_id)
+        self.assertEqual(extract(f"afu12bot_{batch_id}"), batch_id)
+        self.assertEqual(extract(f"AFU12BOT_{batch_id}"), batch_id)
+
+    def test_takeoff_batch_id_rejects_unsupported_bot_names(self):
+        extract = load_function(
+            "_extract_takeoff_batch_id", {"re": __import__("re")}
+        )
+
+        self.assertIsNone(extract("other12bot_Ab3_kL9-xY2pQr7Z"))
+
     def test_backup_bot_username_is_sent_as_telegram_chat_username(self):
         send_to_destination = AsyncMock(return_value=True)
         namespace = {

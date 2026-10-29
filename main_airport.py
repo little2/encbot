@@ -7194,8 +7194,8 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 	return match.group(1) if match else None
 
 
+# 机器人收到私信文字
 @dp.message(F.chat.type == "private", F.text)
-async def on_text(message: Message) -> None:
 	text = (message.text or "").strip()
 
 	if message.from_user:

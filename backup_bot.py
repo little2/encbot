@@ -60,10 +60,6 @@ def _build_dispatcher(
 ) -> Dispatcher:
 	dispatcher = Dispatcher()
 
-
-
-
-
 	@dispatcher.message(F.chat.type == "private", F.text)
 	async def receive_video_id(message: Message) -> None:
 		if message.from_user is None:
@@ -96,15 +92,15 @@ async def start_backup_bot(
 	if not token:
 		raise RuntimeError("缺少 BACKUP_BOT_TOKEN")
 
-	video_bot = Bot(
+	backup_bot = Bot(
 		token=token,
 		default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 	)
 	username = ""
 	try:
-		video_bot.session.middleware(TelegramRateLimitMiddleware())
+		backup_bot.session.middleware(TelegramRateLimitMiddleware())
 		me = await telegram_call(
-			"backup bot get_me", video_bot.get_me, retry_network_errors=True
+			"backup bot get_me", backup_bot.get_me, retry_network_errors=True
 		)
 		username = str(getattr(me, "username", "") or "")
 		if on_ready is not None:
@@ -115,17 +111,17 @@ async def start_backup_bot(
 		bot_name = username
 		dispatcher = _build_dispatcher(bot_name, x_man_bot_id)
 
-		await telegram_call("backup bot set_my_commands", lambda: video_bot.set_my_commands([
+		await telegram_call("backup bot set_my_commands", lambda: backup_bot.set_my_commands([
 			BotCommand(command="check", description="查看資源分享情況"),
 			BotCommand(command="board", description="班机时刻表"),
 		]))
 		_safe_print(f"✅ [BACKUP_BOT] 已启动：@{username}")
-		await dispatcher.start_polling(video_bot, handle_signals=False)
+		await dispatcher.start_polling(backup_bot, handle_signals=False)
 	except Exception as e:
 		_safe_print(f"❌ [BACKUP_BOT] 启动失败：@{username} :{e}")
 		raise
 	finally:
-		await video_bot.session.close()
+		await backup_bot.session.close()
 
 
 if __name__ == "__main__":

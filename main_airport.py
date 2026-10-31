@@ -35,6 +35,7 @@ from typing import Any, Callable
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import imagehash
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import (
 	TelegramBadRequest,
@@ -75,7 +76,7 @@ from dotenv import load_dotenv
 from tgfileid import TelegramFileId
 
 
-
+receive_file_id = ""
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -133,7 +134,10 @@ BACKUP_BOT_NAME = None  #用于接收
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
 KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
-BOT_TOKEN = SharedConfig.get("my_bot_token", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", SharedConfig.get("my_bot_token", ""))
+
+
+BOT_NAME = ""
 
 ADMIN_USER_IDS = ParseUtils.parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
 # 主要用户始终保留访问权限，避免共享配置遗漏时意外将其排除。
@@ -217,11 +221,20 @@ if not BOT_TOKEN:
 	raise RuntimeError("Missing bot token. Please set ENCBOT_TOKEN or BOT_TOKEN.")
 
 
+
+
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "").strip()
+telegram_session = AiohttpSession(
+	**({"proxy": TELEGRAM_PROXY_URL} if TELEGRAM_PROXY_URL else {})
+)
 bot = Bot(
 	token=BOT_TOKEN,
+	session=telegram_session,
 	default=DefaultBotProperties(link_preview_is_disabled=True),
 )
 dp = Dispatcher()
+
+backup_bot = None
 
 database_admin_commands = DatabaseAdminCommands(
 	bot=bot,
@@ -331,7 +344,7 @@ AIRPORT_INVITE_LINK_LOCK = asyncio.Lock()
 INVITE_LINK_LOCKS: dict[str, asyncio.Lock] = {}
 BACKUP_LOCK = asyncio.Lock()
 X_MAN_REQUEST_LOCK = asyncio.Lock()
-X_MAN_PENDING_REPLY: asyncio.Future[XManReply] | None = None
+X_MAN_PENDING_REPLY: asyncio.Future[str] | None = None
 X_MAN_PENDING_REQUEST_MESSAGE_ID: int | None = None
 X_MAN_PENDING_FILE_UNIQUE_ID: str | None = None
 X_MAN_REPLY_TIMEOUT_SECONDS = 30
@@ -341,12 +354,6 @@ USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
 PENDING_AIRPORT_JOIN_INVITES: dict[int, tuple[str, int]] = {}
 
 SHUTTLE_BOT_NAME = "shuttle681bot"
-
-@dataclass(frozen=True, slots=True)
-class XManReply:
-	file_unique_id: str
-	message: Message
-
 
 @dataclass(frozen=True, slots=True)
 class MediaForwardTask:
@@ -465,7 +472,7 @@ AIRPORT_QUIZ_QUESTIONS = (
 
 JOIN_MODE = "invite"  # 可选值: "invite" 或 "request"
 
-
+BACKUP_FORWARD_SEND_LOCK = asyncio.Lock()
 ENCODED_FORWARD_SEND_LOCK = asyncio.Lock()
 INACTIVE_CLEANUP_LOCK = asyncio.Lock()
 async def _telegram_call_with_retry(
@@ -665,6 +672,13 @@ def _extract_preview_info(message: Message, file_type: str, file_id: str) -> dic
 
 
 def _process_thumbnail(image_bytes: bytes) -> tuple[str, bytes]:
+	'''
+	修正 EXIF 旋转方向。
+	转换为 RGB。
+	计算图片的感知哈希 pHash。
+	将最长边缩小到 480px。
+	保存成质量 85 的 JPEG。
+	'''
 	with Image.open(BytesIO(image_bytes)) as source:
 		image = ImageOps.exif_transpose(source).convert("RGB")
 		thumb_phash = str(imagehash.phash(image))
@@ -770,13 +784,13 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 	start_char = "⟦["
 	end_char = "]⟧"
 	# 以json 的方式打印 data (dict)
-	print(json.dumps(data, ensure_ascii=False, indent=2))
+	# print(json.dumps(data, ensure_ascii=False, indent=2))
 
 	
 	batch_id = data.get('batch_id', '')
 	board_code = f"{bot_name}_{batch_id}"
 
-	print(f"data={data} board_code={board_code} valid_until_display={valid_until_display} bot_name={bot_name}")
+	# print(f"data={data} board_code={board_code} valid_until_display={valid_until_display} bot_name={bot_name}")
 
 	return_text=""
 
@@ -1220,12 +1234,50 @@ def _build_token_and_encoded(state: dict[str, Any]) -> tuple[str, str, dict[str,
 	return token, encoded, parsed
 
 
-async def _send_media_by_type(message: Message, data: dict[str, Any], receiver_id: int = None) -> Message:
+def _normalize_receiver_chat_id(
+	receiver_id: int | str | None,
+	*,
+	default_chat_id: int | None = None,
+) -> int | str:
+	"""Normalize a Bot API chat target without guessing private-user IDs."""
+	chat_id = default_chat_id if receiver_id is None else receiver_id
+	if isinstance(chat_id, bool) or chat_id is None:
+		raise ValueError("receiver_id is required")
+	if isinstance(chat_id, int):
+		if chat_id == 0:
+			raise ValueError("receiver_id cannot be 0")
+		return chat_id
+
+	normalized = str(chat_id).strip()
+	if not normalized:
+		raise ValueError("receiver_id cannot be empty")
+	if re.fullmatch(r"-?\d+", normalized):
+		numeric_chat_id = int(normalized)
+		if numeric_chat_id == 0:
+			raise ValueError("receiver_id cannot be 0")
+		return numeric_chat_id
+
+	username = normalized.removeprefix("@").strip()
+	if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
+		raise ValueError(
+			"receiver_id must be a numeric chat_id or a valid public chat username"
+		)
+	return f"@{username}"
+
+
+async def _send_media_by_type(
+	message: Message,
+	data: dict[str, Any],
+	receiver_id: int | str | None = None,
+) -> Message:
 	file_type = str(data["file_type"])
 	file_id = str(data["file_id"])
 	no_forward = bool(data.get("no_forward", False))
 	if_spoiler = bool(data.get("if_spoiler", False))
-	chat_id = receiver_id or message.from_user.id
+	chat_id = _normalize_receiver_chat_id(
+		receiver_id,
+		default_chat_id=message.from_user.id if message.from_user else None,
+	)
 
 	if file_type == "document":
 		return await bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward)
@@ -1260,6 +1312,69 @@ async def _send_media_by_type(message: Message, data: dict[str, Any], receiver_i
 		return await bot.send_sticker(chat_id=chat_id, sticker=file_id, protect_content=no_forward)
 
 	raise ValueError(f"Unsupported file_type: {file_type}")
+
+
+async def _ask_media_by_type(
+	from_bot: Bot,
+	receiver_id: int | str,
+	data: dict[str, Any],
+):
+	result = False
+	file_type = str(data["file_type"])
+	file_id = str(data["file_id"])
+	chat_id = _normalize_receiver_chat_id(receiver_id)
+	# chat_id = 7485812665
+	# file_id = "BAACAgUAAxkBAAINwmrlpgxDhMiacHKhRjYkpVcK4KLrAAKkAQACfieoVU45E5GMHULFPQQ"
+	try:
+		async with BACKUP_FORWARD_SEND_LOCK:
+			if file_type == "document":
+				result = await from_bot.send_document(chat_id=chat_id, document=file_id)
+			if file_type == "photo":
+
+				result = await from_bot.send_photo(
+					chat_id=chat_id,
+					photo=file_id
+				)
+			if file_type == "video":
+				result =  await from_bot.send_video(
+					chat_id=chat_id,
+					video=file_id
+				)
+			if file_type == "audio":
+				result = await from_bot.send_audio(chat_id=chat_id, audio=file_id)
+			if file_type == "voice":
+				result = await from_bot.send_voice(chat_id=chat_id, voice=file_id)
+			if file_type == "animation":
+				result = await from_bot.send_animation(
+					chat_id=chat_id,
+					animation=file_id,
+				)
+			if file_type == "sticker":
+				result =  await from_bot.send_sticker(chat_id=chat_id, sticker=file_id)
+	except Exception as exc:
+
+		if "wrong file identifier" in str(exc):
+			print(f"❌ {exc} , 找 x_man",flush=True)
+			file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
+			x_man_reply = await _request_x_man(file_unique_id)
+			print(f"x_man_reply={x_man_reply}")
+			if x_man_reply == "na":
+				return False
+			else:
+				
+				return True
+				
+		else:
+			print(f"1326:{exc}",flush=True)
+
+		return False
+
+
+	if result:
+		# print(f"👉{result}")
+		return True
+
+
 
 
 def _album_kind(file_type: str) -> str | None:
@@ -1297,26 +1412,37 @@ def _is_invalid_media_reference_error(exc: TelegramBadRequest) -> bool:
 	))
 
 
-async def _request_x_man(file_unique_id: str) -> XManReply:
+async def _request_x_man(file_unique_id: str) -> str:
 	global X_MAN_PENDING_REPLY
 	global X_MAN_PENDING_REQUEST_MESSAGE_ID, X_MAN_PENDING_FILE_UNIQUE_ID
 
 	x_man_bot_id = int(SharedConfig.get("x_man_bot_id", 0) or 0)
 	if x_man_bot_id <= 0:
-		raise RuntimeError("SharedConfig.x_man_bot_id is not configured")
+		print("[X_MAN] x_man_bot_id is not configured", flush=True)
+		return "na"
 
 	async with X_MAN_REQUEST_LOCK:
 		loop = asyncio.get_running_loop()
-		pending_reply: asyncio.Future[XManReply] = loop.create_future()
+		pending_reply: asyncio.Future[str] = loop.create_future()
 		X_MAN_PENDING_REPLY = pending_reply
 		X_MAN_PENDING_FILE_UNIQUE_ID = file_unique_id
 		try:
 			request_message = await bot.send_message(x_man_bot_id, file_unique_id)
 			X_MAN_PENDING_REQUEST_MESSAGE_ID = request_message.message_id
-			return await asyncio.wait_for(
-				pending_reply,
-				timeout=X_MAN_REPLY_TIMEOUT_SECONDS,
-			)
+			try:
+				return await asyncio.wait_for(
+					pending_reply,
+					timeout=X_MAN_REPLY_TIMEOUT_SECONDS,
+				)
+			except TimeoutError:
+				print(
+					f"[X_MAN] reply timed out for file_unique_id={file_unique_id}",
+					flush=True,
+				)
+				return "na"
+		except Exception as exc:
+			print(f"[X_MAN] request failed: {exc}", flush=True)
+			return "na"
 		finally:
 			if X_MAN_PENDING_REPLY is pending_reply:
 				X_MAN_PENDING_REPLY = None
@@ -1327,7 +1453,7 @@ async def _request_x_man(file_unique_id: str) -> XManReply:
 async def _send_all_media(
 	message: Message,
 	data: dict[str, Any],
-	receiver_id: int = None,
+	receiver_id: int | str | None = None,
 ) -> tuple[list[Message], list[dict[str, Any]]]:
 	source_items = data.get("items") or [{
 		"file_id": data["file_id"],
@@ -1357,31 +1483,40 @@ async def _send_all_media(
 		except TelegramBadRequest as exc:
 			if not _is_invalid_media_reference_error(exc):
 				raise
-			skipped_items.append(item)
 
-			if "wrong file identifier" in str(exc.message):
-				try:
-					file_unique_id = TelegramFileId.file_id_to_unique_id(item["file_id"])
-					x_man_reply = await _request_x_man(file_unique_id)
-					# await bot.copy_message(
-					# 	chat_id=receiver_id or message.from_user.id,
-					# 	from_chat_id=x_man_reply.message.chat.id,
-					# 	message_id=x_man_reply.message.message_id,
-					# )
-					# todo
+			if "wrong file identifier" not in str(exc.message).casefold():
+				skipped_items.append(item)
+				return
 
-					print(
-						f"[MEDIA_SEND1] wrong file identifier at item "
-						f"#{item.get('_item_index', '?')}",
-						f"file_unique_id={x_man_reply.file_unique_id}",
-						flush=True,
-					)
-				except Exception as e:
-					print(f"E=>{e} item={item}")
-					
+			try:
+				if backup_bot is None:
+					raise RuntimeError("backup bot is not available")
 
+				sent2 = await _ask_media_by_type(
+					backup_bot,
+					bot_name,
+					item_data,
+				)
 
+				if sent2:
+					await send_item(item)
 
+			except Exception as recovery_exc:
+				skipped_items.append(item)
+				print(
+					f"\n[MEDIA_SEND:1483] backup bot could not send item "
+					f"#{item.get('_item_index', '?')} to the recipient: "
+					f"{recovery_exc}",
+					flush=True,
+				)
+				return
+
+			print(
+				f"[MEDIA_SEND] backup bot sent item "
+				f"#{item.get('_item_index', '?')} to {receiver_id}",
+				flush=True,
+			)
+			sent_messages.append(sent2)
 			return
 		sent_messages.append(sent)
 
@@ -1401,7 +1536,12 @@ async def _send_all_media(
 			try:
 				async with ENCODED_FORWARD_SEND_LOCK:
 					result = await bot.send_media_group(
-						chat_id=receiver_id or message.from_user.id,
+						chat_id=_normalize_receiver_chat_id(
+							receiver_id,
+							default_chat_id=(
+								message.from_user.id if message.from_user else None
+							),
+						),
 						media=media,
 						protect_content=no_forward,
 					)
@@ -1480,7 +1620,7 @@ def _enqueue_media_forward(task: MediaForwardTask) -> None:
 
 async def _forward_media_in_background(task: MediaForwardTask) -> None:
 	seen_destination_ids: set[int] = set()
-	
+
 	remaining_apron_ids = list(APRON_CHANNEL_IDS)
 	while remaining_apron_ids:
 		selected_apron_id = secrets.choice(remaining_apron_ids)
@@ -1505,6 +1645,7 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 	if X_MAN_BOT_ID == 0 or X_MAN_BOT_ID in seen_destination_ids:
 		return
 	try:
+		# print("发送至 X-Man 机器人",flush=True)
 		await _send_media_forward_to_destination(
 			task,
 			"X_MAN_BOT_ID",
@@ -1513,13 +1654,19 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 	finally:
 		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 
+	''' 
+	TODO: 关掉备份
+	'''
+	return
+	print("准备发送至备用机器人",flush=True)
 	if BACKUP_BOT_NAME is None:
 		return
 	backup_bot_username = str(BACKUP_BOT_NAME).strip().lstrip("@")
+	# print(f"备用机器人名称: {backup_bot_username}",flush=True)
 	if not backup_bot_username:
 		return
 	try:
-		print("发送至备用机器人")
+		# print("发送至备用机器人")
 		await _send_media_forward_to_destination(
 			task,
 			"BACKUP_BOT_NAME",
@@ -1643,6 +1790,38 @@ async def _send_file_id_with_backupbot(
 		await backupbot.session.close()
 
 
+async def _send_forward_media_by_type(
+	task: MediaForwardTask,
+	destination_id: int | str,
+) -> Message:
+	chat_id = _normalize_receiver_chat_id(destination_id)
+	send_method = {
+		"document": bot.send_document,
+		"photo": bot.send_photo,
+		"video": bot.send_video,
+		"audio": bot.send_audio,
+		"voice": bot.send_voice,
+		"animation": bot.send_animation,
+		"sticker": bot.send_sticker,
+	}.get(task.file_type)
+	if send_method is None:
+		raise ValueError(f"Unsupported media type: {task.file_type}")
+
+	media_argument = {
+		"document": "document",
+		"photo": "photo",
+		"video": "video",
+		"audio": "audio",
+		"voice": "voice",
+		"animation": "animation",
+		"sticker": "sticker",
+	}[task.file_type]
+	return await send_method(
+		chat_id=chat_id,
+		**{media_argument: task.file_id},
+	)
+
+
 async def _send_media_forward_to_destination(
 	task: MediaForwardTask,
 	destination_name: str,
@@ -1652,12 +1831,8 @@ async def _send_media_forward_to_destination(
 		f"[MEDIA_FORWARD] 开始发送至 {destination_name}={destination_id}",
 		flush=True,
 	)
-	copy_result = await _run_media_forward_operation(
-		lambda: bot.copy_message(
-			chat_id=destination_id,
-			from_chat_id=task.from_chat_id,
-			message_id=task.message_id,
-		),
+	sent_message = await _run_media_forward_operation(
+		lambda: _send_forward_media_by_type(task, destination_id),
 		f"原媒体发送至 {destination_name}",
 		(
 			lambda exc: _remove_invalid_apron_channel(destination_id, exc)
@@ -1665,23 +1840,25 @@ async def _send_media_forward_to_destination(
 			else None
 		),
 	)
-	if copy_result is None:
+	if sent_message is None:
 		return False
 
-	if destination_name == "APRON_CHANNEL_ID" and copy_result is not None:
+	# print(f"sent_message={sent_message}", flush=True)
+
+	if destination_name == "APRON_CHANNEL_ID":
 		# print(task.file_id, flush=True)
-		# print(f"copy_result={copy_result}", flush=True)
+		# print(f"sent_message={sent_message}", flush=True)
 		delete_result = await _run_media_forward_operation(
 			lambda: bot.delete_message(
 				chat_id=destination_id,
-				message_id=copy_result.message_id,
+				message_id=sent_message.message_id,
 			),
 			f"删除 apron {destination_id} 的临时媒体",
 		)
 		if delete_result is None:
 			print(
 				f"[MEDIA_FORWARD] 无法删除 apron {destination_id} "
-				f"的临时媒体 message_id={copy_result.message_id}",
+				f"的临时媒体 message_id={sent_message.message_id}",
 				flush=True,
 			)
 		# await _send_file_id_with_backupbot(task)
@@ -1828,6 +2005,14 @@ def _decorate_video_preview(image_bytes: bytes, duration: int) -> bytes:
 	return output.getvalue()
 
 
+'''
+普通图片直接作为预览。
+视频预览会在中央加播放按钮。
+视频右下角会显示时长，例如 00:27:06。
+下载或图片处理失败时，会使用一张 320×180 的浅灰色备用图。
+处理结果会缓存在内存中，最多保存 500 张。
+'''
+
 def _process_preview_batch(
 	jobs: list[tuple[tuple[str, str], bytes | None, bool, int]],
 ) -> dict[tuple[str, str], tuple[bytes, bool]]:
@@ -1860,45 +2045,38 @@ def _process_preview_batch(
 	return processed
 
 
-async def _send_preview_from_backup_bot(file_id: str, chat_id: int) -> None:
-	if not BACKUP_BOT_TOKEN or chat_id <= 0:
-		return
-	try:
-		async with Bot(token=BACKUP_BOT_TOKEN) as backup_bot:
-			await _telegram_call_with_retry(
-				"send preview from backup bot",
-				lambda: backup_bot.send_photo(chat_id=chat_id, photo=file_id),
-				chat_id=chat_id,
-			)
-	except Exception as exc:
-		print(
-			f"[ENCODED_FORWARD] backup bot could not send preview "
-			f"(chat_id={chat_id}, file_id={file_id}): {exc}",
-			flush=True,
-		)
+
 
 
 async def _download_preview(
 	cache_key: tuple[str, str],
-	file_id: str,
+	item: dict[str, Any],
 	*,
 	recipient_chat_id: int | None = None,
 ) -> tuple[tuple[str, str], bytes | None]:
 	try:
 		async with PREVIEW_DOWNLOAD_LIMIT:
 			buffer = BytesIO()
-			await bot.download(file_id, destination=buffer)
+			await bot.download(item["file_id"], destination=buffer)
 			return cache_key, buffer.getvalue()
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] preview download failed: {exc}", flush=True)
-		if (
-			isinstance(exc, TelegramBadRequest)
-			and "wrong file_id" in str(exc).lower()
-		):
-			print(f"❌{file_id}")
+		# if (
+		# 	 "wrong file_id" in str(exc).lower()
+		# ):
+		# 	# item_data = {"file_id":item["file_id"],"file_type":item["file_type"]}
+		# 	sent2 = await _ask_media_by_type(
+		# 		backup_bot,
+		# 		bot_name,
+		# 		item,
+		# 	)
+		# 	if sent2:
+		# 		return await _download_preview(cache_key,item)
+
+		# 	print(f"❌{file_id}")
 			
-			result = await _send_preview_from_backup_bot(file_id, bot.id)
-			print(f"{result}")
+		# 	result = await _send_preview_from_backup_bot(file_id, bot.id)
+		# 	print(f"{result}")
 		return cache_key, None
 
 
@@ -1942,7 +2120,7 @@ async def _prepare_batch_preview_payloads(
 			download_requests.setdefault(cache_key, preview_file_id)
 
 	downloaded = dict(await asyncio.gather(*[
-		_download_preview(cache_key, file_id, recipient_chat_id=recipient_chat_id)
+		_download_preview(cache_key, item, recipient_chat_id=recipient_chat_id)
 		for cache_key, file_id in download_requests.items()
 	])) if download_requests else {}
 	jobs = [
@@ -2067,7 +2245,7 @@ async def _get_batch_preview_message_settings(
 	if not items:
 		raise ValueError("找不到此批次的媒體。")
 
-	print(f"\n\n items=>{items}", flush=True)
+	# print(f"\n\n items=>{items}", flush=True)
 
 	preview_payloads = await _prepare_batch_preview_payloads(items)
 	if not preview_payloads:
@@ -2237,7 +2415,7 @@ async def _forward_encoded_if_whitelisted(
 		caption = display_text if len(display_text) <= 1024 else None
 
 	except Exception as exc:
-		print(f"{exec}")
+		print(f"2392:{exec}")
 		return {"ok":False}
 		
 
@@ -2419,7 +2597,7 @@ async def _notify_duty_free_new_batch(
 		tag_text = f"\n{tag_text}"
 	else:
 		tag_text = ""
-	
+
 	tower_bot_name = str(bot_name or "ztTowerRobot").strip().lstrip("@")
 	# new_flight_keyboard = InlineKeyboardMarkup(
 	# 	inline_keyboard=[[
@@ -2430,7 +2608,7 @@ async def _notify_duty_free_new_batch(
 	# 				f"?start={normalized_batch_id}"
 	# 			),
 	# 		),
-		
+
 	# 	]],
 	# )
 	enc_code = f"{tower_bot_name}_{normalized_batch_id}"
@@ -2471,7 +2649,7 @@ async def _notify_duty_free_new_batch(
 
 	
 
-		
+
 
 
 async def _send_encoded_snapshot(
@@ -2959,6 +3137,7 @@ async def _process_queued_media(
 			return None
 		file_type, file_id = _extract_media_info(message)
 		file_unique_id = _extract_media_unique_id(message)
+		# 根据上传的媒体取得预览图的信息
 		preview_info = _extract_preview_info(message, file_type, file_id)
 		thumb_phash, thumb_bytes = await _prepare_thumbnail(
 			str(preview_info.get("thumb_file_id", "")),
@@ -4919,7 +5098,8 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 			return
 
 		else:
-
+			message.reply("功能暂时关掉")
+			return
 
 			try:
 				preview_settings = await _get_batch_preview_message_settings(args)
@@ -5803,6 +5983,14 @@ class XManReplyFilter(BaseFilter):
 		return x_man_bot_id > 0 and int(message.from_user.id) == x_man_bot_id
 
 
+def _get_x_man_reply_file_id(message: Message) -> str:
+	try:
+		_, file_id = _extract_media_info(message)
+	except ValueError:
+		return "na"
+	return file_id
+
+
 @dp.message(F.chat.type == "private", XManReplyFilter())
 async def on_x_man_reply(message: Message) -> None:
 	pending_reply = X_MAN_PENDING_REPLY
@@ -5838,12 +6026,7 @@ async def on_x_man_reply(message: Message) -> None:
 		)
 		return
 
-	pending_reply.set_result(
-		XManReply(
-			file_unique_id=replied_file_unique_id,
-			message=message,
-		)
-	)
+	pending_reply.set_result(_get_x_man_reply_file_id(message))
 
 
 @dp.message(
@@ -5872,6 +6055,12 @@ async def on_media(message: Message) -> None:
 
 	try:
 		file_type, file_id = _extract_media_info(message)
+
+
+		global receive_file_id
+		receive_file_id = file_id
+		print(f"file_type={file_type}, file_id={file_id}", flush=True)
+
 		file_unique_id = _extract_media_unique_id(message)
 	except ValueError as exc:
 		await message.reply(f"❌ 无法识别媒体: {exc}")
@@ -5899,6 +6088,7 @@ async def on_media(message: Message) -> None:
 			for item in session.get("items", [])
 		},
 	)
+
 	if file_unique_id in file_unique_ids:
 		await _notify_media_limit(message, "此媒体已在当前批次中，本批未重复加入")
 		return
@@ -6520,7 +6710,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		return
 
 	reader_user_id = int(callback.from_user.id)
-	print(f"2439 reader_user_id = {reader_user_id}")
+
 
 	is_admin  = False
 	if reader_user_id in ADMIN_USER_IDS:
@@ -6557,6 +6747,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 	async with user_lock:
 		now_timestamp = int(app_now().timestamp())
 		user_expire = user_expire_cache.get(reader_user_id)
+		send_result = None
 		# print(f"now_timestamp=>{now_timestamp}")
 		# print(f"user_expire=>{user_expire}")
 		if (
@@ -6628,6 +6819,11 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				await callback.answer(answer_text, show_alert=True, cache_time=0)
 				return
 
+		except Exception as exc:
+			print(f"6794:{exc}",flush=True)
+
+		try:
+			
 
 
 
@@ -6688,8 +6884,12 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				])
 
 			if is_admin:
-				source_chat_id = int(callback.message.chat.id)
-				source_message_id = int(callback.message.message_id)
+				if callback:
+					source_chat_id = int(callback.message.chat.id)
+					source_message_id = int(callback.message.message_id)
+				else:
+					source_chat_id = 0
+					source_message_id = 0
 				uploader_text = await FormatUtils.get_user_hyperlink(
 					bot,
 					{"id": uploader_id},
@@ -6703,6 +6903,15 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 						source_message_id,
 					)
 				)
+
+
+		except Exception as exc:
+			
+			print(f"6880:{exc}",flush=True)
+
+		try:
+
+
 			notify_markup = (
 				InlineKeyboardMarkup(inline_keyboard=notify_keyboard_rows)
 				if notify_keyboard_rows
@@ -7143,17 +7352,18 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 		await callback.answer(f"更新失败: {exc}", show_alert=True)
 
 
-async def extract_encode(parse_text: str, message: Message, receiver_id: int = None) -> dict[str, Any]:
+async def extract_encode(
+	parse_text: str,
+	message: Message,
+	receiver_id: int | str | None = None,
+) -> dict[str, Any]:
 	token = UtfConverter.unicode_cjk_to_telegram(parse_text)
 	data = UtfConverter.parse_file_token(token)
 	marked_flash_key: tuple[str, int] | None = None
 
-	print(f"{data}", flush=True)
-
-	print(f"2693 receiver_id={receiver_id}")
 	reader_user_id = (
 		int(receiver_id)
-		if receiver_id is not None
+		if receiver_id is not None and str(receiver_id).lstrip("-").isdigit()
 		else int(message.from_user.id) if message.from_user else 0
 	)
 	is_admin = reader_user_id in ADMIN_USER_IDS
@@ -7199,7 +7409,7 @@ async def extract_encode(parse_text: str, message: Message, receiver_id: int = N
 		USED_FLASH_NONCES[flash_key] = expires_at
 		marked_flash_key = flash_key
 
-	print(f"extract_encode: token={token}, data={data}, receiver_id={receiver_id}, flash_seconds={flash_seconds}, marked_flash_key={marked_flash_key}", flush=True)
+	# print(f"extract_encode: token={token}, data={data}, receiver_id={receiver_id}, flash_seconds={flash_seconds}, marked_flash_key={marked_flash_key}", flush=True)
 	try:
 		sent_media_messages, skipped_items = await _send_all_media(
 			message,
@@ -7300,7 +7510,8 @@ async def on_text(message: Message) -> None:
 	if not text:
 		return
 
-
+	await message.reply(f"功能暂关闭")
+	return
 
 	batch_id = _extract_takeoff_batch_id(text)
 	if batch_id:
@@ -7379,43 +7590,12 @@ async def main() -> None:
 	global bot_name
 	me = await bot.get_me()
 	bot_name = str(getattr(me, "username", "") or "")
+	BOT_NAME = bot_name
 	print(f"🤖 Bot started as @{bot_name}", flush=True)
 
 	await say_hello_to_x_man(bot_name)
 
-	groups = (
-		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
-		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
-		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
-		("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
-		*(
-			(f"APRON_CHANNEL_ID[{index}]", chat_id)
-			for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
-		),
-	)
 
-	await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
-		bot=bot,
-		bot_name=bot_name,
-		groups=groups,
-		telegram_call=_telegram_call_with_retry,
-	)	
-
-
-	await bot.set_my_commands(
-		[
-			# BotCommand(command="start", description="开始"),
-			# BotCommand(command="about", description="关于我"),
-			BotCommand(command="me", description="查询飞行通行证"),
-			BotCommand(command="hot", description="查看七天热门资源"),
-			BotCommand(command="donate", description="可用账号乐捐说明"),
-			# BotCommand(command="bonus", description="塔台发放 10 天时限"),
-			BotCommand(command="rule", description="查看飞行通行证规则"),
-			BotCommand(command="airport_access_request", description="请求进入机场或大厅"),
-			BotCommand(command="invite", description="建立单人审核邀请"),
-		],
-		scope=BotCommandScopeAllPrivateChats(),
-	)
 	workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
 	forward_worker = asyncio.create_task(_media_forward_worker())
 	maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
@@ -7454,9 +7634,10 @@ async def main() -> None:
 		
 		from backup_bot import start_backup_bot
 
-		async def update_backup_bot_name(username: str) -> None:
-			global BACKUP_BOT_NAME
+		async def update_backup_bot_name(username: str, _backup_bot: Bot) -> None:
+			global BACKUP_BOT_NAME, backup_bot
 			BACKUP_BOT_NAME = username
+			backup_bot = _backup_bot
 			
 			await say_hello_to_x_man(username)
 
@@ -7472,9 +7653,46 @@ async def main() -> None:
 	
 	
 	
+
+
 	await reload_config()
 	try:
 		await dp.start_polling(bot)
+
+		# groups = (
+		# 	("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
+		# 	("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
+		# 	("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+		# 	("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
+		# 	*(
+		# 		(f"APRON_CHANNEL_ID[{index}]", chat_id)
+		# 		for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
+		# 	),
+		# )
+
+		# await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
+		# 	bot=bot,
+		# 	bot_name=bot_name,
+		# 	groups=groups,
+		# 	telegram_call=_telegram_call_with_retry,
+		# )
+
+
+		# await bot.set_my_commands(
+		# 	[
+		# 		# BotCommand(command="start", description="开始"),
+		# 		# BotCommand(command="about", description="关于我"),
+		# 		BotCommand(command="me", description="查询飞行通行证"),
+		# 		BotCommand(command="hot", description="查看七天热门资源"),
+		# 		BotCommand(command="donate", description="可用账号乐捐说明"),
+		# 		# BotCommand(command="bonus", description="塔台发放 10 天时限"),
+		# 		BotCommand(command="rule", description="查看飞行通行证规则"),
+		# 		BotCommand(command="airport_access_request", description="请求进入机场或大厅"),
+		# 		BotCommand(command="invite", description="建立单人审核邀请"),
+		# 	],
+		# 	scope=BotCommandScopeAllPrivateChats(),
+		# )
+
 	finally:
 		for worker in workers:
 			worker.cancel()

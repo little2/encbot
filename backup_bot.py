@@ -25,10 +25,10 @@ from utils.time_utils import app_now
 from utils.telegram_gate import TelegramRateLimitMiddleware, telegram_call
 from utils.video_store import VideoStore
 
-
+backup_bot = None
 PROJECT_ROOT = Path(__file__).resolve().parent
 VIDEO_ID_PATTERN = r"[0-9a-fA-F]{16}"
-
+BACKUP_FORWARD_SEND_LOCK = asyncio.Lock()
 def _safe_print(message: str) -> None:
 	encoding = str(getattr(sys.stdout, "encoding", "") or "utf-8")
 	printable_message = str(message).encode(
@@ -36,22 +36,6 @@ def _safe_print(message: str) -> None:
 		errors="replace",
 	).decode(encoding)
 	print(printable_message, flush=True)
-def _extract_record_ids(text: str, bot_name: str) -> list[str]:
-	normalized_bot_name = str(bot_name or "").strip().removeprefix("@")
-	prefixed_id = (
-		rf"{re.escape(normalized_bot_name)}_({VIDEO_ID_PATTERN})"
-		if normalized_bot_name
-		else rf"({VIDEO_ID_PATTERN})"
-	)
-	pattern = re.compile(
-		rf"(?<![0-9a-zA-Z_])(?:{prefixed_id}|({VIDEO_ID_PATTERN}))"
-		rf"(?![0-9a-zA-Z_])",
-		re.IGNORECASE,
-	)
-	return [
-		next(group for group in match.groups() if group is not None).lower()
-		for match in pattern.finditer(str(text or ""))
-	]
 
 
 def _build_dispatcher(
@@ -60,30 +44,21 @@ def _build_dispatcher(
 ) -> Dispatcher:
 	dispatcher = Dispatcher()
 
-	@dispatcher.message(F.chat.type == "private", F.text)
-	async def receive_video_id(message: Message) -> None:
-		if message.from_user is None:
-			return
-		record_ids = _extract_record_ids(message.text or "", bot_name)
-		if not record_ids:
-			await message.reply("请输入有效的密文。")
-			return
-
-		
 
 	@dispatcher.message(F.chat.type == "private")
 	async def copy_message(message: Message) -> None:
 		if x_man_bot_id is not None:
-			
-			result = await message.copy_to(chat_id=x_man_bot_id)
-			print(f"Message copied to x_man_bot_id={x_man_bot_id}: {result}", flush=True)
+			# result = await message.copy_to(chat_id=x_man_bot_id)
+			# print(f"🎒 Message copied to x_man_bot_id={x_man_bot_id}: {result}", flush=True)
+			pass
+
 	return dispatcher
 
 
 
 
 async def start_backup_bot(
-	on_ready: Callable[[str], Awaitable[None] | None] | None = None,
+	on_ready: Callable[[str, Bot], Awaitable[None] | None] | None = None,
 	x_man_bot_id: int | None = None,
 ) -> None:
   
@@ -96,6 +71,8 @@ async def start_backup_bot(
 		token=token,
 		default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 	)
+
+
 	username = ""
 	try:
 		backup_bot.session.middleware(TelegramRateLimitMiddleware())
@@ -104,7 +81,7 @@ async def start_backup_bot(
 		)
 		username = str(getattr(me, "username", "") or "")
 		if on_ready is not None:
-			ready_result = on_ready(username)
+			ready_result = on_ready(username,backup_bot)
 			if isawaitable(ready_result):
 				await ready_result
 

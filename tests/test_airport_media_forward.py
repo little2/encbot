@@ -113,7 +113,7 @@ class AirportMediaForwardTests(unittest.TestCase):
 
         self.assertIsNone(extract("other12bot_Ab3_kL9-xY2pQr7Z"))
 
-    def test_backup_bot_username_is_sent_as_telegram_chat_username(self):
+    def test_disabled_backup_forwarding_only_sends_to_x_man(self):
         send_to_destination = AsyncMock(return_value=True)
         namespace = {
             "asyncio": asyncio,
@@ -133,6 +133,5 @@ class AirportMediaForwardTests(unittest.TestCase):
             send_to_destination.await_args_list,
             [
                 call(task, "X_MAN_BOT_ID", 123),
-                call(task, "BACKUP_BOT_NAME", "@zttowerpoolbot"),
             ],
         )

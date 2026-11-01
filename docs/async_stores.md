@@ -34,25 +34,25 @@ DATABASE_URL=postgresql://user:password@host:5432/encbot
 
 ### 机场使用独立数据库
 
-机场主程序使用专属配置，默认保持 SQLite，不继承桃花的
-`DATABASE_BACKEND` 或 `DATABASE_URL`。SQLite 文件路径仍沿用
-`USER_EXPIRE_DB_PATH` / `RAILWAY_VOLUME_MOUNT_PATH` 的规则。
+机场与桃花统一使用 `DATABASE_BACKEND`、`DATABASE_URL`，默认后端为 SQLite。
+每个机器人在自己的运行环境中提供配置；机场的连接地址必须指向机场独立数据库。
+SQLite 文件路径仍沿用 `USER_EXPIRE_DB_PATH` / `RAILWAY_VOLUME_MOUNT_PATH` 的规则。
 
 ```dotenv
-AIRPORT_DATABASE_BACKEND=sqlite
+DATABASE_BACKEND=sqlite
 ```
 
 完成机场六表数据迁移及核对后，才能在机场服务中切换：
 
 ```dotenv
-AIRPORT_DATABASE_BACKEND=postgresql
-AIRPORT_DATABASE_URL=postgresql://user:password@host:5432/airport
+DATABASE_BACKEND=postgresql
+DATABASE_URL=postgresql://user:password@host:5432/airport
 ```
 
-`AIRPORT_DATABASE_URL` 必须指向机场独立数据库，不得指向桃花数据库。
-未提供机场连接地址时 PostgreSQL 启动失败，不回退到桃花连接或 SQLite。
-启动创建表结构不会导入旧数据；当前 `scripts/migrate_sqlite_to_postgres.py`
-仅支持桃花两表，不能用来完成机场迁移。
+`DATABASE_URL` 必须指向机场独立数据库，不得指向桃花数据库。
+未提供连接地址时 PostgreSQL 启动失败，不回退到 SQLite。
+启动创建表结构不会导入旧数据。使用 `scripts/migrate_sqlite_to_postgres.py --app airport`
+迁移机场六表，具体步骤见 [机场迁移与备份流程](airport_postgres_migration.md)。
 
 ## 生命周期和调用
 
@@ -99,8 +99,14 @@ PostgreSQL 模式下上述三个指令会提示不支持，且不会操作旧 SQ
 请使用 PostgreSQL 管理工具或托管平台执行备份恢复。
 
 机场的手动维护与每日 SQLite 备份共用同一个维护任务锁。
-机场 PostgreSQL 模式下，每日自动备份及依赖它的不活跃用户自动清理暂停，
-并发送维护通知，不读取旧 SQLite 文件。上线前仍需接入 PostgreSQL 备份流程。
+机场 PostgreSQL 模式已接入 pg_dump custom 归档备份、归档检查和上传流程。
+`POSTGRES_BACKUP_ENABLED` 默认 false，备份及后续自动清理暂停并发送通知；
+完成目标环境恢复演练后设为 true。备份或上传失败时取消本次自动清理，不读取旧 SQLite。
+机场先将备份持久保存在本地，再直接上传给现有 `KEY_MAN_ID`。
+可选的通用 `BACKUP_DIR` 覆盖备份目录；默认使用挂载卷的 `postgres-backups/`，
+没有挂载卷时使用项目 `data/postgres-backups/`。工具自动优先查找项目内安装的客户端，
+其次查找系统 PATH，也可用通用 `PG_DUMP_BIN`、`PG_RESTORE_BIN` 覆盖。
+上传失败也保留本地文件；KEY_MAN_ID 无效时不执行自动备份和清理。
 管理员主动执行的用户清理不受每日任务开关控制。
 
 黑名单查询仅返回未过期记录，不会因读取而删除过期历史记录。

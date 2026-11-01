@@ -281,7 +281,7 @@ async def _initialize_database() -> None:
 	_unban_user = user_manager.unban_user
 	_delete_inactive_user_data = user_manager.delete_inactive_user_data
 	database_admin_commands.database_stores = database_stores
-	print(f"[DATABASE] backend={database_stores.backend}", flush=True)
+	print(f"💼 [DATABASE] backend={database_stores.backend}", flush=True)
 
 
 _is_current_chat_member = UserManager.is_current_chat_member

@@ -72,6 +72,7 @@ from utils.airport_async_stores import (
 from utils.time_utils import APP_TIMEZONE, app_fromtimestamp, app_now
 from utils.user_utils import UserExpire
 from utils.database_admin import DatabaseAdminCommands
+from utils.postgres_backup import create_postgres_backup, get_backup_directory
 from dotenv import load_dotenv
 
 from tgfileid import TelegramFileId
@@ -3699,11 +3700,11 @@ async def _initialize_database() -> None:
 	global user_manager, _ban_user, _unban_user
 	global _remove_inactive_user_from_chat, _delete_inactive_user_data
 
-	# Airport owns a separate database; never inherit Taohua's DATABASE_URL.
+	# Each deployed bot supplies its own DATABASE_URL.
 	database_stores = await create_airport_stores(
-		backend=os.getenv("AIRPORT_DATABASE_BACKEND", "sqlite"),
+		backend=os.getenv("DATABASE_BACKEND", "sqlite"),
 		sqlite_path=user_expire_db_path,
-		database_url=os.getenv("AIRPORT_DATABASE_URL", ""),
+		database_url=os.getenv("DATABASE_URL", ""),
 	)
 	user_expire_cache = database_stores.users
 	blacklist_store = database_stores.blacklist
@@ -3731,7 +3732,7 @@ async def _initialize_database() -> None:
 	_remove_inactive_user_from_chat = user_manager.remove_inactive_user_from_chat
 	_delete_inactive_user_data = user_manager.delete_inactive_user_data
 	database_admin_commands.database_stores = database_stores
-	print(f"[DATABASE] backend={database_stores.backend}", flush=True)
+	print(f"💼 [DATABASE] backend={database_stores.backend}", flush=True)
 
 
 _is_current_chat_member = UserManager.is_current_chat_member
@@ -4279,56 +4280,82 @@ async def _send_daily_maintenance_notice(text: str) -> None:
 
 
 async def _run_scheduled_backup() -> bool:
-	if database_stores is None or database_stores.backend != "sqlite":
+	if database_stores is None:
+		await _send_daily_maintenance_notice("⚠️ 数据库尚未初始化，自动备份和清理已暂停。")
+		return False
+	postgres = database_stores.backend == "postgresql"
+	if postgres and str(os.getenv("POSTGRES_BACKUP_ENABLED", "false")).strip().lower() not in {"1", "true", "yes", "on"}:
 		await _send_daily_maintenance_notice(
-			"⚠️ 自动备份及后续不活跃用户清理已暂停："
-			"当前后端不支持 SQLite 备份，请先配置 PostgreSQL 备份流程。"
+			"⚠️ PostgreSQL 自动备份及后续不活跃用户清理尚未启用。"
+			"请先完成备份恢复演练，再开启 POSTGRES_BACKUP_ENABLED。"
 		)
 		return False
-	if KEY_MAN_ID <= 0:
-		print(
-			"ℹ️[DAILY_MAINTENANCE] KEY_MAN_ID is not configured",
-			flush=True,
+	try:
+		recipient_id = int(KEY_MAN_ID or 0)
+	except (TypeError, ValueError):
+		recipient_id = 0
+	if not 0 < recipient_id < 2**63:
+		await _send_daily_maintenance_notice(
+			"⚠️ 请设置有效的 KEY_MAN_ID 以接收备份。"
+			"本次自动备份和后续用户清理已取消。"
 		)
 		return False
 
 	async with BACKUP_LOCK:
 		timestamp = app_now().strftime("%Y%m%d-%H%M%S")
-		backup_filename = f"encbot-daily-backup-{timestamp}.sqlite3"
+		backup_type = "PostgreSQL" if postgres else "SQLite"
+		extension = "dump" if postgres else "sqlite3"
+		backup_filename = f"encbot-daily-backup-{timestamp}-{secrets.token_hex(6)}.{extension}"
+		local_backup_ready = False
 		try:
-			with tempfile.TemporaryDirectory(prefix="encbot-daily-backup-") as temp_dir:
-				backup_path = Path(temp_dir) / backup_filename
-				await asyncio.to_thread(
-					_create_sqlite_backup,
-					user_expire_db_path,
-					backup_path,
+			backup_dir = get_backup_directory()
+			backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+			backup_path = backup_dir / backup_filename
+			digest_text = ""
+			if postgres:
+				report = await create_postgres_backup(
+					os.getenv("DATABASE_URL", ""), backup_path,
 				)
-				backup_size_text = _format_file_size(backup_path.stat().st_size)
-				await _telegram_call_with_retry(
-					"send daily sqlite backup",
-					lambda: bot.send_document(
-						chat_id=KEY_MAN_ID,
-						document=FSInputFile(
-							backup_path,
-							filename=backup_filename,
-						),
-						caption=(
-							"🗓️ 每日自动 SQLite 数据库备份\n"
-							f"{timestamp} (UTC+8)\n"
-							f"文件大小：{backup_size_text}"
-						),
+				digest_text = f"\nSHA-256：{report['sha256']}"
+			else:
+				# Publish a checked 0600 snapshot, keeping incomplete files private.
+				fd, stage_name = tempfile.mkstemp(prefix=".airport-sqlite-", suffix=".partial", dir=backup_dir)
+				os.close(fd)
+				stage_path = Path(stage_name)
+				try:
+					await asyncio.to_thread(_create_sqlite_backup, user_expire_db_path, stage_path)
+					os.link(stage_path, backup_path)
+				finally:
+					stage_path.unlink(missing_ok=True)
+			local_backup_ready = True
+			backup_size_text = _format_file_size(backup_path.stat().st_size)
+			print(f"[DAILY_MAINTENANCE] local backup ready: {backup_path}", flush=True)
+			await _telegram_call_with_retry(
+				f"send daily {backup_type} backup",
+				lambda: bot.send_document(
+					chat_id=recipient_id,
+					document=FSInputFile(backup_path, filename=backup_filename),
+					caption=(
+						f"🗓️ 每日自动 {backup_type} 数据库备份\n"
+						f"{timestamp} (UTC+8)\n"
+						f"文件大小：{backup_size_text}{digest_text}"
 					),
-				)
+				),
+			)
 		except Exception as exc:
-			print(f"[DAILY_MAINTENANCE] backup failed: {exc}", flush=True)
+			# PostgreSQL tool/connection details must not leak into Telegram/logs.
+			detail = type(exc).__name__ if postgres else str(exc)
+			print(f"[DAILY_MAINTENANCE] backup failed: {detail}", flush=True)
+			local_status = "本地备份已保留。" if local_backup_ready else "本地备份尚未完成。"
 			await _send_daily_maintenance_notice(
 				"❌ 每日自动备份失败\n"
-				f"原因：{exc}\n"
+				f"原因：{detail}\n"
+				f"{local_status}\n"
 				"为保护数据，本次不活跃用户清理已取消。"
 			)
 			return False
 
-	print(f"[DAILY_MAINTENANCE] backup sent: {backup_filename}", flush=True)
+	print(f"[DAILY_MAINTENANCE] backup sent and retained locally: {backup_filename}", flush=True)
 	return True
 
 
@@ -7548,8 +7575,11 @@ async def on_text(message: Message) -> None:
 	if not text:
 		return
 
-	await message.reply(f"功能暂关闭")
-	return
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		await message.reply(f"功能暂关闭")
+		return
+
+
 
 	batch_id = _extract_takeoff_batch_id(text)
 	if batch_id:
@@ -7642,6 +7672,10 @@ async def main() -> None:
 
 		await say_hello_to_x_man(bot_name)
 
+
+
+
+
 		workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
 		forward_worker = asyncio.create_task(_media_forward_worker())
 		maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
@@ -7692,6 +7726,42 @@ async def main() -> None:
 				name="backup_bot",
 			)
 			backup_bot_task.add_done_callback(_report_backup_bot_exit)
+
+
+		groups = (
+			("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
+			("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
+			("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+			("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
+			*(
+				(f"APRON_CHANNEL_ID[{index}]", chat_id)
+				for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
+			),
+		)
+
+		await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
+			bot=bot,
+			bot_name=bot_name,
+			groups=groups,
+			telegram_call=_telegram_call_with_retry,
+		)	
+
+
+		await bot.set_my_commands(
+			[
+				# BotCommand(command="start", description="开始"),
+				# BotCommand(command="about", description="关于我"),
+				BotCommand(command="me", description="查询飞行通行证"),
+				BotCommand(command="hot", description="查看七天热门资源"),
+				BotCommand(command="donate", description="可用账号乐捐说明"),
+				# BotCommand(command="bonus", description="塔台发放 10 天时限"),
+				BotCommand(command="rule", description="查看飞行通行证规则"),
+				BotCommand(command="airport_access_request", description="请求进入机场或大厅"),
+				BotCommand(command="invite", description="建立单人审核邀请"),
+			],
+			scope=BotCommandScopeAllPrivateChats(),
+		)
+
 
 		await reload_config()
 		await dp.start_polling(bot)

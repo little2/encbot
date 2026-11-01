@@ -89,6 +89,9 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
             "OPERATIONAL_NOTIFICATION_TASKS": set(),
             "_initialize_database": AsyncMock(),
             "database_stores": SimpleNamespace(close=AsyncMock()),
+            "_start_health_server": AsyncMock(return_value=(
+                SimpleNamespace(cleanup=AsyncMock()), "127.0.0.1:0",
+            )),
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
         return namespace
@@ -116,13 +119,9 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
         namespace["bot"].session.close.assert_awaited_once()
         namespace["bkbot"].session.close.assert_awaited_once()
 
-    async def test_main_continues_when_startup_notification_fails(self):
+    async def test_main_without_backup_still_polls(self):
         namespace = self._main_namespace()
         namespace["BACKUP_BOT_TOKEN"] = ""
-        namespace["SharedConfig"]._download_from_api.side_effect = RuntimeError(
-            "notification unavailable"
-        )
-
         await namespace["main"]()
 
         namespace["dp"].start_polling.assert_awaited_once_with(namespace["bot"])

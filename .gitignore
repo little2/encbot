@@ -64,6 +64,7 @@ data/user_expire.sqlite3
 data/user_expire.sqlite3-wal
 data/user_expire.sqlite3-shm
 data/migration-backups/
+data/postgres-backups/
 
 # Flask stuff:
 instance/
@@ -225,3 +226,6 @@ cache/
 encbot.code-workspace
 encbot.code-workspace
 .env copy
+
+# Local PostgreSQL client binaries
+/.local/postgresql/

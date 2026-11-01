@@ -3,16 +3,21 @@ import __future__
 import ast
 import asyncio
 import copy
+from contextlib import closing
 from datetime import datetime, timezone
 from html import escape
 import os
+import secrets
+import sqlite3
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from aiogram.types import FSInputFile
 from utils.airport_async_stores import create_airport_stores
+from utils.postgres_backup import get_backup_directory
 from utils.database_admin import DatabaseAdminCommands
 from utils.format_utils import FormatUtils
 from utils.user_manager import AsyncUserManager
@@ -74,7 +79,7 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                        AIRPORT_LOBBY_GROUP_ID=0, TERMINAL_CHANNEL_ID=0,
                        AIRPORT_DUTY_FREE_GROUP_ID=0, AIRPORT_FLIGHT_BOARD_CHANNEL_ID=0)
         load_functions({"_initialize_database"}, self.ns)
-        with patch.dict(os.environ, {"AIRPORT_DATABASE_BACKEND": "sqlite", "AIRPORT_DATABASE_URL": ""}):
+        with patch.dict(os.environ, {"DATABASE_BACKEND": "sqlite", "DATABASE_URL": ""}):
             await self.ns["_initialize_database"]()
         factory.assert_awaited_once_with(backend="sqlite", sqlite_path=self.path, database_url="")
         for name, store in (("user_expire_cache", self.stores.users),
@@ -127,7 +132,8 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                                      telegram_call=self.telegram_call, app_now=self.ns["app_now"],
                                      database_stores=postgres)
         message = SimpleNamespace(from_user=SimpleNamespace(id=99), reply=AsyncMock())
-        with patch("sqlite3.connect", side_effect=AssertionError("must not open SQLite")):
+        with patch("sqlite3.connect", side_effect=AssertionError("must not open SQLite")), \
+             patch.dict(os.environ, {"POSTGRES_BACKUP_ENABLED": "false"}):
             for command in (admin.backup, admin.restore, admin.clear_media):
                 await command(message)
             self.ns.update(database_stores=postgres, _send_daily_maintenance_notice=AsyncMock())
@@ -135,6 +141,113 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.ns["_run_scheduled_backup"]())
         self.assertEqual(message.reply.await_count, 3)
         self.ns["_send_daily_maintenance_notice"].assert_awaited_once()
+
+    def prepare_scheduled_postgres_backup(self):
+        async def dump(dsn, destination, **kwargs):
+            self.assertEqual(dsn, "postgresql://airport.invalid/airport")
+            destination.write_bytes(b"test archive")
+            destination.chmod(0o600)
+            return {"sha256": "a" * 64}
+
+        self.backup_dir = self.path.parent / 'retained-backups'
+        settings = patch.dict(os.environ, {'BACKUP_DIR': str(self.backup_dir)})
+        settings.start()
+        self.addCleanup(settings.stop)
+        self.bot.send_document = AsyncMock()
+        self.ns.update(database_stores=SimpleNamespace(backend="postgresql"), KEY_MAN_ID=99,
+                       BACKUP_LOCK=asyncio.Lock(), tempfile=tempfile, Path=Path, secrets=secrets,
+                       FSInputFile=FSInputFile, get_backup_directory=get_backup_directory,
+                       create_postgres_backup=AsyncMock(side_effect=dump),
+                       _telegram_call_with_retry=self.telegram_call, _format_file_size=str,
+                       _send_daily_maintenance_notice=AsyncMock())
+        load_functions({"_run_scheduled_backup"}, self.ns)
+
+    async def test_enabled_postgres_daily_backup_uploads_archive(self):
+        self.prepare_scheduled_postgres_backup()
+
+        async def upload(**kwargs):
+            self.assertEqual(Path(kwargs['document'].path).read_bytes(), b'test archive')
+            self.assertEqual(Path(kwargs['document'].path).stat().st_mode & 0o777, 0o600)
+
+        self.bot.send_document.side_effect = upload
+        with patch.dict(os.environ, {"POSTGRES_BACKUP_ENABLED": "true",
+                                     "DATABASE_URL": "postgresql://airport.invalid/airport"}), \
+             patch("sqlite3.connect", side_effect=AssertionError("must not open SQLite")):
+            self.assertTrue(await self.ns["_run_scheduled_backup"]())
+        self.bot.send_document.assert_awaited_once()
+        sent = self.bot.send_document.await_args.kwargs
+        self.assertEqual(sent['chat_id'], 99)
+        self.assertTrue(sent['document'].filename.endswith('.dump'))
+        self.assertIn('PostgreSQL', sent['caption'])
+        self.assertIn('a' * 64, sent['caption'])
+        self.assertTrue(Path(sent['document'].path).is_file())
+
+    async def test_postgres_backup_upload_failure_returns_false_and_redacts_details(self):
+        self.prepare_scheduled_postgres_backup()
+        self.bot.send_document.side_effect = RuntimeError('secret-connection-details')
+        with patch.dict(os.environ, {"POSTGRES_BACKUP_ENABLED": "true",
+                                     "DATABASE_URL": "postgresql://airport.invalid/airport"}):
+            self.assertFalse(await self.ns["_run_scheduled_backup"]())
+        notice = self.ns['_send_daily_maintenance_notice'].await_args.args[0]
+        self.assertNotIn('secret-connection-details', notice)
+        self.assertIn('清理已取消', notice)
+        self.assertIn('本地备份已保留', notice)
+        self.assertEqual(len(list(self.backup_dir.glob('*.dump'))), 1)
+
+    async def test_backup_is_sent_directly_to_key_man(self):
+        self.prepare_scheduled_postgres_backup()
+        with patch.dict(os.environ, {'POSTGRES_BACKUP_ENABLED': 'true',
+                                     'DATABASE_URL': 'postgresql://airport.invalid/airport'}):
+            self.assertTrue(await self.ns['_run_scheduled_backup']())
+        self.assertEqual(self.bot.send_document.await_args.kwargs['chat_id'], 99)
+
+    async def test_invalid_key_man_cancels_backup_and_upload(self):
+        self.prepare_scheduled_postgres_backup()
+        for value in (None, '', 0, -100, '@someone', 'invalid', 2**63):
+            self.ns['KEY_MAN_ID'] = value
+            with self.subTest(value=value), patch.dict(os.environ, {'POSTGRES_BACKUP_ENABLED': 'true'}):
+                self.assertFalse(await self.ns['_run_scheduled_backup']())
+        self.ns['create_postgres_backup'].assert_not_awaited()
+        self.bot.send_document.assert_not_awaited()
+
+    async def test_same_second_backups_use_different_local_filenames(self):
+        self.prepare_scheduled_postgres_backup()
+        with patch.dict(os.environ, {'POSTGRES_BACKUP_ENABLED': 'true',
+                                     'DATABASE_URL': 'postgresql://airport.invalid/airport'}):
+            self.assertTrue(await self.ns['_run_scheduled_backup']())
+            self.assertTrue(await self.ns['_run_scheduled_backup']())
+        self.assertEqual(len(list(self.backup_dir.glob('*.dump'))), 2)
+
+    async def test_local_backup_failure_never_uploads(self):
+        self.prepare_scheduled_postgres_backup()
+        self.ns['create_postgres_backup'].side_effect = RuntimeError('backup failed')
+        with patch.dict(os.environ, {'POSTGRES_BACKUP_ENABLED': 'true'}):
+            self.assertFalse(await self.ns['_run_scheduled_backup']())
+        self.bot.send_document.assert_not_awaited()
+
+    async def test_sqlite_backup_is_private_and_retained_after_upload(self):
+        self.prepare_scheduled_postgres_backup()
+        self.ns.update(database_stores=self.stores, user_expire_db_path=self.path,
+                       _create_sqlite_backup=DatabaseAdminCommands._create_sqlite_backup)
+        self.assertTrue(await self.ns['_run_scheduled_backup']())
+        path = Path(self.bot.send_document.await_args.kwargs['document'].path)
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        with closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(connection.execute('PRAGMA quick_check').fetchone(), ('ok',))
+
+    async def test_daily_cleanup_runs_only_after_successful_backup(self):
+        self.ns.update(_send_daily_maintenance_notice=AsyncMock(), _run_scheduled_backup=AsyncMock(),
+                       _execute_inactive_cleanup=AsyncMock(), DAILY_MAINTENANCE_HOUR=4,
+                       DAILY_MAINTENANCE_MINUTE=0, timedelta=__import__('datetime').timedelta)
+        load_functions({'_daily_maintenance_worker', '_next_daily_maintenance_time'}, self.ns)
+        for success in (False, True):
+            self.ns['_run_scheduled_backup'].return_value = success
+            self.ns['_execute_inactive_cleanup'].reset_mock()
+            with patch('asyncio.sleep', new=AsyncMock(side_effect=[None, asyncio.CancelledError()])):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.ns['_daily_maintenance_worker']()
+            self.assertEqual(self.ns['_execute_inactive_cleanup'].await_count, int(success))
 
     async def prepare_takeoff(self, *, quantity=2):
         await self.stores.users.update(1, NOW + 36000, group_message_timestamp=NOW)
@@ -185,21 +298,30 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AirportConfigurationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_default_does_not_inherit_taohua_postgres_configuration(self):
+    async def test_generic_database_settings_are_passed_to_factory(self):
         factory = AsyncMock(side_effect=RuntimeError("factory reached"))
         ns = load_functions({"_initialize_database"}, dict(
             os=os, create_airport_stores=factory, user_expire_db_path="airport.sqlite3"))
         with patch.dict(os.environ, {"DATABASE_BACKEND": "postgresql",
-                                     "DATABASE_URL": "postgresql://taohua.invalid/taohua"}, clear=True):
+                                     "DATABASE_URL": "postgresql://airport.invalid/airport"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "factory reached"):
+                await ns["_initialize_database"]()
+        factory.assert_awaited_once_with(backend="postgresql", sqlite_path="airport.sqlite3",
+                                         database_url="postgresql://airport.invalid/airport")
+
+    async def test_sqlite_is_default_without_database_configuration(self):
+        factory = AsyncMock(side_effect=RuntimeError("factory reached"))
+        ns = load_functions({"_initialize_database"}, dict(
+            os=os, create_airport_stores=factory, user_expire_db_path="airport.sqlite3"))
+        with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "factory reached"):
                 await ns["_initialize_database"]()
         factory.assert_awaited_once_with(backend="sqlite", sqlite_path="airport.sqlite3", database_url="")
 
-    async def test_missing_airport_dsn_fails_instead_of_using_taohua_database(self):
+    async def test_postgres_requires_database_url(self):
         ns = load_functions({"_initialize_database"}, dict(
             os=os, create_airport_stores=create_airport_stores, user_expire_db_path="unused.sqlite3"))
-        with patch.dict(os.environ, {"AIRPORT_DATABASE_BACKEND": "postgresql",
-                                     "DATABASE_URL": "postgresql://taohua.invalid/taohua"}, clear=True):
+        with patch.dict(os.environ, {"DATABASE_BACKEND": "postgresql"}, clear=True):
             with self.assertRaisesRegex(ValueError, "DATABASE_URL is required"):
                 await ns["_initialize_database"]()
 
@@ -217,6 +339,12 @@ class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
             dp=SimpleNamespace(start_polling=AsyncMock()), BACKUP_BOT_TOKEN="", MEDIA_WORKER_COUNT=1,
             _media_worker=worker, _media_forward_worker=worker, _daily_maintenance_worker=worker,
             _daily_hot_worker=worker, ENCODED_SEND_TASKS=set())
+        ns.update(AIRPORT_LOBBY_GROUP_ID=0, TERMINAL_CHANNEL_ID=0, AIRPORT_DUTY_FREE_GROUP_ID=0,
+                  AIRPORT_FLIGHT_BOARD_CHANNEL_ID=0, APRON_CHANNEL_IDS=[],
+                  ControlPanel=Mock(return_value=SimpleNamespace(check_bot_group_admin_permissions=AsyncMock())),
+                  SharedConfig=SimpleNamespace(get_all=lambda: {}), _telegram_call_with_retry=AsyncMock(),
+                  BotCommand=Mock(), BotCommandScopeAllPrivateChats=Mock())
+        ns['bot'].set_my_commands = AsyncMock()
         return load_functions({"main", "_report_backup_bot_exit"}, ns)
 
     async def test_database_initialization_failure_closes_session(self):

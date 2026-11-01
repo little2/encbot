@@ -11,13 +11,13 @@ import asyncio
 
 PROGRAM = os.getenv("PROGRAM")
 
-print(f"Selected program: {PROGRAM}")
+
 
 if PROGRAM == "TAOHUA":
-	print("Running TAOHUA program")
+	print("\n\nRunning TAOHUA program")
 	from main_taohua import main
 else:
-	print("Running AIRPORT program")
+	print("\n\n✈️ Running program")
 	from main_airport import main
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 # 桃花机器人：SQLite → PostgreSQL
 
 迁移仅处理 `user_expire` 和 `user_blacklist`，包括已过期的封禁记录，
-保留 ID、原因和所有时间戳。`main_airport.py` 的数据不在迁移范围内。
+保留 ID、原因和所有时间戳。本文描述默认的桃花模式；
+机场使用独立的 `--app airport` 六表模式，见 [机场迁移流程](airport_postgres_migration.md)。
 
-连接地址从 `.env` 的 `DATABASE_URL` 读取，不通过命令行传递或写入报告。
+连接地址从进程环境或 `.env` 的 `DATABASE_URL` 读取（进程环境优先），不通过命令行传递或写入报告。
 源文件默认沿用 `USER_EXPIRE_DB_PATH` / Railway 挂载路径 / 项目 data 路径。
 可以用 `--source /absolute/path/user_expire.sqlite3` 指定生产源文件，
 `--schema public` 指定目标 schema（schema 必须已存在）。

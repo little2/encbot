@@ -5,8 +5,8 @@ import html
 from io import BytesIO
 import os
 
-
-
+from aiohttp import web
+import errno
 import re
 import time
 from functools import lru_cache
@@ -308,6 +308,46 @@ censor = SpeechCensor({
 
 class IntroStates(StatesGroup):
 	waiting_intro = State()
+
+
+
+async def _start_health_server() -> tuple[web.AppRunner, str]:
+    """启动用于 Render 端口探测的轻量 HTTP 服务。"""
+    host = os.getenv("HOST", "0.0.0.0").strip() or "0.0.0.0"
+    configured_port = os.getenv("PORT", "").strip()
+    initial_port = int(configured_port or 10000)
+    candidate_ports = (
+        (initial_port,)
+        if configured_port
+        else tuple(range(initial_port, initial_port + 10))
+    )
+
+    app = web.Application()
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "service": "peach"})
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    last_error: OSError | None = None
+    for port in candidate_ports:
+        site = web.TCPSite(runner, host=host, port=port)
+        try:
+            await site.start()
+        except OSError as exc:
+            last_error = exc
+            if exc.errno != errno.EADDRINUSE or configured_port:
+                await runner.cleanup()
+                raise
+            print(f"⚠️ 健康检查端口 {port} 已被占用，尝试下一个端口。", flush=True)
+            continue
+        return runner, f"http://{host}:{port}"
+
+    await runner.cleanup()
+    raise RuntimeError("找不到可用的健康检查端口（已尝试 10000–10009）") from last_error
 
 
 async def _ask_intro(message: Message, state: FSMContext, text: str) -> None:
@@ -2968,7 +3008,11 @@ def _report_backup_bot_exit(task: asyncio.Task) -> None:
 async def main() -> None:
 	global bot_name
 	backup_bot_task = None
+	health_runner: web.AppRunner | None = None
 	try:
+		health_runner, bind_address = await _start_health_server()
+		print(f"HTTP 健康检查服务已启动：{bind_address}", flush=True)
+
 		await _initialize_database()
 		try:
 			me = await _telegram_call_with_retry(
@@ -3040,6 +3084,13 @@ async def main() -> None:
 		print(f"[STARTUP_ERROR] {type(exception).__name__}: {exception}", flush=True)
 	
 	finally:
+		# 优先关闭 HTTP server，避免其他任务取消较慢时继续占用端口。
+		if health_runner is not None:
+			await health_runner.cleanup()
+			health_runner = None
+			print("HTTP 健康检查服务已关闭，监听端口已释放。", flush=True)
+
+
 		if backup_bot_task is not None:
 			backup_bot_task.cancel()
 			await asyncio.gather(backup_bot_task, return_exceptions=True)

@@ -4,6 +4,9 @@ import base64
 import html
 from io import BytesIO
 import os
+
+
+
 import re
 import time
 from functools import lru_cache
@@ -51,6 +54,8 @@ cipher = NumberCipher(
 )
 
 
+
+
 SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID",0))
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
@@ -58,6 +63,9 @@ X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
 KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
 BOT_TOKEN = SharedConfig.get("my_bot_token", "")
 CHAT_ROW = SharedConfig.get("chat","")
+
+
+
 if CHAT_ROW:
 	CHAT_SCHOOL = CHAT_ROW.get("school")
 	CHAT_SCHOOL_GROUP_ID = int(os.getenv("CHAT_SCHOOL_GROUP_ID", CHAT_SCHOOL.get("chat_id"))) 
@@ -69,7 +77,9 @@ if CHAT_ROW:
 	CHAT_PUBLIC_LINK = os.getenv("CHAT_PUBLIC_LINK", CHAT_PUBLIC.get("invite_link"))
 
 	SUBSRCIBE_PREVIEW = CHAT_ROW.get("subscribe_preview")
-	SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW.get("chat_id"))) 
+	SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW.get("chat_id", 0)))
+
+
 
 
 
@@ -627,6 +637,7 @@ async def _pin_intro_post(message_id: int) -> None:
 
 @dp.message(IntroStates.waiting_intro, F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def on_intro_text(message: Message, state: FSMContext) -> None:
+	global SUBSRCIBE_PREVIEW_CHANNEL_ID, X_MAN_BOT_ID
 	if not message.from_user:
 		return
 	if await blacklist_store.is_blocked(int(message.from_user.id)):
@@ -706,10 +717,18 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			thumb_caption = f"{thumb_caption}\n\n{html.escape(tags_string)}"
 
 		try:
-			if SUBSRCIBE_PREVIEW_CHANNEL_ID:
+			if SUBSRCIBE_PREVIEW_CHANNEL_ID != 0:
+				print(f"line:720 :{SUBSRCIBE_PREVIEW_CHANNEL_ID}")
 				target_id = SUBSRCIBE_PREVIEW_CHANNEL_ID
-			else:
+			elif X_MAN_BOT_ID != 0:
+				print(f"line:723 :{X_MAN_BOT_ID}")
 				target_id = X_MAN_BOT_ID
+			else:
+				print(f"line:726 :{CHAT_PUBLIC_GROUP_ID}")
+				target_id = message.from_user.id
+
+			
+
 				
 			# print(f"line:738 :{target_id}")
 
@@ -739,23 +758,33 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 				destination=buffer,
 			)
 
-			thumb_result = await _telegram_call_with_retry(
-				"upload intro thumbnail fallback",
-				lambda: bot.send_photo(
-					chat_id=target_id,
-					photo=BufferedInputFile(
-						buffer.getvalue(),
-						filename="thumbnail.jpg",
+			try:
+				thumb_result = await _telegram_call_with_retry(
+					"upload intro thumbnail fallback",
+					lambda: bot.send_photo(
+						chat_id=target_id,
+						photo=BufferedInputFile(
+							buffer.getvalue(),
+							filename="thumbnail.jpg",
+						),
+						caption=thumb_caption,
+						parse_mode="HTML",
+						reply_markup=thumb_reply_markup,
+						protect_content=True,
 					),
-					caption=thumb_caption,
-					parse_mode="HTML",
-					reply_markup=thumb_reply_markup,
-					protect_content=True,
-				),
-				chat_id=target_id,
-			)
+					chat_id=target_id,
+				)
+			except Exception as exc:
+				if target_id == SUBSRCIBE_PREVIEW_CHANNEL_ID:
+					SUBSRCIBE_PREVIEW_CHANNEL_ID = 0 
+				elif target_id == X_MAN_BOT_ID:
+					X_MAN_BOT_ID = 0 
+				
+				print(f"[ENCODED_FORWARD] thumbnail seek failed: {exc}", flush=True)
+			
 
 			print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
+			
 			thumb_file_id = thumb_result.photo[-1].file_id
 			data["thumb_file_id"] = thumb_file_id
 			
@@ -816,8 +845,8 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 				reply_markup=InlineKeyboardMarkup(
 					inline_keyboard=[[
 						InlineKeyboardButton(text="👍", callback_data="alert:like"),
-						# InlineKeyboardButton(text="🍑", callback_data="peach:link"),
-						InlineKeyboardButton(text="👀", callback_data="preview:link"),
+						InlineKeyboardButton(text="🍑", callback_data="peach:link"),
+						# InlineKeyboardButton(text="👀", callback_data="preview:link"),
 						InlineKeyboardButton(text="👎", callback_data="alert:dislike")
 						]]
 				),

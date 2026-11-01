@@ -98,7 +98,11 @@ class ControlPanel:
 
 	async def send(self, message_text: str) -> None:
 		control_panel_chat_id = self.config.get("control_channel")
-		board_id = self.config.get("board_id")
+
+		raw_board_id = self.config.get("board_id")
+		board_id = int(raw_board_id) if str(raw_board_id or "").strip() else None
+
+		
 		switch_bot_token = self.config.get("switch_bot_token")
 
 		if not switch_bot_token:

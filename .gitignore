@@ -224,3 +224,4 @@ __marimo__/
 cache/
 encbot.code-workspace
 encbot.code-workspace
+.env copy

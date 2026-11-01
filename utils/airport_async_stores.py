@@ -1,8 +1,7 @@
 """Async airport stores sharing the database lifecycle from ``async_stores``.
 
-This module is intentionally not wired into ``main_airport.py`` yet.  It gives
-the airport's six tables one SQLite/PostgreSQL contract so the application can
-be converted independently in a later deployment.
+``main_airport.py`` initializes this bundle once at startup. The airport's six
+tables share one SQLite/PostgreSQL contract and one database lifecycle.
 """
 from __future__ import annotations
 
@@ -556,7 +555,7 @@ async def _initialize_airport_schema(database):
 
 
 async def create_airport_stores(*, backend=None, sqlite_path=None, database_url=None):
-    """Create all six airport stores without changing ``main_airport.py``."""
+    """Create all six airport stores sharing one database lifecycle."""
     core = await create_stores(
         backend=backend, sqlite_path=sqlite_path, database_url=database_url
     )

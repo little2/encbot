@@ -201,7 +201,7 @@ class UserManager:
 
 
 class AsyncUserManager(UserManager):
-	"""Async stores for Taohua; legacy UserManager callers keep their sync API."""
+	"""Async stores for bot entrypoints; legacy callers keep their sync API."""
 
 	def __init__(self, *, stores: DatabaseStores, **kwargs):
 		super().__init__(blacklist_store=stores.blacklist, user_expire_cache=stores.users, **kwargs)

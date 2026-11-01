@@ -62,14 +62,15 @@ from utils.control_panel import ControlPanel
 from utils.utf_utils import UtfConverter
 from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
-from utils.user_manager import UserManager
-from utils.blacklist_utils import BlacklistEntry, BlacklistStore
-from utils.batch_utils import BatchStore
-from utils.batch_view_utils import BatchViewStore
-from utils.invite_link_utils import SharedInviteLinkStore
-from utils.received_media_utils import ReceivedMediaStore
+from utils.user_manager import AsyncUserManager, UserManager
+from utils.blacklist_utils import BlacklistEntry
+from utils.async_stores import BlacklistStore, UserExpireStore
+from utils.airport_async_stores import (
+	AirportDatabaseStores, BatchStore, BatchViewStore, ReceivedMediaStore,
+	SharedInviteLinkStore, create_airport_stores,
+)
 from utils.time_utils import APP_TIMEZONE, app_fromtimestamp, app_now
-from utils.user_utils import UserExpireCache, UserExpire
+from utils.user_utils import UserExpire
 from utils.database_admin import DatabaseAdminCommands
 from dotenv import load_dotenv
 
@@ -203,12 +204,13 @@ default_user_expire_db_path = (
 user_expire_db_path = Path(
 	os.getenv("USER_EXPIRE_DB_PATH", str(default_user_expire_db_path))
 )
-user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
-blacklist_store = BlacklistStore(db_path=user_expire_db_path)
-batch_store = BatchStore(db_path=user_expire_db_path)
-batch_view_store = BatchViewStore(db_path=user_expire_db_path)
-received_media_store = ReceivedMediaStore(db_path=user_expire_db_path)
-shared_invite_link_store = SharedInviteLinkStore(db_path=user_expire_db_path)
+database_stores: AirportDatabaseStores | None = None
+user_expire_cache: UserExpireStore
+blacklist_store: BlacklistStore
+batch_store: BatchStore
+batch_view_store: BatchViewStore
+received_media_store: ReceivedMediaStore
+shared_invite_link_store: SharedInviteLinkStore
 
 from utils.telegram_gate import telegram_call as _telegram_call_with_retry
 
@@ -235,17 +237,16 @@ bot = Bot(
 dp = Dispatcher()
 
 backup_bot = None
+BACKUP_LOCK = asyncio.Lock()
 
 database_admin_commands = DatabaseAdminCommands(
 	bot=bot,
-	backup_lock=asyncio.Lock(),
+	backup_lock=BACKUP_LOCK,
 	database_path=user_expire_db_path,
 	key_man_id=KEY_MAN_ID,
 	admin_user_ids=ADMIN_USER_IDS,
 	telegram_call=_telegram_call_with_retry,
 	app_now=app_now,
-	user_expire_cache=user_expire_cache,
-	blacklist_store=blacklist_store,
 )
 database_admin_commands.register(dp)
 
@@ -288,7 +289,7 @@ class PrivateBotSenderLogMiddleware(BaseMiddleware):
 					if user_id:
 						
 
-						user_expire = user_expire_cache.extend_minutes(
+						user_expire = await user_expire_cache.extend_minutes(
 							user_id,
 							int(json_data.get("minutes", 0) or 0),
 						)
@@ -326,6 +327,8 @@ OVERFLOW_NOTICE_TIME: dict[tuple[int, int], float] = {}
 TAKEOFF_COUNTER_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 TAKEOFF_COUNTS: dict[tuple[int, int], int] = {}
 TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
+MESSAGE_REWARD_LOCKS: dict[int, asyncio.Lock] = {}
+ENCODED_SEND_TASKS: set[asyncio.Task] = set()
 TAKEOFF_KICK_LOCKS: dict[int, asyncio.Lock] = {}
 TAKEOFF_KICK_ACTION_STATE: dict[tuple[int, int, int], str] = {}
 TAKEOFF_KICK_ORIGINAL_MARKUPS: dict[
@@ -342,7 +345,6 @@ AIRPORT_QUIZ_PASSED_UNTIL: dict[int, int] = {}
 AIRPORT_QUIZ_LOCKS: dict[int, asyncio.Lock] = {}
 AIRPORT_INVITE_LINK_LOCK = asyncio.Lock()
 INVITE_LINK_LOCKS: dict[str, asyncio.Lock] = {}
-BACKUP_LOCK = asyncio.Lock()
 X_MAN_REQUEST_LOCK = asyncio.Lock()
 X_MAN_PENDING_REPLY: asyncio.Future[str] | None = None
 X_MAN_PENDING_REQUEST_MESSAGE_ID: int | None = None
@@ -1088,7 +1090,7 @@ def _build_tag_menu_keyboard(state: dict[str, Any]) -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeyboardMarkup:
+async def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeyboardMarkup:
 	no_forward = bool(state.get("no_forward", False))
 	
 	flash_seconds = int(state.get("flash_seconds", 0))
@@ -1099,7 +1101,7 @@ def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> InlineKeybo
 	owner_user_id = int(state.get("owner_user_id", 0))
 
 	now_timestamp = int(app_now().timestamp())
-	user_expire = user_expire_cache.get(int(owner_user_id))
+	user_expire = await user_expire_cache.get(int(owner_user_id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 		
 		rows = [
@@ -2190,7 +2192,7 @@ async def _send_encoded_preview_message(
 				has_spoiler=if_spoiler,
 			),
 		)
-		batch_view_store.record(batch_id, user_id)
+		await batch_view_store.record(batch_id, user_id)
 		if caption is not None:
 			return photo_message
 		return await _telegram_call_with_retry(
@@ -2212,7 +2214,7 @@ async def _send_encoded_preview_message(
 			media=media,
 		),
 	)
-	batch_view_store.record(batch_id, user_id)
+	await batch_view_store.record(batch_id, user_id)
 	return await _telegram_call_with_retry(
 		"send encoded text",
 		lambda: bot.send_message(
@@ -2235,13 +2237,13 @@ async def _get_batch_preview_message_settings(
 
 	# print(f"normalized_batch_id=>{normalized_batch_id}", flush=True)
 
-	batch_record = batch_store.get(normalized_batch_id)
+	batch_record = await batch_store.get(normalized_batch_id)
 	if not batch_record:
 		raise ValueError("找不到此批次。")
 
 	# print(f"batch_record=>{batch_record}", flush=True)
 
-	items = received_media_store.get_media_by_batch_id(normalized_batch_id)
+	items = await received_media_store.get_media_by_batch_id(normalized_batch_id)
 	if not items:
 		raise ValueError("找不到此批次的媒體。")
 
@@ -2546,7 +2548,7 @@ async def _record_batch_channel_location(
 	settings = dict(batch_settings or {})
 	channel_key = (int(channel_chat_id), int(channel_message_id))
 	async with BATCH_LOCATION_LOCK:
-		batch_store.upsert_channel_location(
+		await batch_store.upsert_channel_location(
 			batch_id=batch_id,
 			channel_chat_id=channel_key[0],
 			channel_message_id=channel_key[1],
@@ -2567,7 +2569,7 @@ async def _record_batch_channel_location(
 			None,
 		)
 		if pending_discussion:
-			batch_store.update_discussion_location(
+			await batch_store.update_discussion_location(
 				channel_key[0],
 				channel_key[1],
 				pending_discussion[0],
@@ -2697,7 +2699,7 @@ async def _send_encoded_snapshot(
 		except Exception as exc:
 			print(f"[BATCH] channel location save failed: {exc}", flush=True)
 		try:
-			accepted_count = received_media_store.accept_batch(
+			accepted_count = await received_media_store.accept_batch(
 				[
 					str(item.get("file_unique_id", ""))
 					for item in items
@@ -2719,7 +2721,7 @@ async def _send_encoded_snapshot(
 			)
 	else:
 		try:
-			received_media_store.release_pending_batch(batch_id)
+			await received_media_store.release_pending_batch(batch_id)
 		except Exception as exc:
 			print(f"[RECEIVED_MEDIA] pending release failed: {exc}", flush=True)
 
@@ -2772,7 +2774,7 @@ async def _send_encoded_snapshot(
 		if is_first_send:
 			try:
 				now_timestamp = int(app_now().timestamp())
-				previous_user_expire = user_expire_cache.get(owner_user_id)
+				previous_user_expire = await user_expire_cache.get(owner_user_id)
 				previous_expire_timestamp = (
 					previous_user_expire.expire_timestamp
 					if previous_user_expire
@@ -2798,7 +2800,7 @@ async def _send_encoded_snapshot(
 						requested_minutes *= 2
 						content_bonus_applied = True
 
-				user_expire = user_expire_cache.extend_minutes(
+				user_expire = await user_expire_cache.extend_minutes(
 					owner_user_id,
 					requested_minutes,
 				)
@@ -2863,7 +2865,7 @@ async def _send_encoded_snapshot(
 		await bot.edit_message_reply_markup(
 			chat_id=state_key[0],
 			message_id=state_key[1],
-			reply_markup=_build_controls_keyboard(state, current_encoded),
+			reply_markup=await _build_controls_keyboard(state, current_encoded),
 		)
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] status keyboard update failed: {exc}", flush=True)
@@ -2905,20 +2907,20 @@ async def _handle_send_encoded(
 		state["batch_id"] = batch_id
 
 	try:
-		conflicts = received_media_store.claim_batch(
+		conflicts = await received_media_store.claim_batch(
 			items_snapshot,
 			owner_user_id,
 			batch_id,
 		)
 	except Exception as exc:
 		await callback.message.edit_reply_markup(
-			reply_markup=_build_controls_keyboard(state, encoded_snapshot),
+			reply_markup=await _build_controls_keyboard(state, encoded_snapshot),
 		)
 		await callback.answer(f"媒体确认失败：{exc}", show_alert=True)
 		return
 	if conflicts:
 		await callback.message.edit_reply_markup(
-			reply_markup=_build_controls_keyboard(state, encoded_snapshot),
+			reply_markup=await _build_controls_keyboard(state, encoded_snapshot),
 		)
 		await callback.answer(
 			"本批次包含已经送出或正在送出的媒体，请取消后重新上传。",
@@ -2931,11 +2933,11 @@ async def _handle_send_encoded(
 		await callback.answer("正在送出")
 	except Exception:
 		state["send_status"] = "failed"
-		received_media_store.release_pending_batch(batch_id)
+		await received_media_store.release_pending_batch(batch_id)
 		raise
 	try:
 		await callback.message.edit_reply_markup(
-			reply_markup=_build_controls_keyboard(state, encoded_snapshot),
+			reply_markup=await _build_controls_keyboard(state, encoded_snapshot),
 		)
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] sending keyboard update failed: {exc}", flush=True)
@@ -2953,9 +2955,11 @@ async def _handle_send_encoded(
 			is_first_send=is_first_send,
 		)
 	)
+	ENCODED_SEND_TASKS.add(task)
 	state["send_task"] = task
 
 	def _clear_send_task(completed_task: asyncio.Task) -> None:
+		ENCODED_SEND_TASKS.discard(completed_task)
 		if state.get("send_task") is completed_task:
 			state.pop("send_task", None)
 
@@ -3102,7 +3106,7 @@ async def _finish_upload(
 	state["token"] = token
 	state["encoded"] = encoded
 	display_text = await _build_display(parsed, encoded)
-	markup = _build_controls_keyboard(state, encoded)
+	markup = await _build_controls_keyboard(state, encoded)
 	panel_message_id = session.get("panel_message_id")
 
 	if panel_message_id:
@@ -3220,7 +3224,7 @@ async def cmd_me(message: Message) -> None:
 		return
 
 	now_timestamp = int(app_now().timestamp())
-	user_expire = user_expire_cache.get(int(message.from_user.id))
+	user_expire = await user_expire_cache.get(int(message.from_user.id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 		await message.reply(
 			"🎫 飞行通行证\n\n"
@@ -3244,9 +3248,9 @@ async def cmd_me(message: Message) -> None:
 	)
 
 
-def _build_hot_message() -> str:
+async def _build_hot_message() -> str:
 	try:
-		hot_batches = batch_view_store.get_hot_batches(days=7, limit=30)
+		hot_batches = await batch_view_store.get_hot_batches(days=7, limit=30)
 	except Exception as exc:  # pragma: no cover - defensive guard for legacy DBs
 		print(f"_build_hot_message: failed to load hot batches: {exc}", flush=True)
 		hot_batches = []
@@ -3272,7 +3276,7 @@ def _build_hot_message() -> str:
 
 @dp.message(F.chat.type == "private", Command("hot"))
 async def cmd_hot(message: Message) -> None:
-	await message.reply(_build_hot_message(), parse_mode="HTML")
+	await message.reply(await _build_hot_message(), parse_mode="HTML")
 
 
 @dp.message(F.chat.type == "private", Command("donate"))
@@ -3358,7 +3362,7 @@ async def cmd_setup_shared_invite_link(message: Message, command: CommandObject)
 		return
 
 	try:
-		record = shared_invite_link_store.set_chat_id(link_key, chat_id)
+		record = await shared_invite_link_store.set_chat_id(link_key, chat_id)
 	except Exception as exc:
 		print(f"[SETUP_INVITE_LINK] failed: {exc}", flush=True)
 		await message.reply("❌ 更新失败，请检查日志。")
@@ -3536,7 +3540,7 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 
 	bonus_minutes = MAX_HP_CAPACITY_MINUTES
 	now_timestamp = int(app_now().timestamp())
-	previous_user_expire = user_expire_cache.get(target_user_id)
+	previous_user_expire = await user_expire_cache.get(target_user_id)
 	previous_expire_timestamp = (
 		previous_user_expire.expire_timestamp
 		if previous_user_expire
@@ -3544,7 +3548,7 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 	)
 	base_timestamp = max(now_timestamp, previous_expire_timestamp)
 
-	user_expire = user_expire_cache.extend_minutes(
+	user_expire = await user_expire_cache.extend_minutes(
 		target_user_id,
 		bonus_minutes,
 		group_message_timestamp=now_timestamp,
@@ -3589,7 +3593,7 @@ async def cmd_expire15(message: Message, command: CommandObject) -> None:
 			return
 
 	expire_timestamp = int((app_now() + timedelta(days=15)).timestamp())
-	user_expire = user_expire_cache.update(target_user_id, expire_timestamp)
+	user_expire = await user_expire_cache.update(target_user_id, expire_timestamp)
 
 	await message.reply(
 		"✅ 已设置特权飞行通行证\n"
@@ -3631,7 +3635,7 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 		return
 
 	now_timestamp = int(app_now().timestamp())
-	user_expire = user_expire_cache.get(target_user_id)
+	user_expire = await user_expire_cache.get(target_user_id)
 	lines = [
 		"👤 用户资料",
 		f"用户 ID：{target_user_id}",
@@ -3669,7 +3673,7 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 			),
 		])
 
-	blacklist_entry = blacklist_store.get(target_user_id)
+	blacklist_entry = await blacklist_store.get(target_user_id)
 	lines.extend(["", "🚫 黑名单"])
 	if blacklist_entry is None:
 		lines.append("状态：✅ 不在黑名单中")
@@ -3689,26 +3693,47 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 	await message.reply("\n".join(lines))
 
 
-user_manager = UserManager(
-	bot=bot,
-	blacklist_store=blacklist_store,
-	user_expire_cache=user_expire_cache,
-	telegram_call=_telegram_call_with_retry,
-	lobby_group_id=AIRPORT_LOBBY_GROUP_ID,
-	terminal_channel_id=TERMINAL_CHANNEL_ID,
-	duty_free_group_id=AIRPORT_DUTY_FREE_GROUP_ID,
-	flight_board_channel_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,
-	user_state_stores=(
-		PENDING_AIRPORT_JOIN_INVITES,
-		AIRPORT_QUIZ_PROGRESS,
-		AIRPORT_QUIZ_RETRY_AT,
-		AIRPORT_QUIZ_PASSED_UNTIL,
-	),
-)
-_ban_user = user_manager.ban_user
-_unban_user = user_manager.unban_user
-_remove_inactive_user_from_chat = user_manager.remove_inactive_user_from_chat
-_delete_inactive_user_data = user_manager.delete_inactive_user_data
+async def _initialize_database() -> None:
+	global database_stores, user_expire_cache, blacklist_store
+	global batch_store, batch_view_store, received_media_store, shared_invite_link_store
+	global user_manager, _ban_user, _unban_user
+	global _remove_inactive_user_from_chat, _delete_inactive_user_data
+
+	# Airport owns a separate database; never inherit Taohua's DATABASE_URL.
+	database_stores = await create_airport_stores(
+		backend=os.getenv("AIRPORT_DATABASE_BACKEND", "sqlite"),
+		sqlite_path=user_expire_db_path,
+		database_url=os.getenv("AIRPORT_DATABASE_URL", ""),
+	)
+	user_expire_cache = database_stores.users
+	blacklist_store = database_stores.blacklist
+	batch_store = database_stores.batches
+	batch_view_store = database_stores.batch_views
+	received_media_store = database_stores.received_media
+	shared_invite_link_store = database_stores.shared_invite_links
+	user_manager = AsyncUserManager(
+		stores=database_stores,
+		bot=bot,
+		telegram_call=_telegram_call_with_retry,
+		lobby_group_id=AIRPORT_LOBBY_GROUP_ID,
+		terminal_channel_id=TERMINAL_CHANNEL_ID,
+		duty_free_group_id=AIRPORT_DUTY_FREE_GROUP_ID,
+		flight_board_channel_id=AIRPORT_FLIGHT_BOARD_CHANNEL_ID,
+		user_state_stores=(
+			PENDING_AIRPORT_JOIN_INVITES,
+			AIRPORT_QUIZ_PROGRESS,
+			AIRPORT_QUIZ_RETRY_AT,
+			AIRPORT_QUIZ_PASSED_UNTIL,
+		),
+	)
+	_ban_user = user_manager.ban_user
+	_unban_user = user_manager.unban_user
+	_remove_inactive_user_from_chat = user_manager.remove_inactive_user_from_chat
+	_delete_inactive_user_data = user_manager.delete_inactive_user_data
+	database_admin_commands.database_stores = database_stores
+	print(f"[DATABASE] backend={database_stores.backend}", flush=True)
+
+
 _is_current_chat_member = UserManager.is_current_chat_member
 
 
@@ -3770,7 +3795,7 @@ async def cmd_unban(message: Message, command: CommandObject) -> None:
 		await message.reply("用法：/unban [用户id]")
 		return
 
-	if not blacklist_store.is_blocked(target_user_id):
+	if not await blacklist_store.is_blocked(target_user_id):
 		await message.reply(f"ℹ️ 用户不在黑名单中：{target_user_id}")
 		return
 	group_unban_error = await _unban_user(target_user_id)
@@ -3778,7 +3803,7 @@ async def cmd_unban(message: Message, command: CommandObject) -> None:
 		await message.reply(f"❌ 群组解除封禁失败：{group_unban_error}")
 		return
 
-	blacklist_store.unban(target_user_id)
+	await blacklist_store.unban(target_user_id)
 	await message.reply(
 		f"✅ 已从黑名单移除并解除群组封禁：{target_user_id}"
 	)
@@ -3789,7 +3814,7 @@ async def cmd_unban_voluntary_leavers(message: Message) -> None:
 	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
 		return
 
-	entries = blacklist_store.list_by_reason_prefix("主动离开")
+	entries = await blacklist_store.list_by_reason_prefix("主动离开")
 	if not entries:
 		await message.reply("ℹ️ 没有因主动离开而仍在黑名单中的用户")
 		return
@@ -3808,7 +3833,7 @@ async def cmd_unban_voluntary_leavers(message: Message) -> None:
 			failed_user_ids.append(user_id)
 			continue
 
-		blacklist_store.unban(user_id)
+		await blacklist_store.unban(user_id)
 		unbanned_user_ids.append(user_id)
 		try:
 			await bot.send_message(
@@ -3854,7 +3879,7 @@ async def cmd_baninfo(message: Message, command: CommandObject) -> None:
 		await message.reply("用法：/baninfo [用户id]")
 		return
 
-	entry = blacklist_store.get(target_user_id)
+	entry = await blacklist_store.get(target_user_id)
 	if not entry:
 		await message.reply(f"ℹ️ 用户不在黑名单中：{target_user_id}")
 		return
@@ -3873,7 +3898,7 @@ async def cmd_banlist(message: Message, command: CommandObject) -> None:
 		return
 
 	page_size = 10
-	entries, total = blacklist_store.list_page(page, page_size)
+	entries, total = await blacklist_store.list_page(page, page_size)
 	if total == 0:
 		await message.reply("黑名单目前为空")
 		return
@@ -3902,25 +3927,25 @@ def _inactive_cutoff_timestamp(now_timestamp: int | None = None) -> int:
 	return now_timestamp - INACTIVE_EXPIRE_DAYS * 24 * 60 * 60
 
 
-def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
+async def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
 	user_id = int(user_id)
-	if user_id in ADMIN_USER_IDS or blacklist_store.is_blocked(user_id):
+	if user_id in ADMIN_USER_IDS or await blacklist_store.is_blocked(user_id):
 		return False
 	bot_user_id = int(getattr(bot, "id", 0) or 0)
 	if bot_user_id and user_id == bot_user_id:
 		return False
-	user_expire = user_expire_cache.get(user_id)
+	user_expire = await user_expire_cache.get(user_id)
 	return bool(
 		user_expire
 		and user_expire.expire_timestamp <= _inactive_cutoff_timestamp(now_timestamp)
 	)
 
 
-def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]:
+async def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]:
 	candidates = [
 		(user_id, user_expire)
-		for user_id, user_expire in list(user_expire_cache.users.items())
-		if _is_inactive_candidate(user_id, now_timestamp)
+		for user_id, user_expire in (await user_expire_cache.list_users()).items()
+		if await _is_inactive_candidate(user_id, now_timestamp)
 	]
 	return sorted(
 		candidates,
@@ -3966,7 +3991,7 @@ async def cmd_inactive_candidate(message: Message, command: CommandObject) -> No
 		return
 
 	now_timestamp = int(app_now().timestamp())
-	candidates = _get_inactive_candidates(now_timestamp)
+	candidates = await _get_inactive_candidates(now_timestamp)
 	if not candidates:
 		await message.reply(
 			f"目前没有通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天的用户"
@@ -4041,7 +4066,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 
 	async with INACTIVE_CLEANUP_LOCK:
 		now_timestamp = int(app_now().timestamp())
-		candidates = _get_inactive_candidates(now_timestamp)
+		candidates = await _get_inactive_candidates(now_timestamp)
 		if not candidates:
 			await notify(
 				f"目前没有通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天的用户"
@@ -4057,17 +4082,17 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 
 		for user_id, _ in candidates:
 			check_timestamp = int(app_now().timestamp())
-			if not _is_inactive_candidate(user_id, check_timestamp):
+			if not await _is_inactive_candidate(user_id, check_timestamp):
 				skipped_user_ids.append(user_id)
 				continue
 
-			user_expire = user_expire_cache.get(user_id)
+			user_expire = await user_expire_cache.get(user_id)
 			expired_days = max(
 				0,
 				(check_timestamp - user_expire.expire_timestamp) // (24 * 60 * 60),
 			) if user_expire else INACTIVE_EXPIRE_DAYS
 
-			if not _is_inactive_candidate(user_id, int(app_now().timestamp())):
+			if not await _is_inactive_candidate(user_id, int(app_now().timestamp())):
 				skipped_user_ids.append(user_id)
 				continue
 
@@ -4080,7 +4105,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			)
 			if airport_participant_error:
 				try:
-					_delete_inactive_user_data(user_id)
+					await _delete_inactive_user_data(user_id)
 				except Exception as exc:
 					failed_results.append(f"{user_id}：数据库删除失败：{exc}")
 					continue
@@ -4102,7 +4127,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			)
 			if lobby_participant_error:
 				try:
-					_delete_inactive_user_data(user_id)
+					await _delete_inactive_user_data(user_id)
 				except Exception as exc:
 					failed_results.append(f"{user_id}：数据库删除失败：{exc}")
 					continue
@@ -4127,7 +4152,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				)
 				if duty_free_participant_error:
 					try:
-						_delete_inactive_user_data(user_id)
+						await _delete_inactive_user_data(user_id)
 					except Exception as exc:
 						failed_results.append(f"{user_id}：数据库删除失败：{exc}")
 						continue
@@ -4198,7 +4223,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 					)
 
 			try:
-				_delete_inactive_user_data(user_id)
+				await _delete_inactive_user_data(user_id)
 			except Exception as exc:
 				failed_results.append(f"{user_id}：数据库删除失败：{exc}")
 				continue
@@ -4254,6 +4279,12 @@ async def _send_daily_maintenance_notice(text: str) -> None:
 
 
 async def _run_scheduled_backup() -> bool:
+	if database_stores is None or database_stores.backend != "sqlite":
+		await _send_daily_maintenance_notice(
+			"⚠️ 自动备份及后续不活跃用户清理已暂停："
+			"当前后端不支持 SQLite 备份，请先配置 PostgreSQL 备份流程。"
+		)
+		return False
 	if KEY_MAN_ID <= 0:
 		print(
 			"ℹ️[DAILY_MAINTENANCE] KEY_MAN_ID is not configured",
@@ -4366,11 +4397,12 @@ async def _daily_hot_worker() -> None:
 			continue
 
 		try:
+			hot_message = await _build_hot_message()
 			await _telegram_call_with_retry(
 				"send daily hot list to airport duty free group",
 				lambda: bot.send_message(
 					chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
-					text=_build_hot_message(),
+					text=hot_message,
 					parse_mode="HTML",
 					disable_web_page_preview=True,
 				),
@@ -4489,7 +4521,7 @@ async def cmd_invite(message: Message) -> None:
 	if not message.from_user:
 		return
 	user_id = int(message.from_user.id)
-	if blacklist_store.is_blocked(user_id):
+	if await blacklist_store.is_blocked(user_id):
 		# await message.reply("❌ 你目前无法建立邀请连结。")
 		return
 	if AIRPORT_LOBBY_GROUP_ID == 0:
@@ -4498,7 +4530,7 @@ async def cmd_invite(message: Message) -> None:
 	if not await _is_airport_member(user_id):
 		await message.reply("❌ 只有航站大厅或机场的现有成员可以建立邀请。")
 		return
-	user_expire = user_expire_cache.get(user_id)
+	user_expire = await user_expire_cache.get(user_id)
 	now_timestamp = int(app_now().timestamp())
 	if (
 		not user_expire
@@ -4558,7 +4590,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 	if AIRPORT_LOBBY_GROUP_ID == 0:
 		await callback.message.edit_text("❌ 航站大厅尚未配置，请联系塔台。")
 		return
-	if blacklist_store.is_blocked(user_id):
+	if await blacklist_store.is_blocked(user_id):
 		await callback.message.edit_text("❌ 你目前无法建立邀请连结。")
 		return
 	if not await _is_airport_member(user_id):
@@ -4569,7 +4601,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 
 	user_lock = TAKEOFF_USER_LOCKS.setdefault(user_id, asyncio.Lock())
 	async with user_lock:
-		user_expire = user_expire_cache.get(user_id)
+		user_expire = await user_expire_cache.get(user_id)
 		now_timestamp = int(app_now().timestamp())
 		if (
 			not user_expire
@@ -4593,7 +4625,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 				),
 				creates_join_request=True,
 			)
-			updated_user = user_expire_cache.consume_minutes(
+			updated_user = await user_expire_cache.consume_minutes(
 				user_id,
 				PAID_INVITE_COST_MINUTES,
 			)
@@ -4638,7 +4670,7 @@ async def on_paid_invite_confirm(callback: CallbackQuery) -> None:
 					)
 			if consumed:
 				try:
-					user_expire_cache.extend_minutes(
+					await user_expire_cache.refund_minutes(
 						user_id,
 						PAID_INVITE_COST_MINUTES,
 					)
@@ -4814,9 +4846,9 @@ async def _get_or_create_chat_invite_link(
 
 	link_lock = INVITE_LINK_LOCKS.setdefault(resolved_link_key, asyncio.Lock())
 	async with link_lock:
-		stored_link = shared_invite_link_store.get(resolved_link_key)
+		stored_link = await shared_invite_link_store.get(resolved_link_key)
 		if stored_link and stored_link.chat_id != chat_id:
-			shared_invite_link_store.delete(resolved_link_key)
+			await shared_invite_link_store.delete(resolved_link_key)
 			stored_link = None
 
 		if stored_link:
@@ -4832,7 +4864,7 @@ async def _get_or_create_chat_invite_link(
 					f"[INVITE_LINK] stored link is invalid, replacing it: {exc}",
 					flush=True,
 				)
-				shared_invite_link_store.delete(resolved_link_key)
+				await shared_invite_link_store.delete(resolved_link_key)
 			except Exception as exc:
 				print(
 					f"[INVITE_LINK] validation unavailable, using stored link: {exc}",
@@ -4841,7 +4873,7 @@ async def _get_or_create_chat_invite_link(
 				return stored_link.invite_link
 			else:
 				if not bool(validated_link.is_revoked):
-					shared_invite_link_store.save(
+					await shared_invite_link_store.save(
 						resolved_link_key,
 						chat_id,
 						str(validated_link.invite_link),
@@ -4849,7 +4881,7 @@ async def _get_or_create_chat_invite_link(
 						created_at=stored_link.created_at,
 					)
 					return str(validated_link.invite_link)
-				shared_invite_link_store.delete(resolved_link_key)
+				await shared_invite_link_store.delete(resolved_link_key)
 
 		invite = await bot.create_chat_invite_link(
 			chat_id=chat_id,
@@ -4858,7 +4890,7 @@ async def _get_or_create_chat_invite_link(
 		)
 		invite_link = str(invite.invite_link)
 		try:
-			shared_invite_link_store.save(
+			await shared_invite_link_store.save(
 				resolved_link_key,
 				chat_id,
 				invite_link,
@@ -5158,7 +5190,7 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 		return
 
 	user_id = int(callback.from_user.id)
-	user_expire = user_expire_cache.get(user_id)
+	user_expire = await user_expire_cache.get(user_id)
 	remaining_seconds = max(
 		0,
 		(user_expire.expire_timestamp if user_expire else 0) - now_timestamp,
@@ -5371,11 +5403,11 @@ async def _is_member_of_chat(chat_id: int, user_id: int) -> bool:
 async def _get_join_rejection_reason(
 	context: AirportJoinContext,
 ) -> JoinRejection | None:
-	if blacklist_store.is_blocked(context.user_id):
+	if await blacklist_store.is_blocked(context.user_id):
 		return JoinRejection("blacklisted", "你目前无法申请进入机场。")
 
 	now_timestamp = int(app_now().timestamp())
-	user_expire = user_expire_cache.get(context.user_id)
+	user_expire = await user_expire_cache.get(context.user_id)
 	remaining_seconds = max(
 		0,
 		(user_expire.expire_timestamp if user_expire else 0) - now_timestamp,
@@ -5523,12 +5555,12 @@ async def _reward_paid_invite_creator(context: AirportJoinContext) -> None:
 	)
 	async with inviter_lock:
 		now_timestamp = int(app_now().timestamp())
-		previous_user = user_expire_cache.get(context.inviter_user_id)
+		previous_user = await user_expire_cache.get(context.inviter_user_id)
 		previous_expire_timestamp = (
 			previous_user.expire_timestamp if previous_user else 0
 		)
 		base_timestamp = max(now_timestamp, previous_expire_timestamp)
-		updated_user = user_expire_cache.extend_minutes(
+		updated_user = await user_expire_cache.extend_minutes(
 			context.inviter_user_id,
 			PAID_INVITE_REWARD_MINUTES,
 		)
@@ -5774,7 +5806,7 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 	)
 	if is_new_lobby_member:
 		blacklist_entry = (
-			blacklist_store.get(target_user_id)
+			await blacklist_store.get(target_user_id)
 			if target_user_id not in ADMIN_USER_IDS
 			else None
 		)
@@ -5805,7 +5837,7 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 
 	if target_user_id in ADMIN_USER_IDS:
 		return
-	if blacklist_store.is_blocked(target_user_id):
+	if await blacklist_store.is_blocked(target_user_id):
 		return
 	if not was_member:
 		return
@@ -5885,7 +5917,7 @@ async def on_lobby_channel_auto_forward(message: Message) -> None:
 
 	discussion_location = (int(message.chat.id), int(message.message_id))
 	async with BATCH_LOCATION_LOCK:
-		updated = batch_store.update_discussion_location(
+		updated = await batch_store.update_discussion_location(
 			source_location[0],
 			source_location[1],
 			discussion_location[0],
@@ -5924,33 +5956,34 @@ async def on_reward_group_message(message: Message) -> None:
 
 
 	user_id = int(message.from_user.id)
-	now_timestamp = int(app_now().timestamp())
-	previous_user_expire = user_expire_cache.get(user_id)
-	if (
-		previous_user_expire
-		and now_timestamp - previous_user_expire.group_message_timestamp < 60
-	):
-		# print(f"[MESSAGE_REWARD] user {user_id} message too frequent, skip reward -{now_timestamp - previous_user_expire.group_message_timestamp}", flush=True)
-		return
+	async with MESSAGE_REWARD_LOCKS.setdefault(user_id, asyncio.Lock()):
+		now_timestamp = int(app_now().timestamp())
+		previous_user_expire = await user_expire_cache.get(user_id)
+		if (
+			previous_user_expire
+			and now_timestamp - previous_user_expire.group_message_timestamp < 60
+		):
+			# print(f"[MESSAGE_REWARD] user {user_id} message too frequent, skip reward -{now_timestamp - previous_user_expire.group_message_timestamp}", flush=True)
+			return
 
-	base_timestamp = max(
-		now_timestamp,
-		previous_user_expire.expire_timestamp if previous_user_expire else 0,
-	)
-	user_expire = user_expire_cache.extend_minutes(
-		user_id,
-		MESSAGE_REWARD_MINUTES,
-		group_message_timestamp=now_timestamp,
-	)
-	actual_added_minutes = max(
-		0,
-		(user_expire.expire_timestamp - base_timestamp) // 60,
-	)
-	print(
-		f"[MESSAGE_REWARD] user {user_id} granted "
-		f"{actual_added_minutes}/{MESSAGE_REWARD_MINUTES} minutes",
-		flush=True,
-	)
+		base_timestamp = max(
+			now_timestamp,
+			previous_user_expire.expire_timestamp if previous_user_expire else 0,
+		)
+		user_expire = await user_expire_cache.extend_minutes(
+			user_id,
+			MESSAGE_REWARD_MINUTES,
+			group_message_timestamp=now_timestamp,
+		)
+		actual_added_minutes = max(
+			0,
+			(user_expire.expire_timestamp - base_timestamp) // 60,
+		)
+		print(
+			f"[MESSAGE_REWARD] user {user_id} granted "
+			f"{actual_added_minutes}/{MESSAGE_REWARD_MINUTES} minutes",
+			flush=True,
+		)
 
 
 @dp.channel_post(
@@ -6036,7 +6069,7 @@ async def on_x_man_reply(message: Message) -> None:
 async def on_media(message: Message) -> None:
 	if not message.from_user:
 		return
-	if blacklist_store.is_blocked(int(message.from_user.id)):
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		return
 
 	key = (message.chat.id, message.from_user.id)
@@ -6066,7 +6099,7 @@ async def on_media(message: Message) -> None:
 		await message.reply(f"❌ 无法识别媒体: {exc}")
 		return
 
-	if received_media_store.is_accepted(file_unique_id):
+	if await received_media_store.is_accepted(file_unique_id):
 		await _notify_media_limit(message, "此媒体已经收过，本批未计入")
 		return
 
@@ -6208,7 +6241,7 @@ async def on_takeoff_admin_kick_menu(callback: CallbackQuery) -> None:
 	if uploader_id in ADMIN_USER_IDS:
 		await callback.answer("❌ 不能踢出管理员", show_alert=True)
 		return
-	if blacklist_store.is_blocked(uploader_id):
+	if await blacklist_store.is_blocked(uploader_id):
 		await callback.answer("该用户已在黑名单中，不能执行普通踢出", show_alert=True)
 		return
 	action_key = (
@@ -6296,7 +6329,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 	if uploader_id in ADMIN_USER_IDS:
 		await callback.answer("❌ 不能踢出管理员", show_alert=True)
 		return
-	if blacklist_store.is_blocked(uploader_id):
+	if await blacklist_store.is_blocked(uploader_id):
 		await callback.answer("该用户已在黑名单中，不能执行普通踢出", show_alert=True)
 		return
 	if TERMINAL_CHANNEL_ID == 0 or AIRPORT_LOBBY_GROUP_ID == 0:
@@ -6401,7 +6434,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 			return
 
 		try:
-			_delete_inactive_user_data(uploader_id)
+			await _delete_inactive_user_data(uploader_id)
 		except Exception as exc:
 			TAKEOFF_KICK_ACTION_STATE.pop(action_key, None)
 			await callback.message.edit_reply_markup(
@@ -6634,7 +6667,7 @@ def _ceil_div(value: int, divisor: int) -> int:
 	return (value + divisor - 1) // divisor
 
 
-def _get_first_takeoff_batch_id(send_result: dict[str, Any]) -> str | None:
+async def _get_first_takeoff_batch_id(send_result: dict[str, Any]) -> str | None:
 	try:
 		file_unique_ids: list[str] = []
 		for sent_message in send_result.get("sent_media_messages", []):
@@ -6646,7 +6679,7 @@ def _get_first_takeoff_batch_id(send_result: dict[str, Any]) -> str | None:
 					flush=True,
 				)
 
-		batch_ids_by_file = received_media_store.get_batch_ids(file_unique_ids)
+		batch_ids_by_file = await received_media_store.get_batch_ids(file_unique_ids)
 		first_batch_id = next(
 			(
 				batch_id
@@ -6746,7 +6779,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 
 	async with user_lock:
 		now_timestamp = int(app_now().timestamp())
-		user_expire = user_expire_cache.get(reader_user_id)
+		user_expire = await user_expire_cache.get(reader_user_id)
 		send_result = None
 		# print(f"now_timestamp=>{now_timestamp}")
 		# print(f"user_expire=>{user_expire}")
@@ -6794,8 +6827,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			)
 			return
 
-		original_expire_timestamp = user_expire.expire_timestamp
-		if user_expire_cache.consume_minutes(reader_user_id, requested_minutes) is None:
+		if await user_expire_cache.consume_minutes(reader_user_id, requested_minutes) is None:
 			await callback.answer("飞行通行证余额不足，请重新尝试", show_alert=True, cache_time=0)
 			return
 
@@ -6806,42 +6838,48 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				reader_user_id,
 			)
 
-			if not send_result.get("ok", False):
-				user_expire_cache.update(reader_user_id, original_expire_timestamp)
-				reason = send_result.get("reason", "unknown")
-				if reason == "expired":
-					overdue_text = FormatUtils.format_duration(int(send_result.get("overdue_seconds", 0)))
-					answer_text = f"❌ 此 token 已过期\n已过期: {overdue_text}"
-				elif reason == "flash_used":
-					answer_text = "❌ 此闪读密文仅可读取一次"
-				else:
-					answer_text = "❌ 无法解析此 token"
-				await callback.answer(answer_text, show_alert=True, cache_time=0)
-				return
-
 		except Exception as exc:
-			print(f"6794:{exc}",flush=True)
+			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
+			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
+			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
+			return
+
+		if not send_result.get("ok", False):
+			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
+			reason = send_result.get("reason", "unknown")
+			if reason == "expired":
+				overdue_text = FormatUtils.format_duration(int(send_result.get("overdue_seconds", 0)))
+				answer_text = f"❌ 此 token 已过期\n已过期: {overdue_text}"
+			elif reason == "flash_used":
+				answer_text = "❌ 此闪读密文仅可读取一次"
+			else:
+				answer_text = "❌ 无法解析此 token"
+			await callback.answer(answer_text, show_alert=True, cache_time=0)
+			return
+
+		charged_minutes = requested_minutes
 
 		try:
 			
 
 
 
-			batch_id = _get_first_takeoff_batch_id(send_result)
+			batch_id = await _get_first_takeoff_batch_id(send_result)
 
-			skipped_qty = int(send_result.get("skipped_count", 0) or 0)
+			skipped_qty = min(requested_qty, max(0, int(send_result.get("skipped_count", 0) or 0)))
 			delivered_qty = max(0, requested_qty - skipped_qty)
 			delivered_minutes = delivered_qty * MEDIA_VIEW_CONSUMPTION_MINUTES
 			if skipped_qty:
-				user_expire_cache.extend_minutes(
+				await user_expire_cache.refund_minutes(
 					reader_user_id,
 					skipped_qty * MEDIA_VIEW_CONSUMPTION_MINUTES,
 				)
+				charged_minutes -= skipped_qty * MEDIA_VIEW_CONSUMPTION_MINUTES
 
 			requested_human_time = FormatUtils.minutes_to_day_hour(delivered_minutes)[0]
 
 
-			new_user_expire = user_expire_cache.get(reader_user_id)
+			new_user_expire = await user_expire_cache.get(reader_user_id)
 
 			expire_text = FormatUtils.format_timestamp_utc8(new_user_expire.expire_timestamp)
 
@@ -6928,7 +6966,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 
 
 		except Exception as exc:
-			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			await user_expire_cache.refund_minutes(reader_user_id, charged_minutes)
 			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
 			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
 			return
@@ -6951,14 +6989,14 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			try:
 				reward_minutes = requested_qty * MEDIA_REWARD_EXTEND_MINUTES
 				reward_now_timestamp = int(app_now().timestamp())
-				previous_uploader_expire = user_expire_cache.get(uploader_id)
+				previous_uploader_expire = await user_expire_cache.get(uploader_id)
 				reward_base_timestamp = max(
 					reward_now_timestamp,
 					previous_uploader_expire.expire_timestamp
 					if previous_uploader_expire
 					else 0,
 				)
-				updated_uploader = user_expire_cache.extend_minutes(
+				updated_uploader = await user_expire_cache.extend_minutes(
 					uploader_id,
 					reward_minutes,
 				)
@@ -7014,7 +7052,7 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 					f"\n\n🎉 已奖励上传者 {FormatUtils.minutes_to_day_hour(requested_qty * MEDIA_REWARD_EXTEND_MINUTES)[0]} 的飞行通行证期限。"
 				)
 
-			discussion_location = batch_store.get_discussion_location(
+			discussion_location = await batch_store.get_discussion_location(
 				int(chat_id),
 				int(message_id),
 			)
@@ -7174,7 +7212,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				state["encoded"] = encoded
 				await callback.message.edit_text(
 					await _build_display(parsed, encoded),
-					reply_markup=_build_controls_keyboard(state, encoded),
+					reply_markup=await _build_controls_keyboard(state, encoded),
 					parse_mode="HTML",
 				)
 				await callback.answer("✅ 标签已保存")
@@ -7187,7 +7225,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				state["encoded"] = encoded
 				await callback.message.edit_text(
 					await _build_display(parsed, encoded),
-					reply_markup=_build_controls_keyboard(state, encoded),
+					reply_markup=await _build_controls_keyboard(state, encoded),
 					parse_mode="HTML",
 				)
 				await callback.answer("↩️ 已取消标签修改")
@@ -7242,7 +7280,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			state["encoded"] = encoded
 			await callback.message.edit_text(
 				await _build_display(parsed, encoded),
-				reply_markup=_build_controls_keyboard(state, encoded),
+				reply_markup=await _build_controls_keyboard(state, encoded),
 				parse_mode="HTML",
 			)
 			await callback.answer("已返回编辑菜单")
@@ -7284,7 +7322,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				state["send_confirm_pending"] = True
 				try:
 					await callback.message.edit_reply_markup(
-						reply_markup=_build_controls_keyboard(
+						reply_markup=await _build_controls_keyboard(
 							state,
 							str(state.get("encoded", "")),
 						)
@@ -7345,7 +7383,7 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 		state["encoded"] = encoded
 		if str(state.get("send_status", "idle")) != "sending":
 			state["send_status"] = "idle"
-		markup = _build_controls_keyboard(state, encoded)
+		markup = await _build_controls_keyboard(state, encoded)
 		await callback.message.edit_text(await _build_display(parsed, encoded), reply_markup=markup, parse_mode="HTML")
 		await callback.answer("已更新密文")
 	except Exception as exc:
@@ -7493,7 +7531,7 @@ async def on_text(message: Message) -> None:
 						chat_id=state_key[0],
 						message_id=state_key[1],
 						text=await _build_display(parsed, encoded),
-						reply_markup=_build_controls_keyboard(state, encoded),
+						reply_markup=await _build_controls_keyboard(state, encoded),
 						parse_mode="HTML",
 					)
 				except Exception as exc:
@@ -7572,7 +7610,7 @@ async def say_hello_to_x_man(bot_name):
 async def reload_config():
 
 	# 从 table shared_invite_link 取得 key = peach	
-	record = shared_invite_link_store.get("peach")
+	record = await shared_invite_link_store.get("peach")
 
 
 
@@ -7588,140 +7626,90 @@ def _report_backup_bot_exit(task: asyncio.Task) -> None:
 
 async def main() -> None:
 	global bot_name
+	workers: list[asyncio.Task] = []
+	forward_worker = maintenance_worker = hot_worker = None
+	video_bot_task = backup_bot_task = None
 	try:
-		me = await bot.get_me()
-		bot_name = str(getattr(me, "username", "") or "")
-		
-		print(f"🤖 Bot started as @{bot_name}", flush=True)
-	except Exception as exc:
-		print(f"❌ Failed to get bot name: {exc}", flush=True)
-		return
+		await _initialize_database()
+		try:
+			me = await bot.get_me()
+			bot_name = str(getattr(me, "username", "") or "")
 
-	await say_hello_to_x_man(bot_name)
+			print(f"🤖 Bot started as @{bot_name}", flush=True)
+		except Exception as exc:
+			print(f"❌ Failed to get bot name: {exc}", flush=True)
+			return
 
+		await say_hello_to_x_man(bot_name)
 
-	workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
-	forward_worker = asyncio.create_task(_media_forward_worker())
-	maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
-	hot_worker = asyncio.create_task(_daily_hot_worker())
-	video_bot_task: asyncio.Task[None] | None = None
-	
-	video_bot_enabled = str(
-		os.getenv("VIDEO_BOT_ENABLED", "false") or "false"
-	).strip().lower() in {"1", "true", "yes", "on"}
-	if video_bot_enabled:
-		from video_bot import start_video_bot
+		workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
+		forward_worker = asyncio.create_task(_media_forward_worker())
+		maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
+		hot_worker = asyncio.create_task(_daily_hot_worker())
 
-		def update_shuttle_bot_name(username: str) -> None:
-			global SHUTTLE_BOT_NAME
-			SHUTTLE_BOT_NAME = username
+		video_bot_enabled = str(
+			os.getenv("VIDEO_BOT_ENABLED", "false") or "false"
+		).strip().lower() in {"1", "true", "yes", "on"}
+		if video_bot_enabled:
+			from video_bot import start_video_bot
 
-		video_bot_task = asyncio.create_task(
-			start_video_bot(
-				AIRPORT_LOBBY_GROUP_ID,
-				PAID_INVITE_LIFETIME_HOURS,
-				on_ready=update_shuttle_bot_name,
+			def update_shuttle_bot_name(username: str) -> None:
+				global SHUTTLE_BOT_NAME
+				SHUTTLE_BOT_NAME = username
+
+			video_bot_task = asyncio.create_task(
+				start_video_bot(
+					AIRPORT_LOBBY_GROUP_ID,
+					PAID_INVITE_LIFETIME_HOURS,
+					on_ready=update_shuttle_bot_name,
+				)
 			)
-		)
-		def report_video_bot_result(task: asyncio.Task[None]) -> None:
-			if task.cancelled():
-				return
-			exception = task.exception()
-			if exception is not None:
-				print(f"❌[VIDEO_BOT] stopped with error: {exception}", flush=True)
+			def report_video_bot_result(task: asyncio.Task[None]) -> None:
+				if task.cancelled():
+					return
+				exception = task.exception()
+				if exception is not None:
+					print(f"❌[VIDEO_BOT] stopped with error: {exception}", flush=True)
 
-		video_bot_task.add_done_callback(report_video_bot_result)
-	
-	
+			video_bot_task.add_done_callback(report_video_bot_result)
 
-	if BACKUP_BOT_TOKEN:
-		
-		from backup_bot import start_backup_bot
+		if BACKUP_BOT_TOKEN:
 
-		async def update_backup_bot_name(username: str, _backup_bot: Bot) -> None:
-			global BACKUP_BOT_NAME, backup_bot
-			BACKUP_BOT_NAME = username
-			backup_bot = _backup_bot
-			
-			await say_hello_to_x_man(username)
+			from backup_bot import start_backup_bot
 
-		backup_bot_task = asyncio.create_task(
-			start_backup_bot(
-				on_ready=update_backup_bot_name,
-				x_man_bot_id=X_MAN_BOT_ID,
-			),
-			name="backup_bot",
-		)
-		backup_bot_task.add_done_callback(_report_backup_bot_exit)	
-	
-	
-	
-	
+			async def update_backup_bot_name(username: str, _backup_bot: Bot) -> None:
+				global BACKUP_BOT_NAME, backup_bot
+				BACKUP_BOT_NAME = username
+				backup_bot = _backup_bot
 
+				await say_hello_to_x_man(username)
 
-	await reload_config()
-	try:
+			backup_bot_task = asyncio.create_task(
+				start_backup_bot(
+					on_ready=update_backup_bot_name,
+					x_man_bot_id=X_MAN_BOT_ID,
+				),
+				name="backup_bot",
+			)
+			backup_bot_task.add_done_callback(_report_backup_bot_exit)
+
+		await reload_config()
 		await dp.start_polling(bot)
-
-		# groups = (
-		# 	("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
-		# 	("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
-		# 	("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
-		# 	("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
-		# 	*(
-		# 		(f"APRON_CHANNEL_ID[{index}]", chat_id)
-		# 		for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
-		# 	),
-		# )
-
-		# await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
-		# 	bot=bot,
-		# 	bot_name=bot_name,
-		# 	groups=groups,
-		# 	telegram_call=_telegram_call_with_retry,
-		# )
-
-
-		# await bot.set_my_commands(
-		# 	[
-		# 		# BotCommand(command="start", description="开始"),
-		# 		# BotCommand(command="about", description="关于我"),
-		# 		BotCommand(command="me", description="查询飞行通行证"),
-		# 		BotCommand(command="hot", description="查看七天热门资源"),
-		# 		BotCommand(command="donate", description="可用账号乐捐说明"),
-		# 		# BotCommand(command="bonus", description="塔台发放 10 天时限"),
-		# 		BotCommand(command="rule", description="查看飞行通行证规则"),
-		# 		BotCommand(command="airport_access_request", description="请求进入机场或大厅"),
-		# 		BotCommand(command="invite", description="建立单人审核邀请"),
-		# 	],
-		# 	scope=BotCommandScopeAllPrivateChats(),
-		# )
-
 	finally:
-		for worker in workers:
-			worker.cancel()
-		forward_worker.cancel()
-		maintenance_worker.cancel()
-		hot_worker.cancel()
-		if video_bot_task is not None:
-			video_bot_task.cancel()
-		if backup_bot_task is not None:
-			backup_bot_task.cancel()
-		await asyncio.gather(
-			*workers,
-			forward_worker,
-			maintenance_worker,
-			hot_worker,
-			*([video_bot_task] if video_bot_task is not None else []),
-			*([backup_bot_task] if backup_bot_task is not None else []),
-			return_exceptions=True,
-		)
-		blacklist_store.close()
-		batch_store.close()
-		batch_view_store.close()
-		received_media_store.close()
-		shared_invite_link_store.close()
-		user_expire_cache.close()
+		tasks = [*workers, *ENCODED_SEND_TASKS, *(
+			task for task in (
+				forward_worker, maintenance_worker, hot_worker,
+				video_bot_task, backup_bot_task,
+			) if task is not None
+		)]
+		for task in tasks:
+			task.cancel()
+		await asyncio.gather(*tasks, return_exceptions=True)
+		try:
+			if database_stores is not None:
+				await database_stores.close()
+		finally:
+			await bot.session.close()
 
 
 if __name__ == "__main__":

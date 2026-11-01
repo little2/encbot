@@ -137,7 +137,7 @@ KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
 BOT_TOKEN = os.getenv("BOT_TOKEN", SharedConfig.get("my_bot_token", ""))
 
 
-BOT_NAME = ""
+
 
 ADMIN_USER_IDS = ParseUtils.parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
 # 主要用户始终保留访问权限，避免共享配置遗漏时意外将其排除。
@@ -2390,7 +2390,7 @@ async def _forward_encoded_if_whitelisted(
 					download_requests.setdefault(cache_key, preview_file_id)
 
 			downloaded = dict(await asyncio.gather(*[
-				_download_preview(cache_key, file_id)
+				_download_preview(cache_key, {"file_id":file_id})
 				for cache_key, file_id in download_requests.items()
 			])) if download_requests else {}
 
@@ -7588,10 +7588,14 @@ def _report_backup_bot_exit(task: asyncio.Task) -> None:
 
 async def main() -> None:
 	global bot_name
-	me = await bot.get_me()
-	bot_name = str(getattr(me, "username", "") or "")
-	BOT_NAME = bot_name
-	print(f"🤖 Bot started as @{bot_name}", flush=True)
+	try:
+		me = await bot.get_me()
+		bot_name = str(getattr(me, "username", "") or "")
+		
+		print(f"🤖 Bot started as @{bot_name}", flush=True)
+	except Exception as exc:
+		print(f"❌ Failed to get bot name: {exc}", flush=True)
+		return
 
 	await say_hello_to_x_man(bot_name)
 

@@ -6,6 +6,7 @@ from aiogram.types import Message
 
 from utils.blacklist_utils import BlacklistEntry, BlacklistStore
 from utils.user_utils import UserExpireCache
+from utils.async_stores import DatabaseStores
 
 
 class UserManager:
@@ -62,8 +63,7 @@ class UserManager:
 		expires_at: int = 0,
 		target_chats: list[tuple[str, int]] | None = None,
 	) -> tuple[BlacklistEntry, str]:
-		entry = self._blacklist_store.ban(user_id, reason, created_by, expires_at)
-		self._user_expire_cache.remove(user_id)
+		entry = await self._record_ban(user_id, reason, created_by, expires_at)
 		if target_chats is None:
 			target_chats = [
 				("AIRPORT_LOBBY_GROUP_ID", self._lobby_group_id),
@@ -98,6 +98,11 @@ class UserManager:
 				errors.append(f"{chat_name} {chat_id} {str(exc)}")
 
 		return entry, "；\n".join(errors)
+
+	async def _record_ban(self, user_id, reason, created_by, expires_at):
+		entry = self._blacklist_store.ban(user_id, reason, created_by, expires_at)
+		self._user_expire_cache.remove(user_id)
+		return entry
 
 	async def unban_user(self, user_id: int, target_chats: list[tuple[str, int]] | None = None) -> str:
 		errors: list[str] = []
@@ -191,5 +196,21 @@ class UserManager:
 
 	def delete_inactive_user_data(self, user_id: int) -> None:
 		self._user_expire_cache.remove(user_id)
+		for store in self._user_state_stores:
+			store.pop(user_id, None)
+
+
+class AsyncUserManager(UserManager):
+	"""Async stores for Taohua; legacy UserManager callers keep their sync API."""
+
+	def __init__(self, *, stores: DatabaseStores, **kwargs):
+		super().__init__(blacklist_store=stores.blacklist, user_expire_cache=stores.users, **kwargs)
+		self._stores = stores
+
+	async def _record_ban(self, user_id, reason, created_by, expires_at):
+		return await self._stores.ban_user(user_id, reason, created_by, expires_at)
+
+	async def delete_inactive_user_data(self, user_id: int) -> None:
+		await self._user_expire_cache.remove(user_id)
 		for store in self._user_state_stores:
 			store.pop(user_id, None)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -25,6 +26,7 @@ class DatabaseAdminCommands:
         app_now: Callable[..., Any],
         user_expire_cache: Any | None = None,
         blacklist_store: Any | None = None,
+        database_stores: Any | None = None,
     ) -> None:
         self.bot = bot
         self.backup_lock = backup_lock
@@ -35,6 +37,32 @@ class DatabaseAdminCommands:
         self.app_now = app_now
         self.user_expire_cache = user_expire_cache
         self.blacklist_store = blacklist_store
+        self.database_stores = database_stores
+
+    async def _sqlite_available(self, message: Message) -> bool:
+        if self.database_stores is not None and self.database_stores.backend != "sqlite":
+            await message.reply(
+                "当前使用 PostgreSQL，此指令仅支持 SQLite。"
+                "请使用 PostgreSQL 的备份恢复工具或托管平台管理数据库。"
+            )
+            return False
+        return True
+
+    @asynccontextmanager
+    async def _restore_session(self):
+        if self.database_stores is not None:
+            async with self.database_stores.sqlite_restore_session() as restore:
+                yield restore
+        else:
+            # Legacy stores are bound to the event-loop thread. Preserve their
+            # synchronous restore/reload behavior for existing airport callers.
+            async def restore(path):
+                self._restore_sqlite_database(path, self.database_path)
+                if self.user_expire_cache is not None:
+                    self.user_expire_cache._load()
+                if self.blacklist_store is not None:
+                    self.blacklist_store._load()
+            yield restore
 
     @staticmethod
     def _format_file_size(size: int) -> str:
@@ -158,6 +186,8 @@ class DatabaseAdminCommands:
         if not self._is_allowed(message):
             await message.reply("❌ 无效指令")
             return
+        if not await self._sqlite_available(message):
+            return
 
         status_message = await message.reply(
             "🗄️ 已收到数据库备份请求。\n"
@@ -251,6 +281,8 @@ class DatabaseAdminCommands:
         if not self._is_allowed(message):
             await message.reply("❌ 無權限")
             return
+        if not await self._sqlite_available(message):
+            return
 
         status_message = await message.reply(
             "🗄️ 正在備份資料庫；備份成功送出後才會清空媒體資料……"
@@ -312,6 +344,8 @@ class DatabaseAdminCommands:
     async def restore(self, message: Message) -> None:
         if not self._is_allowed(message):
             await message.reply("❌ 无效指令")
+            return
+        if not await self._sqlite_available(message):
             return
 
         replied_message = message.reply_to_message
@@ -438,28 +472,33 @@ class DatabaseAdminCommands:
                         "⏳ 阶段 4/4：正在写入数据库，请勿重复操作……"
                     )
 
-                    try:
-                        self._restore_sqlite_database(uploaded_path, self.database_path)
-                        if self.user_expire_cache is not None:
-                            self.user_expire_cache._load()
-                        if self.blacklist_store is not None:
-                            self.blacklist_store._load()
-                    except Exception as restore_exc:
-                        print(f"[RESTORE] restore failed, rolling back: {restore_exc}", flush=True)
+                    async with self._restore_session() as apply_restore:
+                        rollback_path = current_backup_path
+                        if self.database_stores is not None:
+                            # The uploaded backup predates Telegram network waits.
+                            # Capture any intervening writes under the store lock.
+                            rollback_path = temp_path / "restore-rollback.sqlite3"
+                            await asyncio.to_thread(
+                                self._create_sqlite_backup,
+                                self.database_path,
+                                rollback_path,
+                            )
                         try:
-                            self._restore_sqlite_database(current_backup_path, self.database_path)
-                            if self.user_expire_cache is not None:
-                                self.user_expire_cache._load()
-                            if self.blacklist_store is not None:
-                                self.blacklist_store._load()
-                        except Exception as rollback_exc:
+                            await apply_restore(uploaded_path)
+                        except BaseException as restore_exc:
+                            print(f"[RESTORE] restore failed, rolling back: {restore_exc}", flush=True)
+                            try:
+                                await apply_restore(rollback_path)
+                            except Exception as rollback_exc:
+                                raise RuntimeError(
+                                    f"恢复失败且自动回滚失败：{restore_exc}; "
+                                    f"rollback: {rollback_exc}"
+                                ) from rollback_exc
+                            if isinstance(restore_exc, asyncio.CancelledError):
+                                raise
                             raise RuntimeError(
-                                f"恢复失败且自动回滚失败：{restore_exc}; "
-                                f"rollback: {rollback_exc}"
-                            ) from rollback_exc
-                        raise RuntimeError(
-                            f"恢复失败，已自动还原恢复前数据库：{restore_exc}"
-                        ) from restore_exc
+                                f"恢复失败，已自动还原恢复前数据库：{restore_exc}"
+                            ) from restore_exc
 
                 restored_user_count = table_counts.get("user_expire", 0)
                 restored_media_count = table_counts.get("received_media", 0)
@@ -471,7 +510,7 @@ class DatabaseAdminCommands:
                     f"📦 媒体记录：{restored_media_count}\n"
                     f"🛡️ 恢复前备份已发送给：{self.key_man_id}\n"
                     f"⏱️ 耗时：{elapsed_seconds} 秒\n\n"
-                    "内存缓存已经重新载入，临时文件已自动清理。"
+                    "后续查询将使用恢复后的数据，临时文件已自动清理。"
                 )
             except Exception as exc:
                 print(f"[RESTORE] failed at {restore_stage}: {exc}", flush=True)

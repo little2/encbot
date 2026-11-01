@@ -35,7 +35,7 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
         ):
             await backup_bot.start_backup_bot(on_ready=ready)
         self.assertEqual(bot.get_me.await_count, 2)
-        ready.assert_awaited_once_with("backup_test")
+        ready.assert_awaited_once_with("backup_test", bot)
         dispatcher.start_polling.assert_awaited_once_with(bot, handle_signals=False)
         bot.session.close.assert_awaited_once()
         bot.session.middleware.assert_called_once()
@@ -87,6 +87,8 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
                 get_all=Mock(return_value={}),
             ),
             "OPERATIONAL_NOTIFICATION_TASKS": set(),
+            "_initialize_database": AsyncMock(),
+            "database_stores": SimpleNamespace(close=AsyncMock()),
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
         return namespace
@@ -97,6 +99,7 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
 
         async def backup(**kwargs):
             try:
+                await kwargs["on_ready"]("backup_test", SimpleNamespace())
                 await asyncio.Event().wait()
             finally:
                 stopped.set()
@@ -108,9 +111,8 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(backup_bot, "start_backup_bot", side_effect=backup):
             await namespace["main"]()
         self.assertTrue(stopped.is_set())
-        namespace["SharedConfig"]._download_from_api.assert_called_once_with(
-            {"text": "Bot started"}
-        )
+        namespace["_initialize_database"].assert_awaited_once()
+        namespace["database_stores"].close.assert_awaited_once()
         namespace["bot"].session.close.assert_awaited_once()
         namespace["bkbot"].session.close.assert_awaited_once()
 
@@ -129,7 +131,35 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_main_closes_session_when_initialization_fails(self):
         namespace = self._main_namespace()
         namespace["bot"].get_me.side_effect = RuntimeError("startup failed")
-        with self.assertRaisesRegex(RuntimeError, "startup failed"):
-            await namespace["main"]()
+        await namespace["main"]()
+        namespace["database_stores"].close.assert_awaited_once()
         namespace["bot"].session.close.assert_awaited_once()
         namespace["dp"].start_polling.assert_not_awaited()
+
+    async def test_main_does_not_poll_when_database_initialization_fails(self):
+        namespace = self._main_namespace()
+        namespace["database_stores"] = None
+        namespace["_initialize_database"].side_effect = RuntimeError("database offline")
+        await namespace["main"]()
+        namespace["bot"].get_me.assert_not_awaited()
+        namespace["dp"].start_polling.assert_not_awaited()
+        namespace["bot"].session.close.assert_awaited_once()
+        namespace["bkbot"].session.close.assert_awaited_once()
+
+    async def test_main_cancellation_closes_database(self):
+        namespace = self._main_namespace()
+        namespace["BACKUP_BOT_TOKEN"] = ""
+        namespace["dp"].start_polling.side_effect = asyncio.CancelledError
+        with self.assertRaises(asyncio.CancelledError):
+            await namespace["main"]()
+        namespace["database_stores"].close.assert_awaited_once()
+        namespace["bot"].session.close.assert_awaited_once()
+
+    async def test_database_close_failure_still_closes_bot_sessions(self):
+        namespace = self._main_namespace()
+        namespace["BACKUP_BOT_TOKEN"] = ""
+        namespace["database_stores"].close.side_effect = RuntimeError("close failed")
+        with self.assertRaisesRegex(RuntimeError, "close failed"):
+            await namespace["main"]()
+        namespace["bot"].session.close.assert_awaited_once()
+        namespace["bkbot"].session.close.assert_awaited_once()

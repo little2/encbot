@@ -20,8 +20,9 @@ from utils.format_utils import FormatUtils
 from utils.control_panel import ControlPanel
 from utils.media_text_sender import MediaTextSender, RECOVERY_CAPTION_PREFIX
 from utils.parse_utils import ParseUtils
-from utils.user_manager import UserManager
-from utils.blacklist_utils import BlacklistEntry, BlacklistStore
+from utils.user_manager import AsyncUserManager, UserManager
+from utils.blacklist_utils import BlacklistEntry
+from utils.async_stores import BlacklistStore, DatabaseStores, UserExpireStore, create_stores
 from utils.database_admin import DatabaseAdminCommands
 from utils.peach_exchange_store import (
 	remember_peach_exchange_record,
@@ -78,8 +79,9 @@ ADMIN_USER_IDS.update(ParseUtils.parse_user_ids([KEY_MAN_ID]))
 
 
 
-from utils.user_utils import UserExpireCache, UserExpire
+from utils.user_utils import UserExpire
 TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
+MESSAGE_REWARD_LOCKS: dict[int, asyncio.Lock] = {}
 TAKEOFF_KICK_LOCKS: dict[int, asyncio.Lock] = {}
 TAKEOFF_KICK_ACTION_STATE: dict[tuple[int, int, int], str] = {}
 TAKEOFF_KICK_ORIGINAL_MARKUPS: dict[
@@ -231,9 +233,12 @@ default_user_expire_db_path = (
 user_expire_db_path = Path(
 	os.getenv("USER_EXPIRE_DB_PATH", str(default_user_expire_db_path))
 )
-user_expire_cache = UserExpireCache(db_path=user_expire_db_path)
-blacklist_store = BlacklistStore(db_path=user_expire_db_path)
+database_stores: DatabaseStores | None = None
+user_expire_cache: UserExpireStore
+blacklist_store: BlacklistStore
 
+# Register administrative commands before the catch-all private text handler.
+# Construction does not open a database; the selected stores are bound at startup.
 database_admin_commands = DatabaseAdminCommands(
 	bot=bot,
 	backup_lock=asyncio.Lock(),
@@ -242,31 +247,33 @@ database_admin_commands = DatabaseAdminCommands(
 	admin_user_ids=ADMIN_USER_IDS,
 	telegram_call=_telegram_call_with_retry,
 	app_now=app_now,
-	user_expire_cache=user_expire_cache,
-	blacklist_store=blacklist_store,
 )
 database_admin_commands.register(dp)
 
 
-''''
-用戶管理
-'''
+async def _initialize_database() -> None:
+	global database_stores, user_expire_cache, blacklist_store
+	global user_manager, _ban_user, _unban_user, _delete_inactive_user_data
+	database_stores = await create_stores(sqlite_path=user_expire_db_path)
+	user_expire_cache = database_stores.users
+	blacklist_store = database_stores.blacklist
+	user_manager = AsyncUserManager(
+		stores=database_stores,
+		bot=bot,
+		telegram_call=_telegram_call_with_retry,
+		lobby_group_id=CHAT_SCHOOL_GROUP_ID,
+		terminal_channel_id=CHAT_PUBLIC_GROUP_ID,
+		duty_free_group_id=CHAT_PUBLIC_GROUP_ID,
+		flight_board_channel_id=CHAT_PUBLIC_GROUP_ID,
+		user_state_stores=(),
+	)
+	_ban_user = user_manager.ban_user
+	_unban_user = user_manager.unban_user
+	_delete_inactive_user_data = user_manager.delete_inactive_user_data
+	database_admin_commands.database_stores = database_stores
+	print(f"[DATABASE] backend={database_stores.backend}", flush=True)
 
-user_manager = UserManager(
-	bot=bot,
-	blacklist_store=blacklist_store,
-	user_expire_cache=user_expire_cache,
-	telegram_call=_telegram_call_with_retry,
-	lobby_group_id=CHAT_SCHOOL_GROUP_ID,
-	terminal_channel_id=CHAT_PUBLIC_GROUP_ID,
-	duty_free_group_id=CHAT_PUBLIC_GROUP_ID,
-	flight_board_channel_id=CHAT_PUBLIC_GROUP_ID,
-	user_state_stores=(),
-)
-_ban_user = user_manager.ban_user
-_unban_user = user_manager.unban_user
 
-_delete_inactive_user_data = user_manager.delete_inactive_user_data
 _is_current_chat_member = UserManager.is_current_chat_member
 
 
@@ -455,7 +462,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 		print(f"只接受视频或文件消息", flush=True)
 		return
 
-	if blacklist_store.is_blocked(int(message.from_user.id)):
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		print("黑名单用户 {message.from_user.id}", flush=True)
 		return
 
@@ -622,7 +629,7 @@ async def _pin_intro_post(message_id: int) -> None:
 async def on_intro_text(message: Message, state: FSMContext) -> None:
 	if not message.from_user:
 		return
-	if blacklist_store.is_blocked(int(message.from_user.id)):
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		print("黑名单用户 {message.from_user.id}", flush=True)
 		return
 
@@ -870,7 +877,7 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 	from_user_id = int(message.from_user.id)
 	try:
 		now_timestamp = int(app_now().timestamp())
-		previous_user_expire = user_expire_cache.get(from_user_id)
+		previous_user_expire = await user_expire_cache.get(from_user_id)
 		previous_expire_timestamp = (
 			previous_user_expire.expire_timestamp
 			if previous_user_expire
@@ -889,7 +896,7 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		max_peach_count = MAX_HP_CAPACITY_MINUTES // MEDIA_VIEW_CONSUMPTION_MINUTES
 
 
-		user_expire = user_expire_cache.extend_minutes(
+		user_expire = await user_expire_cache.extend_minutes(
 			from_user_id,
 			requested_minutes,
 		)
@@ -1230,7 +1237,7 @@ async def on_takeoff_admin_kick_reason(callback: CallbackQuery) -> None:
 			return
 
 		try:
-			_delete_inactive_user_data(uploader_id)
+			await _delete_inactive_user_data(uploader_id)
 		except Exception as exc:
 			TAKEOFF_KICK_ACTION_STATE.pop(action_key, None)
 			await callback.message.edit_reply_markup(
@@ -1716,7 +1723,7 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 			return
 		_prune_delivery_records()
 		now_timestamp = int(app_now().timestamp())
-		user_expire = user_expire_cache.get(reader_user_id)
+		user_expire = await user_expire_cache.get(reader_user_id)
 		# print(f"now_timestamp=>{now_timestamp}")
 		# print(f"user_expire=>{user_expire}")
 		if not is_admin:
@@ -1755,15 +1762,15 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 				)
 				return
 
-			original_expire_timestamp = user_expire.expire_timestamp
-			if user_expire_cache.consume_minutes(reader_user_id, requested_minutes) is None:
+			user_expire = await user_expire_cache.consume_minutes(reader_user_id, requested_minutes)
+			if user_expire is None:
 				await callback.answer("桃气值不足，请重新尝试", show_alert=True, cache_time=0)
 				return
 
 
 		#=========================================================================================
 		requested_human_time = FormatUtils.minutes_to_day_hour(requested_minutes)[0]
-		new_user_expire = user_expire_cache.get(reader_user_id)
+		new_user_expire = user_expire or UserExpire(now_timestamp, now_timestamp)
 		expire_text = FormatUtils.format_timestamp_utc8(new_user_expire.expire_timestamp)
 		remaining_minutes = max(
 			0,
@@ -1974,13 +1981,13 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 		except TelegramRetryAfter as exc:
 			# 闸门已重试仍被限流：回滚桃气值并明确提示限流，避免用户立刻重试加剧 flood
 			if not is_admin:
-				user_expire_cache.update(reader_user_id, original_expire_timestamp)
+				await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
 			print(f"[TAKEOFF] media delivery rate limited: {exc}", flush=True)
 			await callback.answer("⚠️ Telegram 限流中，请稍等几秒再试", show_alert=True, cache_time=0)
 			return
 		except Exception as exc:
 			if not is_admin:
-				user_expire_cache.update(reader_user_id, original_expire_timestamp)
+				await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
 			if "Forbidden: bot can't initiate conversation with a user" in str(exc):
 				await callback.answer("🤖 请先和新的桃宝机器人私信对话过一次", show_alert=True, cache_time=0)
 				return
@@ -2048,7 +2055,7 @@ async def on_backup_peach_link(callback: CallbackQuery) -> None:
 			return
 		_prune_delivery_records()
 		now_timestamp = int(app_now().timestamp())
-		user_expire = user_expire_cache.get(reader_user_id)
+		user_expire = await user_expire_cache.get(reader_user_id)
 		# print(f"now_timestamp=>{now_timestamp}")
 		# print(f"user_expire=>{user_expire}")
 		if (
@@ -2084,15 +2091,13 @@ async def on_backup_peach_link(callback: CallbackQuery) -> None:
 			)
 			return
 
-		original_expire_timestamp = user_expire.expire_timestamp
-		if user_expire_cache.consume_minutes(reader_user_id, requested_minutes) is None:
+		new_user_expire = await user_expire_cache.consume_minutes(reader_user_id, requested_minutes)
+		if new_user_expire is None:
 			await callback.answer("桃气值不足，请重新尝试", show_alert=True, cache_time=0)
 			return
 
 		requested_human_time = FormatUtils.minutes_to_day_hour(requested_minutes)[0]
 
-
-		new_user_expire = user_expire_cache.get(reader_user_id)
 
 		expire_text = FormatUtils.format_timestamp_utc8(new_user_expire.expire_timestamp)
 
@@ -2209,12 +2214,12 @@ async def on_backup_peach_link(callback: CallbackQuery) -> None:
 
 		except TelegramRetryAfter as exc:
 			# 闸门已重试仍被限流：回滚桃气值并明确提示限流，避免用户立刻重试加剧 flood
-			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
 			print(f"[TAKEOFF] media delivery rate limited: {exc}", flush=True)
 			await callback.answer("⚠️ Telegram 限流中，请稍等几秒再试", show_alert=True, cache_time=0)
 			return
 		except Exception as exc:
-			user_expire_cache.update(reader_user_id, original_expire_timestamp)
+			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
 			if "Forbidden: bot can't initiate conversation with a user" in str(exc):
 				await callback.answer("🤖 请先和新的桃宝机器人私信对话过一次", show_alert=True, cache_time=0)
 				return
@@ -2271,28 +2276,28 @@ async def on_reward_group_message(message: Message) -> None:
 
 
 	user_id = int(message.from_user.id)
-	now_timestamp = int(app_now().timestamp())
-	previous_user_expire = user_expire_cache.get(user_id)
-	if (
-		previous_user_expire
-		and now_timestamp - previous_user_expire.group_message_timestamp < 60
-	):
-		# print(f"[MESSAGE_REWARD] user {user_id} message too frequent, skip reward -{now_timestamp - previous_user_expire.group_message_timestamp}", flush=True)
-		return
+	async with MESSAGE_REWARD_LOCKS.setdefault(user_id, asyncio.Lock()):
+		now_timestamp = int(app_now().timestamp())
+		previous_user_expire = await user_expire_cache.get(user_id)
+		if (
+			previous_user_expire
+			and now_timestamp - previous_user_expire.group_message_timestamp < 60
+		):
+			return
 
-	base_timestamp = max(
-		now_timestamp,
-		previous_user_expire.expire_timestamp if previous_user_expire else 0,
-	)
-	user_expire = user_expire_cache.extend_minutes(
-		user_id,
-		MESSAGE_REWARD_MINUTES,
-		group_message_timestamp=now_timestamp,
-	)
-	actual_added_minutes = max(
-		0,
-		(user_expire.expire_timestamp - base_timestamp) // 60,
-	)
+		base_timestamp = max(
+			now_timestamp,
+			previous_user_expire.expire_timestamp if previous_user_expire else 0,
+		)
+		user_expire = await user_expire_cache.extend_minutes(
+			user_id,
+			MESSAGE_REWARD_MINUTES,
+			group_message_timestamp=now_timestamp,
+		)
+		actual_added_minutes = max(
+			0,
+			(user_expire.expire_timestamp - base_timestamp) // 60,
+		)
 	# print(
 	# 	f"[MESSAGE_REWARD] user {user_id} granted "
 	# 	f"{actual_added_minutes}/{MESSAGE_REWARD_MINUTES} minutes",
@@ -2308,7 +2313,7 @@ async def on_join_request(join_request: ChatJoinRequest) -> None:
 	print(f"[JOIN_REQUEST] {join_request.from_user.id}", flush=True)
 	try:
 		now_timestamp = int(app_now().timestamp())
-		user_expire = user_expire_cache.get(int(join_request.from_user.id))
+		user_expire = await user_expire_cache.get(int(join_request.from_user.id))
 		if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 
 			text = f"🚧 为避免验证您是同好身份，请入村前先交一份——传送一份资源（文件或视频）给我，确认你我是否志同道同。\n\n📤 传送完成后，再重新申请加入群组。\n\n🍑 确认完成后，方可入村。"
@@ -2337,24 +2342,24 @@ def _inactive_cutoff_timestamp(now_timestamp: int | None = None) -> int:
 	return now_timestamp - INACTIVE_EXPIRE_DAYS * 24 * 60 * 60
 
 
-def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
+async def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
 	user_id = int(user_id)
-	if user_id in ADMIN_USER_IDS or blacklist_store.is_blocked(user_id):
+	if user_id in ADMIN_USER_IDS or await blacklist_store.is_blocked(user_id):
 		return False
 	bot_user_id = int(getattr(bot, "id", 0) or 0)
 	if bot_user_id and user_id == bot_user_id:
 		return False
-	user_expire = user_expire_cache.get(user_id)
+	user_expire = await user_expire_cache.get(user_id)
 	return bool(
 		user_expire
 		and user_expire.expire_timestamp >= _inactive_cutoff_timestamp(now_timestamp)
 	)
 
-def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]:
+async def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserExpire]]:
 	candidates = [
 		(user_id, user_expire)
-		for user_id, user_expire in list(user_expire_cache.users.items())
-		if _is_inactive_candidate(user_id, now_timestamp)
+		for user_id, user_expire in (await user_expire_cache.list_users()).items()
+		if await _is_inactive_candidate(user_id, now_timestamp)
 	]
 	return sorted(
 		candidates,
@@ -2381,12 +2386,12 @@ async def cmd_show_candidate(message: Message, command: CommandObject) -> None:
 	active_candidates = []
 	bot_user_id = int(getattr(bot, "id", 0) or 0)
 	
-	for user_id, user_expire in list(user_expire_cache.users.items()):
+	for user_id, user_expire in (await user_expire_cache.list_users()).items():
 		# 跳过管理员
 		if user_id in ADMIN_USER_IDS:
 			continue
 		# 跳过黑名单用户
-		if blacklist_store.is_blocked(user_id):
+		if await blacklist_store.is_blocked(user_id):
 			continue
 		# 跳过 bot 自己
 		if bot_user_id and user_id == bot_user_id:
@@ -2475,7 +2480,7 @@ async def cmd_inactive_candidate(message: Message, command: CommandObject) -> No
 		return
 
 	now_timestamp = int(app_now().timestamp())
-	candidates = _get_inactive_candidates(now_timestamp)
+	candidates = await _get_inactive_candidates(now_timestamp)
 	if not candidates:
 		await message.reply(
 			f"目前没有通行证过期超过 {INACTIVE_EXPIRE_DAYS} 天的用户"
@@ -2547,7 +2552,7 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 
 async def get_user_status(from_user_id):
 	now_timestamp = int(app_now().timestamp())
-	user_expire = user_expire_cache.get(int(from_user_id))
+	user_expire = await user_expire_cache.get(int(from_user_id))
 	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
 		status_text = (
 			"<blockquote>📊 村民状态</blockquote>\n"
@@ -2576,7 +2581,7 @@ async def cmd_me(message: Message) -> None:
 	if not message.from_user:
 		return
 
-	if blacklist_store.is_blocked(int(message.from_user.id)):
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		print("黑名单用户 {message.from_user.id}", flush=True)
 		return
 
@@ -2588,7 +2593,7 @@ async def cmd_me(message: Message) -> None:
 # 同时监听 /home 和 /rule 命令
 @dp.message(F.chat.type == "private", Command("home"))
 async def cmd_home(message: Message) -> None:
-	if blacklist_store.is_blocked(int(message.from_user.id)):
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		print("黑名单用户 {message.from_user.id}", flush=True)
 		return
 	await message.reply(
@@ -2597,7 +2602,7 @@ async def cmd_home(message: Message) -> None:
 # 同时监听 /home 和 /rule 命令
 @dp.message(F.chat.type == "private", Command("rule"))
 async def cmd_rule(message: Message) -> None:
-	if blacklist_store.is_blocked(int(message.from_user.id)):
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		print("黑名单用户 {message.from_user.id}", flush=True)
 		return
 
@@ -2730,7 +2735,7 @@ async def cmd_unban(message: Message, command: CommandObject) -> None:
 		await message.reply("用法：/unban [用户id]")
 		return
 
-	if not blacklist_store.is_blocked(target_user_id):
+	if not await blacklist_store.is_blocked(target_user_id):
 		await message.reply(f"ℹ️ 用户不在黑名单中：{target_user_id}")
 		return
 	group_unban_error = await _unban_user(target_user_id, target_chats=TARGET_CHATS)
@@ -2738,7 +2743,7 @@ async def cmd_unban(message: Message, command: CommandObject) -> None:
 		await message.reply(f"❌ 群组解除封禁失败：{group_unban_error}")
 		return
 
-	blacklist_store.unban(target_user_id)
+	await blacklist_store.unban(target_user_id)
 	await message.reply(
 		f"✅ 已从黑名单移除并解除群组封禁：{target_user_id}"
 	)
@@ -2756,7 +2761,7 @@ async def cmd_banlist(message: Message, command: CommandObject) -> None:
 		return
 
 	page_size = 10
-	entries, total = blacklist_store.list_page(page, page_size)
+	entries, total = await blacklist_store.list_page(page, page_size)
 	if total == 0:
 		await message.reply("黑名单目前为空")
 		return
@@ -2793,7 +2798,7 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 		return
 
 	now_timestamp = int(app_now().timestamp())
-	user_expire = user_expire_cache.get(target_user_id)
+	user_expire = await user_expire_cache.get(target_user_id)
 	lines = [
 		"👤 用户资料",
 		f"用户 ID：{target_user_id}",
@@ -2831,7 +2836,7 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 			),
 		])
 
-	blacklist_entry = blacklist_store.get(target_user_id)
+	blacklist_entry = await blacklist_store.get(target_user_id)
 	lines.extend(["", "🚫 黑名单"])
 	if blacklist_entry is None:
 		lines.append("状态：✅ 不在黑名单中")
@@ -2857,7 +2862,7 @@ media_text_sender = MediaTextSender()
 async def on_private_text_message(message: Message) -> None:
 	if not message.from_user or message.from_user.is_bot:
 		return
-	if blacklist_store.is_blocked(int(message.from_user.id)):
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		return
 	await fetch_media_from_text(message)
 
@@ -2935,6 +2940,7 @@ async def main() -> None:
 	global bot_name
 	backup_bot_task = None
 	try:
+		await _initialize_database()
 		try:
 			me = await _telegram_call_with_retry(
 				"main bot get_me", bot.get_me, retry_network_errors=True
@@ -2974,7 +2980,7 @@ async def main() -> None:
 			
 			from backup_bot import start_backup_bot
 
-			async def update_backup_bot_name(username: str) -> None:
+			async def update_backup_bot_name(username: str, backup_instance=None) -> None:
 				global BACKUP_BOT_NAME
 				BACKUP_BOT_NAME = username
 				
@@ -3016,9 +3022,13 @@ async def main() -> None:
 				*pending_notifications,
 				return_exceptions=True,
 			)
-		await bot.session.close()
-		if bkbot is not None:
-			await bkbot.session.close()
+		try:
+			if database_stores is not None:
+				await database_stores.close()
+		finally:
+			await bot.session.close()
+			if bkbot is not None:
+				await bkbot.session.close()
 
 
 if __name__ == "__main__":

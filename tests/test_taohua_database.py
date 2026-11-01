@@ -137,6 +137,33 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.reply.await_args.args[0], "❌ 无效指令")
         self.assertIsNone(await self.stores.users.get(456))
 
+    async def test_expire15_sets_exact_deadline_for_self_existing_and_new_users(self):
+        self.namespace.update(UserManager=UserManager, ParseUtils=ParseUtils)
+        load_functions({"cmd_expire15"}, self.namespace)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=99), reply=AsyncMock())
+        await self.stores.users.update(123, NOW + 30 * 24 * 60 * 60,
+                                       group_message_timestamp=NOW - 60)
+        for args, user_id in ((None, 99), ("123", 123), ("456", 456)):
+            with self.subTest(args=args):
+                await self.namespace["cmd_expire15"](message, SimpleNamespace(args=args))
+                user = await self.stores.users.get(user_id)
+                self.assertEqual(user.expire_timestamp, NOW + 15 * 24 * 60 * 60)
+                self.assertIn(f"目标用户：{user_id}", message.reply.await_args.args[0])
+                self.assertIn("有效期限：15 天", message.reply.await_args.args[0])
+        self.assertEqual((await self.stores.users.get(123)).group_message_timestamp, NOW - 60)
+
+    async def test_expire15_rejects_invalid_ids_and_non_admin(self):
+        self.namespace.update(UserManager=UserManager, ParseUtils=ParseUtils)
+        load_functions({"cmd_expire15"}, self.namespace)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=99), reply=AsyncMock())
+        for args in ("abc", "-1", "0", "123 456"):
+            await self.namespace["cmd_expire15"](message, SimpleNamespace(args=args))
+            self.assertEqual(message.reply.await_args.args[0], "用法：/expire15 [用户id]")
+        message.from_user.id = 1
+        await self.namespace["cmd_expire15"](message, SimpleNamespace(args="123"))
+        self.assertEqual(message.reply.await_args.args[0], "❌ 无效指令")
+        self.assertEqual(await self.stores.users.count(), 0)
+
     async def test_me_reads_database_and_blocks_blacklisted_users(self):
         load_functions({"cmd_me", "get_user_status"}, self.namespace)
         message = SimpleNamespace(from_user=SimpleNamespace(id=1), reply=AsyncMock())

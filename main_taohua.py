@@ -2609,6 +2609,7 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"",
 		"/me — 查看当前飞行通行证状态与剩余可请求数量",
 		"/bonus [用户id] — 给指定用户补充桃气值（默认自己，最多补至上限）",
+		"/expire15 [用户id] — 直接设置 15 天桃气时限（默认自己）",
 		"/ban [用户id|回复用户] [原因] — 封禁用户并从群组移除",
 		"/unban [用户id] — 解除封禁",		
 		"/baninfo [用户id] — 查看黑名单资料",
@@ -2665,6 +2666,33 @@ async def cmd_bonus(message: Message, command: CommandObject) -> None:
 		f"本次增加：{actual_added_text}\n"
 		f"预计耗尽：{expire_text}\n"
 		f"🍑 剩余桃气值：{remaining_view_count} / {MAX_HP_CAPACITY_QUANTITY} 点（约 {remaining_text}）"
+	)
+
+
+@dp.message(F.chat.type == "private", Command("expire15"))
+async def cmd_expire15(message: Message, command: CommandObject) -> None:
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		await message.reply("❌ 无效指令")
+		return
+	if not message.from_user:
+		return
+
+	args = str(command.args or "").strip()
+	if not args:
+		target_user_id = int(message.from_user.id)
+	else:
+		target_user_id = ParseUtils._parse_positive_user_id(args)
+		if target_user_id is None:
+			await message.reply("用法：/expire15 [用户id]")
+			return
+
+	expire_timestamp = int(app_now().timestamp()) + 15 * 24 * 60 * 60
+	user_expire = await user_expire_cache.update(target_user_id, expire_timestamp)
+	await message.reply(
+		"✅ 已设置特权桃气时限\n"
+		f"目标用户：{target_user_id}\n"
+		"有效期限：15 天\n"
+		f"预计耗尽：{FormatUtils.format_timestamp_utc8(user_expire.expire_timestamp)}"
 	)
 
 

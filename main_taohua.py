@@ -2608,6 +2608,7 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"🛠️ 管理员命令总览",
 		"",
 		"/me — 查看当前飞行通行证状态与剩余可请求数量",
+		"/bonus [用户id] — 给指定用户补充桃气值（默认自己，最多补至上限）",
 		"/ban [用户id|回复用户] [原因] — 封禁用户并从群组移除",
 		"/unban [用户id] — 解除封禁",		
 		"/baninfo [用户id] — 查看黑名单资料",
@@ -2618,6 +2619,54 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"/admin — 查看管理员命令说明",
 	]
 	await message.reply("\n".join(lines))
+
+
+@dp.message(F.chat.type == "private", Command("bonus"))
+async def cmd_bonus(message: Message, command: CommandObject) -> None:
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		await message.reply("❌ 无效指令")
+		return
+	if not message.from_user:
+		return
+
+	args = str(command.args or "").strip()
+	if not args:
+		target_user_id = int(message.from_user.id)
+	else:
+		target_user_id = ParseUtils._parse_positive_user_id(args)
+		if target_user_id is None:
+			await message.reply("用法：/bonus [用户id]")
+			return
+
+	now_timestamp = int(app_now().timestamp())
+	previous_user_expire = await user_expire_cache.get(target_user_id)
+	base_timestamp = max(
+		now_timestamp,
+		previous_user_expire.expire_timestamp if previous_user_expire else 0,
+	)
+	user_expire = await user_expire_cache.extend_minutes(
+		target_user_id,
+		MAX_HP_CAPACITY_MINUTES,
+		group_message_timestamp=now_timestamp,
+	)
+	actual_added_minutes = max(
+		0, (user_expire.expire_timestamp - base_timestamp) // 60,
+	)
+	remaining_minutes = max(
+		0, (user_expire.expire_timestamp - now_timestamp) // 60,
+	)
+	actual_added_text = FormatUtils.minutes_to_day_hour(actual_added_minutes)[0]
+	remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
+	expire_text = FormatUtils.format_timestamp_utc8(user_expire.expire_timestamp)
+
+	await message.reply(
+		"✅ 已发放桃气奖励\n"
+		f"目标用户：{target_user_id}\n"
+		f"本次增加：{actual_added_text}\n"
+		f"预计耗尽：{expire_text}\n"
+		f"🍑 剩余桃气值：{remaining_view_count} / {MAX_HP_CAPACITY_QUANTITY} 点（约 {remaining_text}）"
+	)
+
 
 async def get_user_status(from_user_id):
 	now_timestamp = int(app_now().timestamp())

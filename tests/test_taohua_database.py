@@ -18,6 +18,8 @@ from utils.format_utils import FormatUtils
 from utils.user_manager import AsyncUserManager, UserManager
 from utils.user_utils import UserExpireCache
 from utils.blacklist_utils import BlacklistStore
+from utils.parse_utils import ParseUtils
+from config import MAX_HP_CAPACITY_MINUTES
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main_taohua.py"
@@ -99,6 +101,41 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         user = await self.stores.users.get(1)
         self.assertEqual(user.expire_timestamp, NOW + 3600)
         self.assertEqual(user.group_message_timestamp, NOW)
+
+    async def test_bonus_fills_peach_capacity_for_self_and_target(self):
+        self.namespace.update(UserManager=UserManager, ParseUtils=ParseUtils,
+                              MAX_HP_CAPACITY_MINUTES=MAX_HP_CAPACITY_MINUTES)
+        load_functions({"cmd_bonus"}, self.namespace)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=99), reply=AsyncMock())
+        for args, user_id in ((None, 99), ("123", 123)):
+            with self.subTest(args=args):
+                await self.stores.users.update(user_id, NOW + 600)
+                await self.namespace["cmd_bonus"](message, SimpleNamespace(args=args))
+                user = await self.stores.users.get(user_id)
+                self.assertEqual(user.expire_timestamp, NOW + MAX_HP_CAPACITY_MINUTES * 60)
+                self.assertEqual(user.group_message_timestamp, NOW)
+                self.assertIn(f"目标用户：{user_id}", message.reply.await_args.args[0])
+                self.assertIn("桃气", message.reply.await_args.args[0])
+                # Repeated rewards cannot exceed the configured capacity.
+                await self.namespace["cmd_bonus"](message, SimpleNamespace(args=args))
+                self.assertEqual((await self.stores.users.get(user_id)).expire_timestamp,
+                                 user.expire_timestamp)
+
+    async def test_bonus_creates_missing_user_and_rejects_invalid_requests(self):
+        self.namespace.update(UserManager=UserManager, ParseUtils=ParseUtils,
+                              MAX_HP_CAPACITY_MINUTES=MAX_HP_CAPACITY_MINUTES)
+        load_functions({"cmd_bonus"}, self.namespace)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=99), reply=AsyncMock())
+        await self.namespace["cmd_bonus"](message, SimpleNamespace(args="123"))
+        self.assertEqual((await self.stores.users.get(123)).expire_timestamp,
+                         NOW + MAX_HP_CAPACITY_MINUTES * 60)
+        for args in ("abc", "-1", "0", "123 456"):
+            await self.namespace["cmd_bonus"](message, SimpleNamespace(args=args))
+            self.assertEqual(message.reply.await_args.args[0], "用法：/bonus [用户id]")
+        message.from_user.id = 1
+        await self.namespace["cmd_bonus"](message, SimpleNamespace(args="456"))
+        self.assertEqual(message.reply.await_args.args[0], "❌ 无效指令")
+        self.assertIsNone(await self.stores.users.get(456))
 
     async def test_me_reads_database_and_blocks_blacklisted_users(self):
         load_functions({"cmd_me", "get_user_status"}, self.namespace)

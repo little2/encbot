@@ -92,6 +92,8 @@ ADMIN_USER_IDS.update(ParseUtils.parse_user_ids([KEY_MAN_ID]))
 from utils.user_utils import UserExpire
 TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
 MESSAGE_REWARD_LOCKS: dict[int, asyncio.Lock] = {}
+JUHUA_JOIN_LOCKS: dict[int, asyncio.Lock] = {}
+JUHUA_JOIN_COST_MINUTES = 24 * 60
 TAKEOFF_KICK_LOCKS: dict[int, asyncio.Lock] = {}
 TAKEOFF_KICK_ACTION_STATE: dict[tuple[int, int, int], str] = {}
 TAKEOFF_KICK_ORIGINAL_MARKUPS: dict[
@@ -675,7 +677,8 @@ async def _pin_intro_post(message_id: int) -> None:
 		print(f"[ENCODED_FORWARD] pin post_item failed: {exc}", flush=True)
 
 
-@dp.message(IntroStates.waiting_intro, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+@dp.message(IntroStates.waiting_intro, F.chat.type == "private", F.text,
+	~F.text.startswith("/"), F.text != "加入菊花台")
 async def on_intro_text(message: Message, state: FSMContext) -> None:
 	global SUBSRCIBE_PREVIEW_CHANNEL_ID, X_MAN_BOT_ID
 	if not message.from_user:
@@ -2376,6 +2379,9 @@ async def on_reward_group_message(message: Message) -> None:
 
 @dp.chat_join_request()
 async def on_join_request(join_request: ChatJoinRequest) -> None:
+	if SUBSRCIBE_PREVIEW_CHANNEL_ID and join_request.chat.id == SUBSRCIBE_PREVIEW_CHANNEL_ID:
+		await _handle_juhua_join_request(join_request)
+		return
 	if join_request.chat.id not in {CHAT_PUBLIC_GROUP_ID, CHAT_SCHOOL_GROUP_ID}:
 		print(f"[JOIN_REQUEST] ignored join request from chat {join_request.chat.id}", flush=True)
 		return
@@ -2404,6 +2410,46 @@ async def on_join_request(join_request: ChatJoinRequest) -> None:
 			
 	except Exception as exc:
 		print(f"[JOIN_REQUEST] failed to approve join request: {exc}", flush=True)
+
+
+async def _handle_juhua_join_request(join_request: ChatJoinRequest) -> None:
+	user_id = int(join_request.from_user.id)
+
+	if await blacklist_store.is_blocked(user_id):
+		# await reject("❌ 无法加入菊花台：你目前在黑名单中。")
+		return
+
+	lock = JUHUA_JOIN_LOCKS.setdefault(user_id, asyncio.Lock())
+	async with lock:
+		async def reject(reason: str) -> None:
+			try:
+				await _telegram_call_with_retry(
+					"juhua join rejection notice",
+					lambda: bot.send_message(chat_id=join_request.user_chat_id, text=reason),
+					chat_id=join_request.user_chat_id,
+				)
+			except Exception as exc:
+				print(f"[JUHUA_JOIN] rejection notice failed for {user_id}: {exc}", flush=True)
+			await join_request.decline()
+
+
+
+		# Ignore duplicate updates once the applicant is already a member.
+		member = await bot.get_chat_member(chat_id=join_request.chat.id, user_id=user_id)
+		if UserManager.is_current_chat_member(member):
+			return
+		user_expire = await user_expire_cache.consume_minutes(user_id, JUHUA_JOIN_COST_MINUTES)
+		if user_expire is None:
+			await reject(
+				"❌ 加入菊花台申请已拒绝：剩余桃气不足 1 天，无法支付入群所需的 1 天桃气。\n"
+				"请先在桃花村发言或分享资源，累积足够桃气后重新申请。"
+			)
+			return
+		try:
+			await join_request.approve()
+		except Exception:
+			await user_expire_cache.refund_minutes(user_id, JUHUA_JOIN_COST_MINUTES)
+			raise
 
 
 def _inactive_cutoff_timestamp(now_timestamp: int | None = None) -> int:
@@ -2620,6 +2666,33 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"/admin — 查看管理员命令说明",
 	]
 	await message.reply("\n".join(lines))
+
+
+@dp.message(F.chat.type == "private", F.text == "加入菊花台")
+@dp.message(F.chat.type == "private", Command("join_juhua"))
+async def cmd_join_juhua(message: Message) -> None:
+	if not message.from_user:
+		return
+	if not SUBSRCIBE_PREVIEW_CHANNEL_ID:
+		await message.reply("菊花台暂未开放，请稍后再试。")
+		return
+	if await blacklist_store.is_blocked(int(message.from_user.id)):
+		# await message.reply("❌ 无法加入菊花台：你目前在黑名单中。")
+		return
+	invite = await bot.create_chat_invite_link(
+		chat_id=SUBSRCIBE_PREVIEW_CHANNEL_ID,
+		name="菊花台入群申请",
+		creates_join_request=True,
+	)
+	await message.reply(
+		"🌼 菊花台\n\n"
+		"欢迎申请加入菊花台，与村民相聚交流。\n\n"
+		"入群需要支付 1 天桃气。点击下方按钮申请后，机器人会检查你的剩余桃气；"
+		"足够时扣除 1 天并通过申请，不足时会告知原因并拒绝申请。",
+		reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+			InlineKeyboardButton(text="确定加入菊花台", url=invite.invite_link),
+		]]),
+	)
 
 
 @dp.message(F.chat.type == "private", Command("bonus"))
@@ -3121,6 +3194,7 @@ async def main() -> None:
 					BotCommand(command="me", description="查询我的信息"),
 					BotCommand(command="rule", description="查看村规"),
 					BotCommand(command="home", description="回村"),
+					BotCommand(command="join_juhua", description="加入菊花台"),
 				],
 				scope=BotCommandScopeAllPrivateChats(),
 			),

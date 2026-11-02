@@ -20,6 +20,7 @@ from utils.user_utils import UserExpireCache
 from utils.blacklist_utils import BlacklistStore
 from utils.parse_utils import ParseUtils
 from config import MAX_HP_CAPACITY_MINUTES
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main_taohua.py"
@@ -163,6 +164,98 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.namespace["cmd_expire15"](message, SimpleNamespace(args="123"))
         self.assertEqual(message.reply.await_args.args[0], "❌ 无效指令")
         self.assertEqual(await self.stores.users.count(), 0)
+
+    def prepare_juhua(self):
+        bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="left")),
+            create_chat_invite_link=AsyncMock(
+                return_value=SimpleNamespace(invite_link="https://t.me/+test")),
+        )
+        self.namespace.update(
+            bot=bot, UserManager=UserManager, JUHUA_JOIN_LOCKS={},
+            SUBSRCIBE_PREVIEW_CHANNEL_ID=-100123, JUHUA_JOIN_COST_MINUTES=1440,
+            _telegram_call_with_retry=self.telegram_call,
+            InlineKeyboardButton=InlineKeyboardButton, InlineKeyboardMarkup=InlineKeyboardMarkup,
+        )
+        load_functions({"cmd_join_juhua", "_handle_juhua_join_request", "on_join_request"},
+                       self.namespace)
+        request = SimpleNamespace(chat=SimpleNamespace(id=-100123),
+                                  from_user=SimpleNamespace(id=1), user_chat_id=567,
+                                  approve=AsyncMock(), decline=AsyncMock())
+        return bot, request
+
+    async def test_juhua_entry_creates_approval_link_without_charging(self):
+        bot, _ = self.prepare_juhua()
+        message = SimpleNamespace(from_user=SimpleNamespace(id=1), reply=AsyncMock())
+        await self.namespace["cmd_join_juhua"](message)
+        bot.create_chat_invite_link.assert_awaited_once_with(
+            chat_id=-100123, name="菊花台入群申请", creates_join_request=True)
+        keyboard = message.reply.await_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][0].text, "确定加入菊花台")
+        self.assertEqual(keyboard.inline_keyboard[0][0].url, "https://t.me/+test")
+        self.assertEqual(await self.stores.users.count(), 0)
+
+    async def test_juhua_join_debits_exactly_one_day_before_approval(self):
+        _, request = self.prepare_juhua()
+        for seconds in (86400, 86400 + 600):
+            with self.subTest(seconds=seconds):
+                await self.stores.users.update(1, NOW + seconds)
+                async def approve():
+                    self.assertEqual((await self.stores.users.get(1)).expire_timestamp,
+                                     NOW + seconds - 86400)
+                request.approve.side_effect = approve
+                await self.namespace["on_join_request"](request)
+        self.assertEqual(request.approve.await_count, 2)
+        request.decline.assert_not_awaited()
+
+    async def test_juhua_insufficient_notice_precedes_decline_even_if_notice_fails(self):
+        bot, request = self.prepare_juhua()
+        await self.stores.users.update(1, NOW + 86399)
+        events = []
+        async def notice(**kwargs):
+            self.assertEqual(kwargs["chat_id"], 567)
+            self.assertIn("不足 1 天", kwargs["text"])
+            events.append("notice")
+            raise RuntimeError("DM unavailable")
+        async def decline():
+            events.append("decline")
+        bot.send_message.side_effect = notice
+        request.decline.side_effect = decline
+        await self.namespace["on_join_request"](request)
+        self.assertEqual(events, ["notice", "decline"])
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 86399)
+        request.approve.assert_not_awaited()
+
+    async def test_juhua_failed_approval_refunds_and_member_is_not_charged(self):
+        bot, request = self.prepare_juhua()
+        await self.stores.users.update(1, NOW + 86400)
+        request.approve.side_effect = RuntimeError("approval failed")
+        with self.assertRaisesRegex(RuntimeError, "approval failed"):
+            await self.namespace["on_join_request"](request)
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 86400)
+        bot.get_chat_member.return_value = SimpleNamespace(status="member")
+        await self.namespace["on_join_request"](request)
+        self.assertEqual(request.approve.await_count, 1)
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 86400)
+
+    async def test_juhua_blacklisted_applicant_is_rejected_without_charge(self):
+        bot, request = self.prepare_juhua()
+        await self.stores.blacklist.ban(1, "blocked", 99)
+        await self.namespace["on_join_request"](request)
+        request.decline.assert_awaited_once()
+        request.approve.assert_not_awaited()
+        bot.get_chat_member.assert_not_awaited()
+
+    async def test_juhua_concurrent_duplicate_requests_only_charge_once(self):
+        bot, request = self.prepare_juhua()
+        await self.stores.users.update(1, NOW + 3 * 86400)
+        async def approve():
+            bot.get_chat_member.return_value = SimpleNamespace(status="member")
+        request.approve.side_effect = approve
+        await asyncio.gather(*(self.namespace["on_join_request"](request) for _ in range(2)))
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 2 * 86400)
+        request.approve.assert_awaited_once()
 
     async def test_me_reads_database_and_blocks_blacklisted_users(self):
         load_functions({"cmd_me", "get_user_status"}, self.namespace)

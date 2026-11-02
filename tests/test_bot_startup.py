@@ -82,6 +82,8 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
             "CHAT_PUBLIC_GROUP_ID": 0,
             "CHAT_SCHOOL_GROUP_ID": 0,
             "SUBSRCIBE_PREVIEW_CHANNEL_ID": 0,
+            "SUBSRCIBE_PREVIEW_GROUP_ID": 0,
+            "_daily_maintenance_worker": AsyncMock(),
             "SharedConfig": SimpleNamespace(
                 _download_from_api=Mock(return_value={}),
                 get_all=Mock(return_value={}),
@@ -118,6 +120,31 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
         namespace["database_stores"].close.assert_awaited_once()
         namespace["bot"].session.close.assert_awaited_once()
         namespace["bkbot"].session.close.assert_awaited_once()
+
+    async def test_main_stops_maintenance_before_closing_database(self):
+        namespace = self._main_namespace()
+        namespace["BACKUP_BOT_TOKEN"] = ""
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def maintenance():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        async def poll(bot):
+            await started.wait()
+
+        async def close_database():
+            self.assertTrue(stopped.is_set())
+
+        namespace["_daily_maintenance_worker"] = maintenance
+        namespace["dp"].start_polling.side_effect = poll
+        namespace["database_stores"].close.side_effect = close_database
+        await namespace["main"]()
+        self.assertTrue(stopped.is_set())
 
     async def test_main_without_backup_still_polls(self):
         namespace = self._main_namespace()

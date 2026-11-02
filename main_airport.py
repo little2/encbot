@@ -5877,40 +5877,41 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 	expires_at = int(app_now().timestamp()) + 24 * 60 * 60
 	reason = f"主动离开{chat_name}，系统自动加入黑名单一天"
 	PENDING_AIRPORT_JOIN_INVITES.pop(target_user_id, None)
-	try:
-		_, group_ban_error = await _ban_user(
-			user_id=target_user_id,
-			reason=reason,
-			created_by=int(bot.id),
-			expires_at=expires_at,
-		)
-	except Exception as exc:
-		print(
-			f"[AUTO_BLACKLIST] failed for user {target_user_id}, "
-			f"chat {update.chat.id}: {exc}",
-			flush=True,
-		)
-		return
+	
+	# try:
+	# 	_, group_ban_error = await _ban_user(
+	# 		user_id=target_user_id,
+	# 		reason=reason,
+	# 		created_by=int(bot.id),
+	# 		expires_at=expires_at,
+	# 	)
+	# except Exception as exc:
+	# 	print(
+	# 		f"[AUTO_BLACKLIST] failed for user {target_user_id}, "
+	# 		f"chat {update.chat.id}: {exc}",
+	# 		flush=True,
+	# 	)
+	# 	return
 
-	print(
-		f"[AUTO_BLACKLIST] user {target_user_id} voluntarily left "
-		f"{chat_name} ({update.chat.id}); ban error: {group_ban_error or 'none'}",
-		flush=True,
-	)
-	try:
-		await bot.send_message(
-			chat_id=target_user_id,
-			text=(
-				"🚫 已列入黑名单一天\n\n"
-				f"系统检测到你主动离开{chat_name}。\n"
-				"24 小时后将自动恢复申请资格。"
-			),
-		)
-	except Exception as exc:
-		print(
-			f"[AUTO_BLACKLIST] notice failed for user {target_user_id}: {exc}",
-			flush=True,
-		)
+	# print(
+	# 	f"[AUTO_BLACKLIST] user {target_user_id} voluntarily left "
+	# 	f"{chat_name} ({update.chat.id}); ban error: {group_ban_error or 'none'}",
+	# 	flush=True,
+	# )
+	# try:
+	# 	await bot.send_message(
+	# 		chat_id=target_user_id,
+	# 		text=(
+	# 			"🚫 已列入黑名单一天\n\n"
+	# 			f"系统检测到你主动离开{chat_name}。\n"
+	# 			"24 小时后将自动恢复申请资格。"
+	# 		),
+	# 	)
+	# except Exception as exc:
+	# 	print(
+	# 		f"[AUTO_BLACKLIST] notice failed for user {target_user_id}: {exc}",
+	# 		flush=True,
+	# 	)
 
 
 def _extract_automatic_forward_source(message: Message) -> tuple[int, int] | None:

@@ -27,6 +27,7 @@ class UserExpireStore(Protocol):
     async def update(self, user_id: int, expire_timestamp: int,
                      group_message_timestamp: int | None = None) -> UserExpire: ...
     async def remove(self, user_id: int) -> None: ...
+    async def remove_if_expired(self, user_id: int, cutoff: int) -> bool: ...
     async def is_valid(self, user_id: int) -> bool: ...
     async def count(self) -> int: ...
     async def list_users(self) -> dict[int, UserExpire]: ...
@@ -204,6 +205,15 @@ class _UserExpireStore:
     async def remove(self, user_id: int) -> None:
         async with self.database.transaction(write=True) as conn:
             await conn.execute("DELETE FROM user_expire WHERE user_id = $1", int(user_id))
+
+    async def remove_if_expired(self, user_id: int, cutoff: int) -> bool:
+        """Delete only if the current deadline still meets the cleanup cutoff."""
+        async with self.database.transaction(write=True) as conn:
+            row = await conn.fetchrow("""
+                DELETE FROM user_expire WHERE user_id = $1 AND expire_timestamp <= $2
+                RETURNING user_id
+            """, int(user_id), int(cutoff))
+            return row is not None
 
     async def is_valid(self, user_id: int) -> bool:
         user = await self.get(user_id)

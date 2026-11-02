@@ -1,6 +1,8 @@
 """Parse media codes and deliver small, paced Telegram albums."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import re
 from functools import partial
 from uuid import uuid4
@@ -19,6 +21,18 @@ ALBUM_BATCH_SIZE = 5
 ALBUM_INTERVAL_SECONDS = 5.0
 RECOVERY_CAPTION_PREFIX = "media-recovery:"
 RECOVERY_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass
+class MediaDelivery:
+    caption: str | None = None
+    parse_mode: str | None = None
+    sent: bool = False
+
+
+@asynccontextmanager
+async def _free_delivery(count):
+    yield MediaDelivery()
 
 
 def media_batches(text: str) -> list[list[tuple[str, str]]]:
@@ -47,7 +61,8 @@ class MediaTextSender:
         self._pending: dict[str, tuple[int, str, asyncio.Future[str]]] = {}
 
     @staticmethod
-    def _operation(bot: Bot, chat_id: int, batch: list[tuple[str, str]]):
+    def _operation(bot: Bot, chat_id: int, batch: list[tuple[str, str]],
+                   caption: str | None = None, parse_mode: str | None = None):
         media_classes = {
             "v": InputMediaVideo,
             "d": InputMediaDocument,
@@ -60,8 +75,14 @@ class MediaTextSender:
                 "d": (bot.send_document, "document"),
                 "p": (bot.send_photo, "photo"),
             }[media_type]
-            return partial(method, chat_id=chat_id, **{parameter: file_id})
+            kwargs = {parameter: file_id}
+            if caption is not None:
+                kwargs.update(caption=caption, parse_mode=parse_mode)
+            return partial(method, chat_id=chat_id, **kwargs)
         media = [media_classes[kind](media=file_id) for kind, file_id in batch]
+        if caption is not None:
+            media[0].caption = caption
+            media[0].parse_mode = parse_mode
         return partial(bot.send_media_group, chat_id=chat_id, media=media)
 
     def accept_recovery(self, message: Message) -> bool:
@@ -124,36 +145,42 @@ class MediaTextSender:
                 changed = True
         return recovered if changed else None
 
-    async def send(self, bot: Bot, chat_id: int, text: str, bkbot: Bot | None = None) -> None:
+    async def send(self, bot: Bot, chat_id: int, text: str, bkbot: Bot | None = None,
+                   *, delivery_context=None) -> None:
+        """Deliver batches; optional context reserves payment and settles on sent."""
         failed_count = 0
         for batch in media_batches(text):
-            operation = self._operation(bot, chat_id, batch)
-            try:
-                await self.gate.call("send parsed media", operation, chat_id=chat_id)
-            except (TelegramNetworkError, TelegramRetryAfter):
-                # An uncertain delivery or exhausted flood wait must not trigger
-                # a second delivery via the backup recovery path.
-                raise
-            except TelegramAPIError as exc:
-                print(f"[MEDIA_TEXT_SEND_FAILED] chat_id={chat_id}: {exc}", flush=True)
-                if bkbot is not None:
-                    recovered = await self._recover_batch(bot, bkbot, batch)
-                    if recovered is not None:
-                        try:
-                            await self.gate.call(
-                                "resend recovered media",
-                                self._operation(bot, chat_id, recovered),
-                                chat_id=chat_id,
-                                max_attempts=1,
-                            )
-                        except TelegramAPIError as retry_exc:
-                            print(
-                                f"[MEDIA_TEXT_RESEND_FAILED] chat_id={chat_id}: {retry_exc}",
-                                flush=True,
-                            )
-                        else:
-                            continue
-                failed_count += len(batch)
+            async with (delivery_context or _free_delivery)(len(batch)) as delivery:
+                operation = self._operation(bot, chat_id, batch, delivery.caption, delivery.parse_mode)
+                try:
+                    await self.gate.call("send parsed media", operation, chat_id=chat_id)
+                except (TelegramNetworkError, TelegramRetryAfter):
+                    # Do not replay deliveries with uncertain network outcomes.
+                    raise
+                except TelegramAPIError as exc:
+                    print(f"[MEDIA_TEXT_SEND_FAILED] chat_id={chat_id}: {exc}", flush=True)
+                    if bkbot is not None:
+                        recovered = await self._recover_batch(bot, bkbot, batch)
+                        if recovered is not None:
+                            try:
+                                await self.gate.call(
+                                    "resend recovered media",
+                                    self._operation(bot, chat_id, recovered,
+                                                    delivery.caption, delivery.parse_mode),
+                                    chat_id=chat_id,
+                                    max_attempts=1,
+                                )
+                            except TelegramAPIError as retry_exc:
+                                print(
+                                    f"[MEDIA_TEXT_RESEND_FAILED] chat_id={chat_id}: {retry_exc}",
+                                    flush=True,
+                                )
+                            else:
+                                delivery.sent = True
+                    if not delivery.sent:
+                        failed_count += len(batch)
+                else:
+                    delivery.sent = True
 
         if failed_count:
             await self.gate.call(

@@ -55,6 +55,19 @@ class StoreContract:
         await users.remove(user_id)
         self.assertIsNone(await users.get(user_id))
 
+    async def test_remove_if_expired_preserves_renewed_users(self):
+        users = self.stores.users
+        cutoff = NOW - 86400
+        await users.update(1, cutoff)
+        self.assertTrue(await users.remove_if_expired(1, cutoff))
+        self.assertFalse(await users.remove_if_expired(1, cutoff))
+        await users.update(2, cutoff + 1)
+        self.assertFalse(await users.remove_if_expired(2, cutoff))
+        await users.update(3, cutoff - 1)
+        await users.update(3, NOW + 600)
+        self.assertFalse(await users.remove_if_expired(3, cutoff))
+        self.assertEqual((await users.get(3)).expire_timestamp, NOW + 600)
+
     async def test_reward_cap_and_existing_over_cap_balance(self):
         users = self.stores.users
         limit = NOW + MAX_HP_CAPACITY_MINUTES * 60

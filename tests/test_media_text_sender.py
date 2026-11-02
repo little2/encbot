@@ -1,5 +1,6 @@
 import ast
 import asyncio
+from contextlib import asynccontextmanager
 import time
 import unittest
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import SendMediaGroup
 from aiogram.types import InputMediaPhoto, Message
 
-from utils.media_text_sender import MediaTextSender, RECOVERY_CAPTION_PREFIX, media_batches
+from utils.media_text_sender import MediaDelivery, MediaTextSender, RECOVERY_CAPTION_PREFIX, media_batches
 from utils.telegram_gate import TelegramGate
 
 
@@ -84,6 +85,55 @@ class MediaTextSenderTests(unittest.IsolatedAsyncioTestCase):
         self.bot.send_document.assert_awaited_once_with(chat_id=42, document="document")
         self.bot.send_photo.assert_awaited_once_with(chat_id=42, photo="photo")
         self.bot.send_media_group.assert_not_awaited()
+
+    async def test_delivery_context_gets_batch_results_and_media_caption(self):
+        outcomes = []
+        @asynccontextmanager
+        async def delivery(count):
+            receipt = MediaDelivery(caption=f"扣除 {count} 点", parse_mode="HTML")
+            try:
+                yield receipt
+            finally:
+                outcomes.append((count, receipt.sent))
+        self.bot.send_document.side_effect = TelegramBadRequest(
+            SendMediaGroup(chat_id=42, media=[]), "wrong file ID")
+        await self.sender.send(self.bot, 42, "p_one v_two d_bad p_last",
+                               delivery_context=delivery)
+        self.assertEqual(outcomes, [(2, True), (1, False), (1, True)])
+        media = self.bot.send_media_group.await_args.kwargs["media"]
+        self.assertEqual(media[0].caption, "扣除 2 点")
+        self.assertEqual(media[0].parse_mode, "HTML")
+        self.assertIsNone(media[1].caption)
+        self.assertEqual(self.bot.send_photo.await_args.kwargs["caption"], "扣除 1 点")
+
+    async def test_recovered_send_keeps_caption_and_commits_once(self):
+        self.relay_backup_updates()
+        outcomes = []
+        @asynccontextmanager
+        async def delivery(count):
+            receipt = MediaDelivery(caption="扣除 1 点", parse_mode="HTML")
+            try:
+                yield receipt
+            finally:
+                outcomes.append(receipt.sent)
+        self.bot.send_photo.side_effect = [
+            TelegramBadRequest(SendMediaGroup(chat_id=42, media=[]), "wrong file ID"), None]
+        await self.sender.send(self.bot, 42, "p_old", self.backup_bot,
+                               delivery_context=delivery)
+        self.assertEqual(outcomes, [True])
+        self.assertEqual(self.bot.send_photo.await_args.kwargs["caption"], "扣除 1 点")
+
+    async def test_cancelled_send_reports_no_success_to_delivery_context(self):
+        receipts = []
+        @asynccontextmanager
+        async def delivery(count):
+            receipt = MediaDelivery()
+            receipts.append(receipt)
+            yield receipt
+        self.bot.send_photo.side_effect = asyncio.CancelledError
+        with self.assertRaises(asyncio.CancelledError):
+            await self.sender.send(self.bot, 42, "p_one", delivery_context=delivery)
+        self.assertFalse(receipts[0].sent)
 
     async def test_bad_album_does_not_stop_later_batch(self):
         method = SendMediaGroup(chat_id=42, media=[

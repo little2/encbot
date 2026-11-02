@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import html
+from contextlib import asynccontextmanager
 from io import BytesIO
 import os
 
@@ -19,9 +20,11 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BufferedIn
 from aiogram.types import ReplyKeyboardRemove
 from aiogram.types import ErrorEvent
 
+from datetime import datetime, time, timedelta
+
 from utils.format_utils import FormatUtils
 from utils.control_panel import ControlPanel
-from utils.media_text_sender import MediaTextSender, RECOVERY_CAPTION_PREFIX
+from utils.media_text_sender import MediaDelivery, MediaTextSender, RECOVERY_CAPTION_PREFIX, media_batches
 from utils.parse_utils import ParseUtils
 from utils.user_manager import AsyncUserManager, UserManager
 from utils.blacklist_utils import BlacklistEntry
@@ -53,10 +56,16 @@ cipher = NumberCipher(
     key=8947499974
 )
 
-
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+	try:
+		value = int(os.getenv(name, str(default)) or default)
+	except (TypeError, ValueError):
+		value = default
+	return min(maximum, max(minimum, value))
 
 
 SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID",0))
+SUBSRCIBE_PREVIEW_GROUP_ID = int(os.getenv("SUBSRCIBE_PREVIEW_GROUP_ID", 0))
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
@@ -64,6 +73,8 @@ KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
 BOT_TOKEN = SharedConfig.get("my_bot_token", "")
 CHAT_ROW = SharedConfig.get("chat","")
 
+DAILY_MAINTENANCE_HOUR = _bounded_env_int("DAILY_MAINTENANCE_HOUR", 4, 0, 23)
+DAILY_MAINTENANCE_MINUTE = _bounded_env_int("DAILY_MAINTENANCE_MINUTE", 0, 0, 59)
 
 
 if CHAT_ROW:
@@ -2734,8 +2745,9 @@ async def cmd_join_juhua(message: Message) -> None:
 	await message.reply(
 		text,
 		reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-			InlineKeyboardButton(text="确定加入菊花台", url=invite.invite_link),
+			InlineKeyboardButton(text="🌼 确定加入菊花台", url=invite.invite_link),
 		]]),
+		parse_mode="HTML",
 	)
 
 
@@ -3131,7 +3143,55 @@ async def on_private_text_message(message: Message) -> None:
 
 
 async def fetch_media_from_text(message: Message) -> None:
-	await media_text_sender.send(bot, message.chat.id, message.text or "", bkbot=bkbot)
+	if not message.from_user:
+		return
+	text = message.text or ""
+	media_count = sum(len(batch) for batch in media_batches(text))
+	if not media_count:
+		return
+	user_id = int(message.from_user.id)
+	user_lock = TAKEOFF_USER_LOCKS.setdefault(user_id, asyncio.Lock())
+	async with user_lock:
+		user = await user_expire_cache.get(user_id)
+		required_minutes = media_count * HOURLY_CONSUMPTION_MINUTES
+		now_timestamp = int(app_now().timestamp())
+		if user is None or user.expire_timestamp - now_timestamp < required_minutes * 60:
+			await message.reply(
+				f"❌ 桃气不足：本次请求 {media_count} 个媒体，需要 {media_count} 点桃气。\n\n"
+				+ await get_user_status(user_id), parse_mode="HTML",
+			)
+			return
+
+		class InsufficientPeach(Exception):
+			pass
+
+		@asynccontextmanager
+		async def delivery_context(count):
+			minutes = count * HOURLY_CONSUMPTION_MINUTES
+			# Reserve atomically against other debit paths; failed deliveries refund.
+			if await user_expire_cache.consume_minutes(user_id, minutes) is None:
+				raise InsufficientPeach()
+			delivery = MediaDelivery()
+			try:
+				delivery.caption = (
+					f"✅ 成功请求 {count} 个媒体，消耗 {count} 点桃气值。\n\n"
+					+ await get_user_status(user_id)
+				)
+				delivery.parse_mode = "HTML"
+				yield delivery
+			finally:
+				if not delivery.sent:
+					await asyncio.shield(user_expire_cache.refund_minutes(user_id, minutes))
+
+		try:
+			await media_text_sender.send(
+				bot, message.chat.id, text, bkbot=bkbot, delivery_context=delivery_context,
+			)
+		except InsufficientPeach:
+			await message.reply(
+				"❌ 剩余桃气不足，已停止后续媒体请求。未发送成功的媒体不会扣款。\n\n"
+				+ await get_user_status(user_id), parse_mode="HTML",
+			)
 
 # 常见良性 BadRequest：重复编辑同一内容、查询过期、消息已不存在等，静默处理即可
 BENIGN_BAD_REQUEST_MARKERS = (
@@ -3199,9 +3259,80 @@ def _report_backup_bot_exit(task: asyncio.Task) -> None:
 		)
 
 
+def _next_daily_maintenance_time(now: datetime) -> datetime:
+	next_run = now.replace(
+		hour=DAILY_MAINTENANCE_HOUR,
+		minute=DAILY_MAINTENANCE_MINUTE,
+		second=0,
+		microsecond=0,
+	)
+	if next_run <= now:
+		next_run += timedelta(days=1)
+	return next_run
+
+
+async def _cleanup_expired_users() -> None:
+	if not SUBSRCIBE_PREVIEW_GROUP_ID:
+		print("[DAILY_MAINTENANCE] SUBSRCIBE_PREVIEW_GROUP_ID 未配置，跳过清理", flush=True)
+		return
+	cutoff = int(app_now().timestamp()) - 24 * 60 * 60
+	users = await user_expire_cache.list_users()
+	deleted = failed = 0
+	for user_id, user in users.items():
+		if user.expire_timestamp > cutoff:
+			continue
+		try:
+			member = await _telegram_call_with_retry(
+				f"lookup expired member {user_id}",
+				lambda: bot.get_chat_member(chat_id=SUBSRCIBE_PREVIEW_GROUP_ID, user_id=user_id),
+			)
+			current = await user_expire_cache.get(user_id)
+			if current is None or current.expire_timestamp > cutoff:
+				continue
+			if UserManager.is_current_chat_member(member):
+				# One call removes the member while allowing them to rejoin.
+				removed = await _telegram_call_with_retry(
+					f"remove expired member {user_id}",
+					lambda: bot.unban_chat_member(
+						chat_id=SUBSRCIBE_PREVIEW_GROUP_ID,
+						user_id=user_id,
+						only_if_banned=False,
+					),
+				)
+				if not removed:
+					raise RuntimeError("Telegram did not confirm member removal")
+			# Leave existing Telegram bans intact; only delete user_expire data.
+			if await user_expire_cache.remove_if_expired(user_id, cutoff):
+				deleted += 1
+		except Exception as exc:
+			failed += 1
+			print(f"[DAILY_MAINTENANCE] user {user_id} cleanup failed: {exc}", flush=True)
+	print(f"[DAILY_MAINTENANCE] expired users deleted={deleted}, failed={failed}", flush=True)
+
+
+async def _daily_maintenance_worker() -> None:
+	while True:
+		now = app_now()
+		next_run = _next_daily_maintenance_time(now)
+		delay_seconds = max(1.0, (next_run - now).total_seconds())
+		print(
+			f"ℹ️ [DAILY_MAINTENANCE] next run at {next_run.isoformat()}",
+			flush=True,
+		)
+		await asyncio.sleep(delay_seconds)
+
+		try:
+			await _cleanup_expired_users()
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			print(f"[DAILY_MAINTENANCE] unexpected failure: {exc}", flush=True)
+
+
 async def main() -> None:
 	global bot_name
 	backup_bot_task = None
+	maintenance_worker = None
 	health_runner: web.AppRunner | None = None
 	try:
 		health_runner, bind_address = await _start_health_server()
@@ -3245,6 +3376,8 @@ async def main() -> None:
 			),
 		)
 
+		maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
+
 		if BACKUP_BOT_TOKEN:
 			
 			from backup_bot import start_backup_bot
@@ -3287,6 +3420,9 @@ async def main() -> None:
 			print("HTTP 健康检查服务已关闭，监听端口已释放。", flush=True)
 
 
+		if maintenance_worker is not None:
+			maintenance_worker.cancel()
+			await asyncio.gather(maintenance_worker, return_exceptions=True)
 		if backup_bot_task is not None:
 			backup_bot_task.cancel()
 			await asyncio.gather(backup_bot_task, return_exceptions=True)

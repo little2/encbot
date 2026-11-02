@@ -21,6 +21,10 @@ from utils.blacklist_utils import BlacklistStore
 from utils.parse_utils import ParseUtils
 from config import MAX_HP_CAPACITY_MINUTES
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.methods import SendMediaGroup
+from utils.media_text_sender import MediaDelivery, MediaTextSender, media_batches
+from utils.telegram_gate import TelegramGate
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main_taohua.py"
@@ -174,7 +178,7 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.namespace.update(
             bot=bot, UserManager=UserManager, JUHUA_JOIN_LOCKS={},
-            SUBSRCIBE_PREVIEW_CHANNEL_ID=-100123, JUHUA_JOIN_COST_MINUTES=1440,
+            SUBSRCIBE_PREVIEW_GROUP_ID=-100123, JUHUA_JOIN_COST_MINUTES=1440,
             _telegram_call_with_retry=self.telegram_call,
             InlineKeyboardButton=InlineKeyboardButton, InlineKeyboardMarkup=InlineKeyboardMarkup,
         )
@@ -215,7 +219,7 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         events = []
         async def notice(**kwargs):
             self.assertEqual(kwargs["chat_id"], 567)
-            self.assertIn("不足 1 天", kwargs["text"])
+            self.assertIn("不足 24 点", kwargs["text"])
             events.append("notice")
             raise RuntimeError("DM unavailable")
         async def decline():
@@ -256,6 +260,176 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*(self.namespace["on_join_request"](request) for _ in range(2)))
         self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 2 * 86400)
         request.approve.assert_awaited_once()
+
+    def prepare_expired_cleanup(self):
+        bot = SimpleNamespace(
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+            unban_chat_member=AsyncMock(return_value=True),
+        )
+        self.namespace.update(bot=bot, UserManager=UserManager,
+                              SUBSRCIBE_PREVIEW_GROUP_ID=-100123,
+                              _telegram_call_with_retry=self.telegram_call)
+        load_functions({"_cleanup_expired_users"}, self.namespace)
+        return bot
+
+    async def test_expired_cleanup_removes_members_without_banning(self):
+        bot = self.prepare_expired_cleanup()
+        for user_id, deadline in ((1, NOW - 86400), (2, NOW - 86401),
+                                  (3, NOW - 86399), (4, NOW + 600)):
+            await self.stores.users.update(user_id, deadline)
+        await self.namespace["_cleanup_expired_users"]()
+        self.assertEqual(set(await self.stores.users.list_users()), {3, 4})
+        self.assertEqual(bot.unban_chat_member.await_count, 2)
+        for call in bot.unban_chat_member.await_args_list:
+            self.assertEqual(call.kwargs["chat_id"], -100123)
+            self.assertFalse(call.kwargs["only_if_banned"])
+        self.assertEqual(await self.stores.blacklist.list_page(), ([], 0))
+
+    async def test_expired_cleanup_preserves_failures_and_continues(self):
+        bot = self.prepare_expired_cleanup()
+        for user_id in (1, 2, 3):
+            await self.stores.users.update(user_id, NOW - 86400)
+        async def status(*, chat_id, user_id):
+            if user_id == 1:
+                raise RuntimeError("lookup failed")
+            return SimpleNamespace(status="member")
+        bot.get_chat_member.side_effect = status
+        bot.unban_chat_member.side_effect = [RuntimeError("remove failed"), True]
+        await self.namespace["_cleanup_expired_users"]()
+        self.assertEqual(set(await self.stores.users.list_users()), {1, 2})
+
+    async def test_expired_cleanup_deletes_nonmembers_without_lifting_bans(self):
+        bot = self.prepare_expired_cleanup()
+        for user_id in (1, 2):
+            await self.stores.users.update(user_id, NOW - 86400)
+        bot.get_chat_member.side_effect = [SimpleNamespace(status="left"),
+                                          SimpleNamespace(status="kicked")]
+        await self.namespace["_cleanup_expired_users"]()
+        self.assertEqual(await self.stores.users.count(), 0)
+        bot.unban_chat_member.assert_not_awaited()
+
+    async def test_expired_cleanup_preserves_renewals_during_lookup_or_removal(self):
+        bot = self.prepare_expired_cleanup()
+        for user_id in (1, 2):
+            await self.stores.users.update(user_id, NOW - 86400)
+        async def status(*, chat_id, user_id):
+            if user_id == 1:
+                await self.stores.users.update(1, NOW + 600)
+            return SimpleNamespace(status="member")
+        async def remove(**kwargs):
+            await self.stores.users.update(kwargs["user_id"], NOW + 600)
+            return True
+        bot.get_chat_member.side_effect = status
+        bot.unban_chat_member.side_effect = remove
+        await self.namespace["_cleanup_expired_users"]()
+        self.assertEqual(set(await self.stores.users.list_users()), {1, 2})
+        bot.unban_chat_member.assert_awaited_once_with(
+            chat_id=-100123, user_id=2, only_if_banned=False)
+
+    async def test_expired_cleanup_skips_when_group_is_unconfigured(self):
+        bot = self.prepare_expired_cleanup()
+        self.namespace["SUBSRCIBE_PREVIEW_GROUP_ID"] = 0
+        await self.stores.users.update(1, NOW - 86400)
+        await self.namespace["_cleanup_expired_users"]()
+        self.assertIsNotNone(await self.stores.users.get(1))
+        bot.get_chat_member.assert_not_awaited()
+
+    def prepare_paid_media(self):
+        bot = SimpleNamespace(**{name: AsyncMock() for name in (
+            "send_video", "send_document", "send_photo", "send_media_group", "send_message")})
+        sender = MediaTextSender()
+        sender.gate = TelegramGate(send_min_interval=0, global_min_interval=0)
+        self.namespace.update(
+            bot=bot, bkbot=None, media_text_sender=sender,
+            HOURLY_CONSUMPTION_MINUTES=60, TAKEOFF_USER_LOCKS={},
+            asynccontextmanager=asynccontextmanager, MediaDelivery=MediaDelivery,
+            media_batches=media_batches,
+        )
+        load_functions({"fetch_media_from_text", "get_user_status"}, self.namespace)
+        return bot, SimpleNamespace(from_user=SimpleNamespace(id=1),
+                                    chat=SimpleNamespace(id=1), text="p_one", reply=AsyncMock())
+
+    async def test_paid_media_checks_full_request_balance_before_sending(self):
+        bot, message = self.prepare_paid_media()
+        for deadline in (None, NOW + 3599, NOW + 3600):
+            if deadline is not None:
+                await self.stores.users.update(1, deadline)
+            message.text = "p_one p_two"
+            await self.namespace["fetch_media_from_text"](message)
+            self.assertIn("桃气不足", message.reply.await_args.args[0])
+            bot.send_media_group.assert_not_awaited()
+            if deadline is not None:
+                self.assertEqual((await self.stores.users.get(1)).expire_timestamp, deadline)
+
+    async def test_paid_media_success_deducts_per_media_and_attaches_status(self):
+        bot, message = self.prepare_paid_media()
+        await self.stores.users.update(1, NOW + 5 * 3600)
+        message.text = "p_one v_two d_three"
+        await self.namespace["fetch_media_from_text"](message)
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 2 * 3600)
+        album = bot.send_media_group.await_args.kwargs["media"]
+        self.assertIn("消耗 2 点", album[0].caption)
+        self.assertIn("桃气值：3 /", album[0].caption)
+        self.assertEqual(album[0].parse_mode, "HTML")
+        caption = bot.send_document.await_args.kwargs["caption"]
+        self.assertIn("消耗 1 点", caption)
+        self.assertIn("桃气值：2 /", caption)
+        message.reply.assert_not_awaited()
+
+    async def test_paid_media_failed_album_refunds_before_later_success(self):
+        bot, message = self.prepare_paid_media()
+        await self.stores.users.update(1, NOW + 4 * 3600)
+        bot.send_media_group.side_effect = TelegramBadRequest(
+            SendMediaGroup(chat_id=1, media=[]), "wrong file ID")
+        message.text = "p_bad p_bad2 d_good"
+        await self.namespace["fetch_media_from_text"](message)
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 3 * 3600)
+        self.assertIn("桃气值：3 /", bot.send_document.await_args.kwargs["caption"])
+
+    async def test_paid_media_failure_or_cancellation_refunds(self):
+        bot, message = self.prepare_paid_media()
+        for error in (TelegramNetworkError(SendMediaGroup(chat_id=1, media=[]), "offline"),
+                      asyncio.CancelledError()):
+            await self.stores.users.update(1, NOW + 3600)
+            bot.send_photo.side_effect = error
+            with self.assertRaises(type(error)):
+                await self.namespace["fetch_media_from_text"](message)
+            self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 3600)
+
+    async def test_paid_media_partial_network_failure_keeps_only_successful_debit(self):
+        bot, message = self.prepare_paid_media()
+        await self.stores.users.update(1, NOW + 3 * 3600)
+        message.text = "p_good d_bad"
+        bot.send_document.side_effect = TelegramNetworkError(
+            SendMediaGroup(chat_id=1, media=[]), "offline")
+        with self.assertRaises(TelegramNetworkError):
+            await self.namespace["fetch_media_from_text"](message)
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 2 * 3600)
+
+    async def test_paid_media_serializes_concurrent_requests_without_overdraft(self):
+        bot, message = self.prepare_paid_media()
+        await self.stores.users.update(1, NOW + 3600)
+        await asyncio.gather(*(self.namespace["fetch_media_from_text"](message) for _ in range(2)))
+        bot.send_photo.assert_awaited_once()
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW)
+        self.assertIn("桃气不足", message.reply.await_args.args[0])
+
+    async def test_paid_media_caption_failure_refunds_before_sending(self):
+        bot, message = self.prepare_paid_media()
+        await self.stores.users.update(1, NOW + 3600)
+        self.namespace["get_user_status"] = AsyncMock(side_effect=RuntimeError("status failed"))
+        with self.assertRaisesRegex(RuntimeError, "status failed"):
+            await self.namespace["fetch_media_from_text"](message)
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 3600)
+        bot.send_photo.assert_not_awaited()
+
+    async def test_paid_media_ignores_text_without_codes(self):
+        bot, message = self.prepare_paid_media()
+        message.text = "普通文字"
+        await self.namespace["fetch_media_from_text"](message)
+        message.reply.assert_not_awaited()
+        self.assertEqual(await self.stores.users.count(), 0)
+        bot.send_photo.assert_not_awaited()
 
     async def test_me_reads_database_and_blocks_blacklisted_users(self):
         load_functions({"cmd_me", "get_user_status"}, self.namespace)

@@ -818,10 +818,21 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 					chat_id=target_id,
 				)
 			except Exception as exc:
-				if target_id == SUBSRCIBE_PREVIEW_CHANNEL_ID:
-					SUBSRCIBE_PREVIEW_CHANNEL_ID = 0 
-				elif target_id == X_MAN_BOT_ID:
-					X_MAN_BOT_ID = 0 
+				thumb_result = await _telegram_call_with_retry(
+					"upload intro thumbnail fallback",
+					lambda: bot.send_photo(
+						chat_id=X_MAN_BOT_ID,
+						photo=BufferedInputFile(
+							buffer.getvalue(),
+							filename="thumbnail.jpg",
+						),
+						caption=thumb_caption,
+						parse_mode="HTML",
+						reply_markup=thumb_reply_markup,
+						protect_content=True,
+					),
+					chat_id=X_MAN_BOT_ID,
+				)
 				
 				print(f"[ENCODED_FORWARD] thumbnail seek failed: {exc}", flush=True)
 			

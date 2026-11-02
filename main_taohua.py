@@ -78,6 +78,7 @@ if CHAT_ROW:
 
 	SUBSRCIBE_PREVIEW = CHAT_ROW.get("subscribe_preview")
 	SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW.get("chat_id", 0)))
+	SUBSRCIBE_PREVIEW_GROUP_ID = int(os.getenv("SUBSRCIBE_PREVIEW_GROUP_ID", SUBSRCIBE_PREVIEW.get("bk_chat_id", 0)))
 
 
 
@@ -680,11 +681,11 @@ async def _pin_intro_post(message_id: int) -> None:
 @dp.message(IntroStates.waiting_intro, F.chat.type == "private", F.text,
 	~F.text.startswith("/"), F.text != "加入菊花台")
 async def on_intro_text(message: Message, state: FSMContext) -> None:
-	global SUBSRCIBE_PREVIEW_CHANNEL_ID, X_MAN_BOT_ID
+	global SUBSRCIBE_PREVIEW_CHANNEL_ID, X_MAN_BOT_ID, SUBSRCIBE_PREVIEW_GROUP_ID
 	if not message.from_user:
 		return
 	if await blacklist_store.is_blocked(int(message.from_user.id)):
-		print("黑名单用户 {message.from_user.id}", flush=True)
+		# print("黑名单用户 {message.from_user.id}", flush=True)
 		return
 
 	text = (message.text or "").strip()
@@ -2390,7 +2391,7 @@ async def on_reward_group_message(message: Message) -> None:
 
 @dp.chat_join_request()
 async def on_join_request(join_request: ChatJoinRequest) -> None:
-	if SUBSRCIBE_PREVIEW_CHANNEL_ID and join_request.chat.id == SUBSRCIBE_PREVIEW_CHANNEL_ID:
+	if SUBSRCIBE_PREVIEW_GROUP_ID and join_request.chat.id == SUBSRCIBE_PREVIEW_GROUP_ID:
 		await _handle_juhua_join_request(join_request)
 		return
 	if join_request.chat.id not in {CHAT_PUBLIC_GROUP_ID, CHAT_SCHOOL_GROUP_ID}:
@@ -2452,7 +2453,7 @@ async def _handle_juhua_join_request(join_request: ChatJoinRequest) -> None:
 		user_expire = await user_expire_cache.consume_minutes(user_id, JUHUA_JOIN_COST_MINUTES)
 		if user_expire is None:
 			await reject(
-				"❌ 加入菊花台申请已拒绝：剩余桃气不足 1 天，无法支付入群所需的 1 天桃气。\n"
+				"❌ 加入菊花台申请已拒绝：剩余桃气不足 24 点，无法支付入群所需的 24 点桃气。\n"
 				"请先在桃花村发言或分享资源，累积足够桃气后重新申请。"
 			)
 			return
@@ -2684,22 +2685,54 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 async def cmd_join_juhua(message: Message) -> None:
 	if not message.from_user:
 		return
-	if not SUBSRCIBE_PREVIEW_CHANNEL_ID:
+	if not SUBSRCIBE_PREVIEW_GROUP_ID:
 		await message.reply("菊花台暂未开放，请稍后再试。")
 		return
 	if await blacklist_store.is_blocked(int(message.from_user.id)):
 		# await message.reply("❌ 无法加入菊花台：你目前在黑名单中。")
 		return
 	invite = await bot.create_chat_invite_link(
-		chat_id=SUBSRCIBE_PREVIEW_CHANNEL_ID,
+		chat_id=SUBSRCIBE_PREVIEW_GROUP_ID,
 		name="菊花台入群申请",
 		creates_join_request=True,
 	)
+
+
+
+
+	text  = '''
+	<blockquote>🌸 桃源深处有高台，正是陶公采菊处</blockquote>
+
+	各位寻幽探秘的老司机、各位挑剔的枪手们——
+
+	全新【预览频道】现已落成登台！
+
+	<blockquote>✨ 登台之后，你能看到什么？</blockquote>
+
+	1️⃣ 代码直提，不再绝版 
+
+	以前老机器人炸号、失联、再也拿不到的心水资源，这里全给你们捞回来了！只需轻轻复制资源代码，再也不用担心炸号即绝版！
+
+	2️⃣ 预览随心，告别盲盒 
+
+	这里陈列的，是过去桃宝里看不到的高清预览、生动切片，身段好不好、可爱不可爱，点开一眼看光！合不合胃口，一秒见分晓～
+
+	<blockquote>🎟 如何登台？</blockquote>
+
+	高台虽好，但从不招待空手而来的闲人：
+	消耗 24点桃气 即可解锁进入 ；只要你账上有桃气，就能在高台上一直逛！
+
+	不过一旦桃气消耗归零，将会被自动移出频道。
+
+	<i>想在台上长留？记得平时在群里多吹水、多投稿，保持桃气充盈，别让自己弹尽粮绝被请下台。</i>
+
+	路已指明，秘境已开。 想闻闻真正的嫩菊清芳，就别在山脚下干瞪眼了～
+	'''
+
+
+
 	await message.reply(
-		"🌼 菊花台\n\n"
-		"欢迎申请加入菊花台，与村民相聚交流。\n\n"
-		"入群需要支付 1 天桃气。点击下方按钮申请后，机器人会检查你的剩余桃气；"
-		"足够时扣除 1 天并通过申请，不足时会告知原因并拒绝申请。",
+		text,
 		reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
 			InlineKeyboardButton(text="确定加入菊花台", url=invite.invite_link),
 		]]),
@@ -3194,6 +3227,7 @@ async def main() -> None:
 				("CHAT_PUBLIC_GROUP_ID", CHAT_PUBLIC_GROUP_ID),
 				("CHAT_SCHOOL_GROUP_ID", CHAT_SCHOOL_GROUP_ID),
 				("SUBSRCIBE_PREVIEW_CHANNEL_ID", SUBSRCIBE_PREVIEW_CHANNEL_ID),
+				("SUBSRCIBE_PREVIEW_GROUP_ID", SUBSRCIBE_PREVIEW_GROUP_ID),
 			),
 			telegram_call=_telegram_call_with_retry,
 		)

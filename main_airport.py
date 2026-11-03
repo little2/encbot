@@ -4118,20 +4118,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 					"飞机场",
 				)
 			)
-			if airport_participant_error:
-				try:
-					await _delete_inactive_user_data(user_id)
-				except Exception as exc:
-					failed_results.append(f"{user_id}：数据库删除失败：{exc}")
-					continue
-				participant_record_deleted_user_ids.append(user_id)
-				removed_user_ids.append(user_id)
-				print(
-					f"[INACTIVE_CLEANUP] deleted user {user_id} data after "
-					f"PARTICIPANT_ID from airport lookup",
-					flush=True,
-				)
-				continue
+			airport_ok = airport_ok or airport_participant_error
 
 			lobby_ok, lobby_result, lobby_participant_error = (
 				await _remove_inactive_user_from_chat(
@@ -4140,22 +4127,10 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 					"航站大厅",
 				)
 			)
-			if lobby_participant_error:
-				try:
-					await _delete_inactive_user_data(user_id)
-				except Exception as exc:
-					failed_results.append(f"{user_id}：数据库删除失败：{exc}")
-					continue
-				participant_record_deleted_user_ids.append(user_id)
-				removed_user_ids.append(user_id)
-				print(
-					f"[INACTIVE_CLEANUP] deleted user {user_id} data after "
-					f"PARTICIPANT_ID from lobby lookup",
-					flush=True,
-				)
-				continue
+			lobby_ok = lobby_ok or lobby_participant_error
 
 			duty_free_ok = True
+			duty_free_participant_error = False
 			duty_free_result = "免税店未配置"
 			if AIRPORT_DUTY_FREE_GROUP_ID != 0:
 				duty_free_ok, duty_free_result, duty_free_participant_error = (
@@ -4165,20 +4140,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 						"免税店",
 					)
 				)
-				if duty_free_participant_error:
-					try:
-						await _delete_inactive_user_data(user_id)
-					except Exception as exc:
-						failed_results.append(f"{user_id}：数据库删除失败：{exc}")
-						continue
-					participant_record_deleted_user_ids.append(user_id)
-					removed_user_ids.append(user_id)
-					print(
-						f"[INACTIVE_CLEANUP] deleted user {user_id} data after "
-						f"PARTICIPANT_ID from duty free lookup",
-						flush=True,
-					)
-					continue
+				duty_free_ok = duty_free_ok or duty_free_participant_error
 
 			if not airport_ok or not lobby_ok or not duty_free_ok:
 				failed_results.append(
@@ -4243,6 +4205,8 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				failed_results.append(f"{user_id}：数据库删除失败：{exc}")
 				continue
 
+			if airport_participant_error or lobby_participant_error or duty_free_participant_error:
+				participant_record_deleted_user_ids.append(user_id)
 			removed_user_ids.append(user_id)
 			print(
 				f"[INACTIVE_CLEANUP] removed user {user_id}: "
@@ -4257,7 +4221,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			f"跳过：{len(skipped_user_ids)} 人",
 			f"失败：{len(failed_results)} 人",
 			f"大厅广播失败：{len(broadcast_failed_results)} 人",
-			f"PARTICIPANT_ID 直接删除资料：{len(participant_record_deleted_user_ids)} 人",
+			f"含 PARTICIPANT_ID 且完成全部群组检查后删除资料：{len(participant_record_deleted_user_ids)} 人",
 		]
 		if removed_user_ids:
 			summary_lines.append(

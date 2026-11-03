@@ -114,6 +114,68 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.stores.blacklist.ban(3, "blocked", 99)
         self.assertEqual([uid for uid, _ in await self.ns["_get_inactive_candidates"](NOW)], [2, 1])
 
+    async def run_cleanup_with_results(self, results, *, duty_free_id=-103, delete_error=None):
+        await self.stores.users.update(1, NOW - 86401)
+        calls = []
+        async def remove(chat_id, user_id, name):
+            calls.append(name)
+            return results[len(calls) - 1]
+        async def delete(user_id):
+            self.assertEqual(len(calls), 3 if duty_free_id else 2)
+            if delete_error:
+                raise delete_error
+            await self.stores.users.remove(user_id)
+        self.ns.update(
+            INACTIVE_EXPIRE_DAYS=1, INACTIVE_CLEANUP_LOCK=asyncio.Lock(), KEY_MAN_ID=0,
+            TERMINAL_CHANNEL_ID=-101, AIRPORT_LOBBY_GROUP_ID=-102,
+            AIRPORT_DUTY_FREE_GROUP_ID=duty_free_id,
+            _remove_inactive_user_from_chat=AsyncMock(side_effect=remove),
+            _delete_inactive_user_data=AsyncMock(side_effect=delete),
+            _telegram_call_with_retry=self.telegram_call,
+        )
+        load_functions({'_execute_inactive_cleanup', '_inactive_cutoff_timestamp',
+                        '_is_inactive_candidate', '_get_inactive_candidates'}, self.ns)
+        message = SimpleNamespace(reply=AsyncMock())
+        await self.ns['_execute_inactive_cleanup'](message)
+        return calls, message.reply.await_args.args[0]
+
+    async def test_cleanup_checks_all_chats_before_deletion_despite_participant_errors(self):
+        for error_index in (None, 0, 1, 2, 'all'):
+            with self.subTest(error_index=error_index):
+                results = [(False, 'PARTICIPANT_ID', True)
+                           if error_index == 'all' or i == error_index else (True, '已移出', False)
+                           for i in range(3)]
+                calls, summary = await self.run_cleanup_with_results(results)
+                self.assertEqual(calls, ['飞机场', '航站大厅', '免税店'])
+                self.ns['_delete_inactive_user_data'].assert_awaited_once_with(1)
+                self.assertIsNone(await self.stores.users.get(1))
+                self.assertIn('成功：1 人', summary)
+
+    async def test_cleanup_keeps_record_if_any_chat_fails_and_still_checks_duty_free(self):
+        for failure_index in range(3):
+            with self.subTest(failure_index=failure_index):
+                results = [(False, '权限不足', False) if i == failure_index
+                           else (False, 'PARTICIPANT_ID', True) for i in range(3)]
+                calls, summary = await self.run_cleanup_with_results(results)
+                self.assertEqual(calls, ['飞机场', '航站大厅', '免税店'])
+                self.ns['_delete_inactive_user_data'].assert_not_awaited()
+                self.assertIsNotNone(await self.stores.users.get(1))
+                self.assertIn('失败：1 人', summary)
+
+    async def test_cleanup_allows_unconfigured_duty_free_after_checking_required_chats(self):
+        calls, _ = await self.run_cleanup_with_results(
+            [(False, 'PARTICIPANT_ID', True), (True, '原本不在群内', False)], duty_free_id=0)
+        self.assertEqual(calls, ['飞机场', '航站大厅'])
+        self.assertIsNone(await self.stores.users.get(1))
+
+    async def test_cleanup_database_failure_retains_record_after_all_chats_checked(self):
+        calls, summary = await self.run_cleanup_with_results(
+            [(False, 'PARTICIPANT_ID', True)] * 3, delete_error=RuntimeError('database offline'))
+        self.assertEqual(calls, ['飞机场', '航站大厅', '免税店'])
+        self.assertIsNotNone(await self.stores.users.get(1))
+        self.assertIn('失败：1 人', summary)
+        self.assertIn('成功：0 人', summary)
+
     async def test_hot_command_reads_current_stores(self):
         await self.stores.batches.upsert_channel_location("batch", -100, 1, "A&B")
         await self.stores.batch_views.record("batch", 1)

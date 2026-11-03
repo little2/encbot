@@ -387,7 +387,7 @@ bot_name = ""
 PERM_FLASH_NONCE_RETENTION_DAYS = 30
 AIRPORT_QUIZ_RETRY_SECONDS = 30 * 60
 AIRPORT_QUIZ_PASS_SECONDS = 30 * 60
-AIRPORT_REGISTRATION_MEMBER_LIMIT = 175	# 机场注册的成员上限
+AIRPORT_REGISTRATION_MEMBER_LIMIT = 75	# 机场注册的成员上限
 PAID_INVITE_COST_MINUTES = 24 * 60
 PAID_INVITE_REWARD_MINUTES = 1 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
@@ -4281,12 +4281,12 @@ async def _send_daily_maintenance_notice(text: str) -> None:
 
 async def _run_scheduled_backup() -> bool:
 	if database_stores is None:
-		await _send_daily_maintenance_notice("⚠️ 数据库尚未初始化，自动备份和清理已暂停。")
+		await _send_daily_maintenance_notice("⚠️ 数据库尚未初始化，自动备份已暂停。")
 		return False
 	postgres = database_stores.backend == "postgresql"
 	if postgres and str(os.getenv("POSTGRES_BACKUP_ENABLED", "false")).strip().lower() not in {"1", "true", "yes", "on"}:
 		await _send_daily_maintenance_notice(
-			"⚠️ PostgreSQL 自动备份及后续不活跃用户清理尚未启用。"
+			"⚠️ PostgreSQL 自动备份尚未启用，不影响定时清理。"
 			"请先完成备份恢复演练，再开启 POSTGRES_BACKUP_ENABLED。"
 		)
 		return False
@@ -4297,7 +4297,7 @@ async def _run_scheduled_backup() -> bool:
 	if not 0 < recipient_id < 2**63:
 		await _send_daily_maintenance_notice(
 			"⚠️ 请设置有效的 KEY_MAN_ID 以接收备份。"
-			"本次自动备份和后续用户清理已取消。"
+			"本次自动备份已取消，定时清理仍会执行。"
 		)
 		return False
 
@@ -4351,7 +4351,7 @@ async def _run_scheduled_backup() -> bool:
 				"❌ 每日自动备份失败\n"
 				f"原因：{detail}\n"
 				f"{local_status}\n"
-				"为保护数据，本次不活跃用户清理已取消。"
+				"定时清理仍会执行。"
 			)
 			return False
 
@@ -4385,10 +4385,18 @@ async def _daily_maintenance_worker() -> None:
 		try:
 			await _send_daily_maintenance_notice(
 				"🕓 每日维护任务开始\n"
-				"执行顺序：数据库备份 → 不活跃用户清理"
+				"执行顺序：尝试数据库备份 → 不活跃用户清理（不受备份结果影响）"
 			)
-			if await _run_scheduled_backup():
-				await _execute_inactive_cleanup()
+			try:
+				await _run_scheduled_backup()
+			except asyncio.CancelledError:
+				raise
+			except Exception as exc:
+				print(f"[DAILY_MAINTENANCE] backup unexpected failure: {type(exc).__name__}", flush=True)
+				await _send_daily_maintenance_notice(
+					f"❌ 每日备份发生未预期错误：{type(exc).__name__}，定时清理仍会执行。"
+				)
+			await _execute_inactive_cleanup()
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:

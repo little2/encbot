@@ -782,7 +782,8 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 				print(f"line:726 :{CHAT_PUBLIC_GROUP_ID}")
 				target_id = message.from_user.id
 
-			
+			# TODO
+			target_id = 6854193623
 
 				
 			# print(f"line:738 :{target_id}")

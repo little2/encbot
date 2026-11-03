@@ -190,7 +190,7 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.ns["_run_scheduled_backup"]())
         notice = self.ns['_send_daily_maintenance_notice'].await_args.args[0]
         self.assertNotIn('secret-connection-details', notice)
-        self.assertIn('清理已取消', notice)
+        self.assertIn('定时清理仍会执行', notice)
         self.assertIn('本地备份已保留', notice)
         self.assertEqual(len(list(self.backup_dir.glob('*.dump'))), 1)
 
@@ -236,18 +236,30 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(path)) as connection:
             self.assertEqual(connection.execute('PRAGMA quick_check').fetchone(), ('ok',))
 
-    async def test_daily_cleanup_runs_only_after_successful_backup(self):
+    async def test_daily_cleanup_runs_regardless_of_backup_result_or_exception(self):
         self.ns.update(_send_daily_maintenance_notice=AsyncMock(), _run_scheduled_backup=AsyncMock(),
                        _execute_inactive_cleanup=AsyncMock(), DAILY_MAINTENANCE_HOUR=4,
                        DAILY_MAINTENANCE_MINUTE=0, timedelta=__import__('datetime').timedelta)
         load_functions({'_daily_maintenance_worker', '_next_daily_maintenance_time'}, self.ns)
-        for success in (False, True):
-            self.ns['_run_scheduled_backup'].return_value = success
+        for outcome in (False, True, RuntimeError('backup failed')):
+            self.ns['_run_scheduled_backup'].side_effect = outcome if isinstance(outcome, Exception) else None
+            self.ns['_run_scheduled_backup'].return_value = outcome
             self.ns['_execute_inactive_cleanup'].reset_mock()
             with patch('asyncio.sleep', new=AsyncMock(side_effect=[None, asyncio.CancelledError()])):
                 with self.assertRaises(asyncio.CancelledError):
                     await self.ns['_daily_maintenance_worker']()
-            self.assertEqual(self.ns['_execute_inactive_cleanup'].await_count, int(success))
+            self.ns['_execute_inactive_cleanup'].assert_awaited_once()
+
+    async def test_daily_cleanup_does_not_run_when_worker_is_cancelled_during_backup(self):
+        self.ns.update(_send_daily_maintenance_notice=AsyncMock(),
+                       _run_scheduled_backup=AsyncMock(side_effect=asyncio.CancelledError()),
+                       _execute_inactive_cleanup=AsyncMock(), DAILY_MAINTENANCE_HOUR=4,
+                       DAILY_MAINTENANCE_MINUTE=0, timedelta=__import__('datetime').timedelta)
+        load_functions({'_daily_maintenance_worker', '_next_daily_maintenance_time'}, self.ns)
+        with patch('asyncio.sleep', new=AsyncMock()):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.ns['_daily_maintenance_worker']()
+        self.ns['_execute_inactive_cleanup'].assert_not_awaited()
 
     async def prepare_takeoff(self, *, quantity=2):
         await self.stores.users.update(1, NOW + 36000, group_message_timestamp=NOW)

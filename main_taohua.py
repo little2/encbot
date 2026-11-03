@@ -20,7 +20,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BufferedIn
 from aiogram.types import ReplyKeyboardRemove
 from aiogram.types import ErrorEvent
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 
 from utils.format_utils import FormatUtils
 from utils.control_panel import ControlPanel

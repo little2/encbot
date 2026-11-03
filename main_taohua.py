@@ -2424,7 +2424,7 @@ async def on_join_request(join_request: ChatJoinRequest) -> None:
 				)
 			except Exception as exc:
 				# DM 失败（含限流）不阻断拒绝流程，避免申请悬挂
-				print(f"[JOIN_REQUEST] dm failed for {join_request.from_user.id}: {exc}", flush=True)
+				print(f"[JOIN_REQUEST] dm failed for user_id:{join_request.from_user.id}: {exc}", flush=True)
 			await join_request.decline()
 
 			return
@@ -3241,7 +3241,16 @@ async def on_telegram_error(event: ErrorEvent) -> None:
 			flush=True,
 		)
 	else:
-		print(f"[TG_UPDATE_ERROR] {type(exception).__name__}: {exception}", flush=True)
+		method = getattr(exception, "method", None)
+		print(
+			f"[TG_UPDATE_ERROR] bot=@{bot_name} "
+			f"method={type(method).__name__} "
+			f"chat_id={getattr(method, 'chat_id', None)}: {exception}; ",
+			flush=True,
+		)
+
+
+		
 	if callback is not None:
 		try:
 			await callback.answer("❌ 操作失败，请稍后重试", show_alert=True, cache_time=0)

@@ -1657,6 +1657,20 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 	finally:
 		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 
+
+	## TODO
+	try:
+		# print("发送至 X-Man 机器人",flush=True)
+		await _send_media_forward_to_destination(
+			task,
+			"BKMAN",
+			8473892643,
+		)
+	finally:
+		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
+
+	
+
 	''' 
 	TODO: 关掉备份
 	'''

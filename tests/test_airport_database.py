@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from utils.airport_async_stores import create_airport_stores
 from utils.postgres_backup import get_backup_directory
 from utils.database_admin import DatabaseAdminCommands
@@ -372,6 +372,19 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AirportConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    def test_keyboard_omits_only_tower_button_when_username_is_missing(self):
+        ns = load_functions({'_build_keyboard'}, dict(
+            bot_name=' @airport_test ', InlineKeyboardButton=InlineKeyboardButton,
+            InlineKeyboardMarkup=InlineKeyboardMarkup))
+        self.assertEqual(ns['_build_keyboard']().inline_keyboard[0][1].url,
+                         'https://t.me/airport_test')
+        for invalid in ('', None, ' @ '):
+            ns['bot_name'] = invalid
+            buttons = ns['_build_keyboard']().inline_keyboard[0]
+            self.assertEqual([button.callback_data for button in buttons],
+                             ['takeoff:ban', 'takeoff:fly'])
+            self.assertTrue(all(button.url is None for button in buttons))
+
     async def test_generic_database_settings_are_passed_to_factory(self):
         factory = AsyncMock(side_effect=RuntimeError("factory reached"))
         ns = load_functions({"_initialize_database"}, dict(
@@ -436,6 +449,17 @@ class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await ns["main"]()
         ns["database_stores"].close.assert_awaited_once()
         ns["bot"].session.close.assert_awaited_once()
+
+    async def test_missing_telegram_username_stops_before_workers_and_polling(self):
+        for username in (None, '', '   '):
+            with self.subTest(username=username):
+                ns = self.namespace()
+                ns['bot'].get_me.return_value = SimpleNamespace(username=username)
+                await ns['main']()
+                ns['say_hello_to_x_man'].assert_not_awaited()
+                ns['dp'].start_polling.assert_not_awaited()
+                ns['database_stores'].close.assert_awaited_once()
+                ns['bot'].session.close.assert_awaited_once()
 
     async def test_polling_exit_stops_background_writes_before_closing_database(self):
         ns = self.namespace()

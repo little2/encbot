@@ -885,18 +885,21 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 	return return_text
 
 def _build_keyboard() -> InlineKeyboardMarkup:
-	return InlineKeyboardMarkup(
-		inline_keyboard=[[
+	tower_bot_name = str(bot_name or "").strip().lstrip("@")
+	buttons = [
+		InlineKeyboardButton(text="🈲 立即停飞", callback_data="takeoff:ban"),
+	]
+	if tower_bot_name:
+		buttons.append(
 			InlineKeyboardButton(
-				text="🈲 立即停飞",
-				callback_data=f"takeoff:ban",
-			),
-			InlineKeyboardButton(
-				text="🛫 请求起飞",
-				callback_data=f"takeoff:fly",
+				text="🗼 塔台",
+				url=f"https://t.me/{tower_bot_name}",
 			)
-		]]
+		)
+	buttons.append(
+		InlineKeyboardButton(text="🛫 请求起飞", callback_data="takeoff:fly"),
 	)
+	return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 def _takeoff_count_from_keyboard(markup: InlineKeyboardMarkup) -> int:
@@ -7650,7 +7653,9 @@ async def main() -> None:
 		await _initialize_database()
 		try:
 			me = await bot.get_me()
-			bot_name = str(getattr(me, "username", "") or "")
+			bot_name = str(getattr(me, "username", "") or "").strip().lstrip("@")
+			if not bot_name:
+				raise RuntimeError("Telegram get_me 未返回机器人用户名，停止启动")
 
 			print(f"🤖 Bot started as @{bot_name}", flush=True)
 		except Exception as exc:

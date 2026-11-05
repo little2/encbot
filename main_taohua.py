@@ -1859,7 +1859,7 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 				return
 
 
-			if act_type == "preview" or act_type == "buy":	
+			if act_type == "peach" or act_type == "buy":	
 				user_expire = await user_expire_cache.consume_minutes(reader_user_id, requested_minutes)
 				if user_expire is None:
 					await callback.answer("桃气值不足，请重新尝试", show_alert=True, cache_time=0)

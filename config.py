@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 from dotenv import load_dotenv
 load_dotenv(
     dotenv_path=Path(__file__).resolve().parent / ".env",
@@ -9,10 +10,10 @@ PHOTO_UPLOAD_EXTEND_MINUTES = 60
 VIDEO_UPLOAD_EXTEND_MINUTES = 360
 OTHERS_UPLOAD_EXTEND_MINUTES = 360
 
-INACTIVE_EXPIRE_DAYS = 1  # 通行证过期超过此天数后，可由管理员清理
+INACTIVE_EXPIRE_DAYS = int(os.getenv("INACTIVE_EXPIRE_DAYS", 5))  # 通行证过期超过此天数后，可由管理员清理
 MEDIA_REWARD_EXTEND_MINUTES = 60  # 每个媒体奖励增加的分钟数
 
-HOURLY_CONSUMPTION_MINUTES = 60
+HOURLY_CONSUMPTION_MINUTES = int(os.getenv("HOURLY_CONSUMPTION_MINUTES", 60))
 MESSAGE_REWARD_MINUTES = 60
 MEDIA_UPLOAD_EXTEND_MINUTES = 360   #每个媒体增加六小时(360min)
 MEDIA_VIEW_CONSUMPTION_MINUTES = 60

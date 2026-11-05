@@ -988,8 +988,8 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 			requested_minutes = MEDIA_UPLOAD_EXTEND_MINUTES
 			action_notify_text = "🌿 灵韵馈赠成功"
 		
-		peach_count = requested_minutes // MEDIA_VIEW_CONSUMPTION_MINUTES
-		max_peach_count = MAX_HP_CAPACITY_MINUTES // MEDIA_VIEW_CONSUMPTION_MINUTES
+		peach_count = MEDIA_UPLOAD_EXTEND_QUANTITY
+		max_peach_count = MAX_HP_CAPACITY_QUANTITY
 
 
 		user_expire = await user_expire_cache.extend_minutes(

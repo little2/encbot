@@ -912,8 +912,8 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 				reply_markup=InlineKeyboardMarkup(
 					inline_keyboard=[[
 						InlineKeyboardButton(text="👍", callback_data="alert:like"),
-						InlineKeyboardButton(text="🍑", callback_data="peach:link"),
-						# InlineKeyboardButton(text="👀", callback_data="preview:link"),
+						# InlineKeyboardButton(text="🍑", callback_data="peach:link"),
+						InlineKeyboardButton(text="👀", callback_data="preview:link"),
 						InlineKeyboardButton(text="👎", callback_data="alert:dislike")
 						]]
 				),

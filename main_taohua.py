@@ -2841,7 +2841,7 @@ async def get_user_status(from_user_id):
 
 	remaining_seconds = user_expire.expire_timestamp - now_timestamp
 	remaining_minutes = remaining_seconds // 60
-	available_view_count = remaining_minutes // MEDIA_VIEW_CONSUMPTION_MINUTES
+	available_view_count = remaining_minutes // HOURLY_CONSUMPTION_MINUTES
 	expire_text = FormatUtils.format_timestamp_utc8(user_expire.expire_timestamp)
 	hp_bar = FormatUtils.hp_bar(available_view_count, MAX_HP_CAPACITY_QUANTITY)
 	status_text = (

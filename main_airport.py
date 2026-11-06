@@ -393,6 +393,7 @@ PAID_INVITE_REWARD_MINUTES = 1 * 24 * 60
 PAID_INVITE_LIFETIME_HOURS = 24
 PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
 INACTIVE_CANDIDATE_PAGE_SIZE = 20
+LOW_UPLOAD_CLEANUP_LIMIT = 15
 TAKEOFF_KICK_REASONS = {
 	"mixed": "同批不同系列，单品需独立上传，不同系列(弟弟)的不要混在一批上传",
 	"not_shota": "非正太资源，例如萝莉、男同、清水图等，机场不收。",
@@ -3344,6 +3345,7 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"/banlist [页码] — 查看黑名单列表",
 		"/inactive_candidate [页码] — 查看不活跃候选用户",
 		"/inactive_cleanup — 清理长期不活跃用户",
+		"/low_upload_cleanup — 移除上传批次少于 30 且通行证仍有效或过期不超过一天的用户",
 		"/backup — 将 SQLite 数据库备份发送给指定管理员",
 		"/clear_media — 备份数据库后清空 received_media 与 batch",
 		"/restore — 回复 SQLite 备份文件以恢复数据库",
@@ -3657,6 +3659,7 @@ async def cmd_userinfo(message: Message, command: CommandObject) -> None:
 	lines = [
 		"👤 用户资料",
 		f"用户 ID：{target_user_id}",
+		f"📤 上传批次数：{await batch_store.count_by_uploader(target_user_id)}",
 		"",
 		"🎫 飞行通行证",
 	]
@@ -3971,6 +3974,28 @@ async def _get_inactive_candidates(now_timestamp: int) -> list[tuple[int, UserEx
 	)
 
 
+async def _get_low_upload_candidates(
+	now_timestamp: int,
+) -> list[tuple[int, UserExpire, int]]:
+	expiry_cutoff = now_timestamp - 24 * 60 * 60
+	bot_user_id = int(getattr(bot, "id", 0) or 0)
+	candidates = []
+	for user_id, user_expire in (await user_expire_cache.list_users()).items():
+		if user_expire.expire_timestamp < expiry_cutoff:
+			continue
+		if user_id in ADMIN_USER_IDS or user_id == bot_user_id:
+			continue
+		if await blacklist_store.is_blocked(user_id):
+			continue
+		upload_count = await batch_store.count_by_uploader(user_id)
+		if upload_count < LOW_UPLOAD_CLEANUP_LIMIT:
+			candidates.append((user_id, user_expire, upload_count))
+	return sorted(
+		candidates,
+		key=lambda item: (item[1].expire_timestamp, item[0]),
+	)
+
+
 def _chat_member_status_text(status: Any) -> str:
 	status_name = str(getattr(status, "status", "unknown"))
 	return {
@@ -4008,6 +4033,7 @@ async def cmd_inactive_candidate(message: Message, command: CommandObject) -> No
 		await message.reply("用法：/inactive_candidate [页码]")
 		return
 
+	print(f"开始执行不活跃候选名单查询",flush=True)
 	now_timestamp = int(app_now().timestamp())
 	candidates = await _get_inactive_candidates(now_timestamp)
 	if not candidates:
@@ -4054,6 +4080,121 @@ async def cmd_inactive_cleanup(message: Message) -> None:
 	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
 		return
 	await _execute_inactive_cleanup(message)
+
+
+@dp.message(Command("low_upload_cleanup"))
+async def cmd_low_upload_cleanup(message: Message) -> None:
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		return
+	await _execute_low_upload_cleanup(message)
+
+
+async def _execute_low_upload_cleanup(message: Message) -> bool:
+	if INACTIVE_CLEANUP_LOCK.locked():
+		await message.reply("⏳ 用户清理正在执行，本次任务不重复执行")
+		return False
+	if TERMINAL_CHANNEL_ID == 0 or AIRPORT_LOBBY_GROUP_ID == 0:
+		await message.reply("❌ 飞机场或航站大厅尚未配置，无法执行清理")
+		return False
+
+	async with INACTIVE_CLEANUP_LOCK:
+		now_timestamp = int(app_now().timestamp())
+		print(f"[LOW_UPLOAD_CLEANUP] start at {now_timestamp}")
+		candidates = await _get_low_upload_candidates(now_timestamp)
+		if not candidates:
+			await message.reply(
+				f"目前没有通行证仍有效或过期不超过一天、且上传批次数少于 "
+				f"{LOW_UPLOAD_CLEANUP_LIMIT} 的用户"
+			)
+			return True
+
+		results = []
+		for user_id, _, upload_count in candidates:
+			check_timestamp = int(app_now().timestamp())
+			user_expire = await user_expire_cache.get(user_id)
+			if (
+				user_id in ADMIN_USER_IDS
+				or user_id == int(getattr(bot, "id", 0) or 0)
+				or await blacklist_store.is_blocked(user_id)
+				or user_expire is None
+				or user_expire.expire_timestamp < check_timestamp - 24 * 60 * 60
+			):
+				results.append((user_id, upload_count, "跳过（资格已变化）"))
+				continue
+
+			upload_count = await batch_store.count_by_uploader(user_id)
+			if upload_count >= LOW_UPLOAD_CLEANUP_LIMIT:
+				print(f"[LOW_UPLOAD_CLEANUP] user {user_id} upload_count={upload_count} >= LOW_UPLOAD_CLEANUP_LIMIT")
+				results.append((user_id, upload_count, "跳过（上传次数已达标）"))
+				continue
+
+			chat_results = []
+			chat_checks = [
+				(TERMINAL_CHANNEL_ID, "飞机场"),
+				(AIRPORT_LOBBY_GROUP_ID, "航站大厅"),
+			]
+			if AIRPORT_DUTY_FREE_GROUP_ID != 0:
+				chat_checks.append((AIRPORT_DUTY_FREE_GROUP_ID, "免税店"))
+
+			for chat_id, chat_name in chat_checks:
+				ok, result, participant_error = await _remove_inactive_user_from_chat(
+					chat_id,
+					user_id,
+					chat_name,
+				)
+				chat_results.append((ok or participant_error, result))
+
+			if not all(ok for ok, _ in chat_results):
+				results.append((
+					user_id,
+					upload_count,
+					"失败（" + "；".join(result for _, result in chat_results) + "）",
+				))
+				continue
+
+			try:
+				await _delete_inactive_user_data(user_id)
+			except Exception as exc:
+				results.append((user_id, upload_count, f"失败（资料删除：{exc}）"))
+				continue
+
+			results.append((user_id, upload_count, "已移除"))
+			print(
+				f"[LOW_UPLOAD_CLEANUP] removed user {user_id} "
+				f"(batch_count={upload_count})",
+				flush=True,
+			)
+
+		report_lines = [
+			"🧹 低上传用户清理完成",
+			"条件：通行证仍有效或过期不超过一天，上传批次数少于 "
+			f"{LOW_UPLOAD_CLEANUP_LIMIT}",
+			f"候选：{len(candidates)} 人",
+			f"已移除：{sum(status == '已移除' for _, _, status in results)} 人",
+			f"跳过/失败：{sum(status != '已移除' for _, _, status in results)} 人",
+			"名单（用户 ID｜上传批次数｜结果）：",
+		]
+		report_lines.extend(
+			f"{user_id}｜{upload_count}｜{status}"
+			for user_id, upload_count, status in results
+		)
+
+		chunks = []
+		current_lines = []
+		current_length = 0
+		for line in report_lines:
+			line_length = len(line) + 1
+			if current_lines and current_length + line_length > 3500:
+				chunks.append("\n".join(current_lines))
+				current_lines = []
+				current_length = 0
+			current_lines.append(line)
+			current_length += line_length
+		if current_lines:
+			chunks.append("\n".join(current_lines))
+		for chunk in chunks:
+			await message.reply(chunk)
+		return True
 
 
 async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
@@ -4161,13 +4302,21 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 						f"notify inactive member {user_id}",
 						lambda: bot.send_message(
 							chat_id=user_id,
+							# text=(
+							# 	"🛫 机场成员清理通知\n\n"
+							# 	f"你的飞行通行证已经过期 {expired_days} 天，"
+							# 	f"超过机场设定的 {INACTIVE_EXPIRE_DAYS} 天不活跃期限。"
+							# 	"系统已将你移出原先所在的「镇泰飞机场」「航站大厅」或「免税店」，"
+							# 	"并清除相关通行证数据。\n\n"
+							# 	"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
+							# 	"https://t.me/+ek6YrGU0Rsg4YmZl"
+							# ),
 							text=(
-								"🛫 机场成员清理通知\n\n"
-								f"你的飞行通行证已经过期 {expired_days} 天，"
-								f"超过机场设定的 {INACTIVE_EXPIRE_DAYS} 天不活跃期限。"
-								"系统已将你移出原先所在的「镇泰飞机场」「航站大厅」或「免税店」，"
-								"并清除相关通行证数据。\n\n"
-								"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
+								"🛫 机场通知\n\n"
+								"受外部环境影响，机场暂时关闭。如您偏爱本机场风格，欢迎前往服务站留言。\n\n"
+								"这不是黑名单封禁，塔台恢复开放后，将向入选旅客发出邀约。"
+								"静候重逢，平安启航。"
+								"https://t.me/+ek6YrGU0Rsg4YmZl"
 							),
 						),
 					)

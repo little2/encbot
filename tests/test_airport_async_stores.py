@@ -68,6 +68,16 @@ class AirportStoreContract:
         self.assertEqual(await batches.get_discussion_location(-101, 11), (None, None))
         self.assertFalse(await batches.update_discussion_location(-999, 1, -200, 1))
 
+    async def test_batch_count_by_uploader(self):
+        batches = self.stores.batches
+        await batches.upsert_channel_location("batch-a", -100, 1, uploader_user_id=42)
+        await batches.upsert_channel_location("batch-b", -100, 2, uploader_user_id=42)
+        await batches.upsert_channel_location("batch-c", -100, 3, uploader_user_id=7)
+
+        self.assertEqual(await batches.count_by_uploader(42), 2)
+        self.assertEqual(await batches.count_by_uploader(7), 1)
+        self.assertEqual(await batches.count_by_uploader(99), 0)
+
     async def test_batch_views_are_unique_and_hot_query_joins_batch(self):
         await self.stores.batches.upsert_channel_location("popular", -100, 1, "Popular")
         await self.stores.batches.upsert_channel_location("other", -100, 2, "Other")

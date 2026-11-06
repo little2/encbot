@@ -114,6 +114,71 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.stores.blacklist.ban(3, "blocked", 99)
         self.assertEqual([uid for uid, _ in await self.ns["_get_inactive_candidates"](NOW)], [2, 1])
 
+    async def test_low_upload_snapshot_filters_expiry_upload_count_and_exempt_users(self):
+        self.ns["LOW_UPLOAD_CLEANUP_LIMIT"] = 30
+        load_functions({"_get_low_upload_candidates"}, self.ns)
+        await self.stores.users.update(1, NOW + 100)
+        await self.stores.users.update(2, NOW - 86400)
+        await self.stores.users.update(3, NOW - 86401)
+        await self.stores.users.update(4, NOW + 500)
+        await self.stores.users.update(7, NOW + 600)
+        await self.stores.users.update(99, NOW + 700)
+        await self.stores.users.update(999, NOW + 800)
+        await self.stores.blacklist.ban(7, "blocked", 99)
+        for index in range(30):
+            await self.stores.batches.upsert_channel_location(
+                f"batch-{index}", -100, index, uploader_user_id=4
+            )
+
+        candidates = await self.ns["_get_low_upload_candidates"](NOW)
+
+        self.assertEqual(
+            [(user_id, count) for user_id, _, count in candidates],
+            [(2, 0), (1, 0)],
+        )
+
+    async def test_low_upload_cleanup_removes_candidates_and_reports_counts(self):
+        await self.stores.users.update(1, NOW + 3600)
+        await self.stores.batches.upsert_channel_location(
+            "low-upload", -100, 1, uploader_user_id=1
+        )
+        removed_chats = []
+
+        async def remove(chat_id, user_id, chat_name):
+            removed_chats.append((chat_id, user_id, chat_name))
+            return True, f"{chat_name}已移出", False
+
+        async def delete(user_id):
+            await self.stores.users.remove(user_id)
+
+        self.ns.update(
+            LOW_UPLOAD_CLEANUP_LIMIT=30,
+            INACTIVE_CLEANUP_LOCK=asyncio.Lock(),
+            TERMINAL_CHANNEL_ID=-101,
+            AIRPORT_LOBBY_GROUP_ID=-102,
+            AIRPORT_DUTY_FREE_GROUP_ID=-103,
+            _remove_inactive_user_from_chat=AsyncMock(side_effect=remove),
+            _delete_inactive_user_data=AsyncMock(side_effect=delete),
+        )
+        load_functions({
+            "_get_low_upload_candidates",
+            "_execute_low_upload_cleanup",
+        }, self.ns)
+        message = SimpleNamespace(reply=AsyncMock())
+
+        result = await self.ns["_execute_low_upload_cleanup"](message)
+
+        self.assertTrue(result)
+        self.assertEqual(
+            removed_chats,
+            [(-101, 1, "飞机场"), (-102, 1, "航站大厅"), (-103, 1, "免税店")],
+        )
+        self.ns["_delete_inactive_user_data"].assert_awaited_once_with(1)
+        self.assertIsNone(await self.stores.users.get(1))
+        report = message.reply.await_args.args[0]
+        self.assertIn("已移除：1 人", report)
+        self.assertIn("1｜1｜已移除", report)
+
     async def run_cleanup_with_results(self, results, *, duty_free_id=-103, delete_error=None):
         await self.stores.users.update(1, NOW - 86401)
         calls = []

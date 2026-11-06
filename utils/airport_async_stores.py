@@ -27,6 +27,7 @@ class BatchStore(Protocol):
         discussion_chat_id: int, discussion_message_id: int,
     ) -> bool: ...
     async def get(self, batch_id: str) -> dict | None: ...
+    async def count_by_uploader(self, uploader_user_id: int) -> int: ...
     async def get_discussion_location(
         self, channel_chat_id: int, channel_message_id: int,
     ) -> tuple[int | None, int | None] | None: ...
@@ -172,6 +173,14 @@ class _BatchStore:
             return _batch(await conn.fetchrow(
                 "SELECT * FROM batch WHERE batch_id = $1", str(batch_id or "").strip()
             ))
+
+    async def count_by_uploader(self, uploader_user_id: int) -> int:
+        async with self.database.transaction() as conn:
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS total FROM batch WHERE uploader_user_id = $1",
+                int(uploader_user_id),
+            )
+            return int(row["total"])
 
     async def get_discussion_location(self, channel_chat_id, channel_message_id):
         async with self.database.transaction() as conn:

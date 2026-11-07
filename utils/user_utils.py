@@ -11,6 +11,7 @@ class UserExpire:
     expire_timestamp: int
     update_timestamp: int
     group_message_timestamp: int = 0
+    subscription_status: int = 0
 
 
 class UserExpireCache:
@@ -28,7 +29,8 @@ class UserExpireCache:
                 user_id INTEGER PRIMARY KEY,
                 expire_timestamp INTEGER NOT NULL,
                 update_timestamp INTEGER NOT NULL,
-                group_message_timestamp INTEGER NOT NULL DEFAULT 0
+                group_message_timestamp INTEGER NOT NULL DEFAULT 0,
+                subscription_status INTEGER NOT NULL DEFAULT 0
             )
         """)
         columns = {
@@ -40,6 +42,11 @@ class UserExpireCache:
                 ALTER TABLE user_expire
                 ADD COLUMN group_message_timestamp INTEGER NOT NULL DEFAULT 0
             """)
+        if "subscription_status" not in columns:
+            self.connection.execute("""
+                ALTER TABLE user_expire
+                ADD COLUMN subscription_status INTEGER NOT NULL DEFAULT 0
+            """)
         self.connection.commit()
         self._load()
 
@@ -49,7 +56,8 @@ class UserExpireCache:
                 user_id,
                 expire_timestamp,
                 update_timestamp,
-                group_message_timestamp
+                group_message_timestamp,
+                subscription_status
             FROM user_expire
         """).fetchall()
         self.users = {
@@ -57,12 +65,14 @@ class UserExpireCache:
                 expire_timestamp=int(expire_timestamp),
                 update_timestamp=int(update_timestamp),
                 group_message_timestamp=int(group_message_timestamp),
+                subscription_status=int(subscription_status),
             )
             for (
                 user_id,
                 expire_timestamp,
                 update_timestamp,
                 group_message_timestamp,
+                subscription_status,
             ) in rows
         }
 
@@ -90,6 +100,23 @@ class UserExpireCache:
 
     def get(self, user_id: int) -> UserExpire | None:
         return self.users.get(user_id)
+
+    def set_subscription_status(self, user_id: int, status: int) -> UserExpire | None:
+        if type(status) is not int or status not in (0, 1):
+            raise ValueError("subscription status must be 0 or 1")
+        user = self.users.get(user_id)
+        if user is None:
+            return None
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE user_expire SET subscription_status = ? WHERE user_id = ?",
+                (status, user_id),
+            )
+            if cursor.rowcount == 0:
+                self.users.pop(user_id, None)
+                return None
+        user.subscription_status = status
+        return user
 
     def update(
         self,

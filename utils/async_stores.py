@@ -26,6 +26,7 @@ class UserExpireStore(Protocol):
     async def get(self, user_id: int) -> UserExpire | None: ...
     async def update(self, user_id: int, expire_timestamp: int,
                      group_message_timestamp: int | None = None) -> UserExpire: ...
+    async def set_subscription_status(self, user_id: int, status: int) -> UserExpire | None: ...
     async def remove(self, user_id: int) -> None: ...
     async def remove_if_expired(self, user_id: int, cutoff: int) -> bool: ...
     async def is_valid(self, user_id: int) -> bool: ...
@@ -169,7 +170,7 @@ def _user(row) -> UserExpire | None:
     if row is None:
         return None
     return UserExpire(int(row["expire_timestamp"]), int(row["update_timestamp"]),
-                      int(row["group_message_timestamp"]))
+                      int(row["group_message_timestamp"]), int(row["subscription_status"]))
 
 
 def _blacklist_entry(row) -> BlacklistEntry:
@@ -201,6 +202,15 @@ class _UserExpireStore:
                      group_message_timestamp: int | None = None) -> UserExpire:
         async with self.database.transaction(write=True) as conn:
             return await self._update(conn, user_id, expire_timestamp, group_message_timestamp)
+
+    async def set_subscription_status(self, user_id: int, status: int) -> UserExpire | None:
+        if type(status) is not int or status not in (0, 1):
+            raise ValueError("subscription status must be 0 or 1")
+        async with self.database.transaction(write=True) as conn:
+            return _user(await conn.fetchrow("""
+                UPDATE user_expire SET subscription_status = $1 WHERE user_id = $2
+                RETURNING *
+            """, status, int(user_id)))
 
     async def remove(self, user_id: int) -> None:
         async with self.database.transaction(write=True) as conn:
@@ -410,7 +420,8 @@ async def _initialize_schema(conn, backend):
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_expire (
             user_id BIGINT PRIMARY KEY, expire_timestamp BIGINT NOT NULL,
-            update_timestamp BIGINT NOT NULL, group_message_timestamp BIGINT NOT NULL DEFAULT 0
+            update_timestamp BIGINT NOT NULL, group_message_timestamp BIGINT NOT NULL DEFAULT 0,
+            subscription_status BIGINT NOT NULL DEFAULT 0
         )
     """)
     await conn.execute("""
@@ -421,7 +432,9 @@ async def _initialize_schema(conn, backend):
         )
     """)
     # Compatibility with the legacy SQLite schema, without changing old callers.
-    for table, column in (("user_expire", "group_message_timestamp"), ("user_blacklist", "expires_at")):
+    for table, column in (("user_expire", "group_message_timestamp"),
+                          ("user_expire", "subscription_status"),
+                          ("user_blacklist", "expires_at")):
         if backend == "sqlite":
             columns = await conn.fetch(f"PRAGMA table_info({table})")
             if column in {row["name"] for row in columns}:

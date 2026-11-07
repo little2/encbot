@@ -55,6 +55,22 @@ class StoreContract:
         await users.remove(user_id)
         self.assertIsNone(await users.get(user_id))
 
+    async def test_subscription_status_is_persistent_and_independent_of_pass_updates(self):
+        users = self.stores.users
+        self.assertIsNone(await users.set_subscription_status(1, 1))
+        self.assertEqual((await users.update(1, NOW + 600)).subscription_status, 0)
+        self.assertEqual((await users.set_subscription_status(1, 1)).subscription_status, 1)
+        self.assertEqual((await users.update(1, NOW + 1200)).subscription_status, 1)
+        self.assertEqual((await users.extend_minutes(1, 1)).subscription_status, 1)
+        self.assertEqual((await users.consume_minutes(1, 1)).subscription_status, 1)
+        self.assertEqual((await users.refund_minutes(1, 1)).subscription_status, 1)
+        self.assertEqual((await users.list_users())[1].subscription_status, 1)
+        self.assertEqual((await users.set_subscription_status(1, 0)).subscription_status, 0)
+        for value in (-1, 2, "1", True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                await users.set_subscription_status(1, value)
+        self.assertEqual((await users.get(1)).subscription_status, 0)
+
     async def test_remove_if_expired_preserves_renewed_users(self):
         users = self.stores.users
         cutoff = NOW - 86400
@@ -166,7 +182,7 @@ class StoreContract:
     async def test_transaction_failure_rolls_back(self):
         with self.assertRaisesRegex(ValueError, "abort"):
             async with self.stores._database.transaction() as conn:
-                await conn.execute("INSERT INTO user_expire VALUES ($1, $2, $3, $4)", 1, NOW, NOW, 0)
+                await conn.execute("INSERT INTO user_expire (user_id, expire_timestamp, update_timestamp, group_message_timestamp) VALUES ($1, $2, $3, $4)", 1, NOW, NOW, 0)
                 raise ValueError("abort")
         self.assertIsNone(await self.stores.users.get(1))
 
@@ -175,7 +191,7 @@ class StoreContract:
 
         async def work():
             async with self.stores._database.transaction() as conn:
-                await conn.execute("INSERT INTO user_expire VALUES ($1, $2, $3, $4)", 1, NOW, NOW, 0)
+                await conn.execute("INSERT INTO user_expire (user_id, expire_timestamp, update_timestamp, group_message_timestamp) VALUES ($1, $2, $3, $4)", 1, NOW, NOW, 0)
                 entered.set()
                 await asyncio.Event().wait()
 
@@ -206,10 +222,12 @@ class SQLiteStoreTests(StoreContract, unittest.IsolatedAsyncioTestCase):
 
     async def test_reopen_preserves_data(self):
         await self.stores.users.update(1, NOW + 60, 123)
+        await self.stores.users.set_subscription_status(1, 1)
         await self.stores.blacklist.ban(2, "persist", 1)
         await self.stores.close()
         async with await create_stores(backend="sqlite", sqlite_path=self.path) as reopened:
             self.assertEqual((await reopened.users.get(1)).group_message_timestamp, 123)
+            self.assertEqual((await reopened.users.get(1)).subscription_status, 1)
             self.assertTrue(await reopened.blacklist.is_blocked(2))
 
     async def test_restore_updates_live_connection_and_repairs_optional_schema(self):
@@ -224,6 +242,7 @@ class SQLiteStoreTests(StoreContract, unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertFalse(waiting.done())
         self.assertEqual((await waiting).group_message_timestamp, 0)
+        self.assertEqual((await self.stores.users.get(2)).subscription_status, 0)
         self.assertIsNone(await self.stores.users.get(1))
         self.assertFalse(await self.stores.blacklist.is_blocked(2))
         await self.stores.blacklist.ban(2, "works after restore", 123)
@@ -249,16 +268,42 @@ class SQLiteStoreTests(StoreContract, unittest.IsolatedAsyncioTestCase):
             conn.execute("INSERT INTO user_blacklist VALUES (2, 'legacy', 1, ?)", (NOW,))
         async with await create_stores(backend="sqlite", sqlite_path=legacy_path) as stores:
             self.assertEqual((await stores.users.get(1)).group_message_timestamp, 0)
+            self.assertEqual((await stores.users.get(1)).subscription_status, 0)
             self.assertTrue(await stores.blacklist.is_blocked(2))
             await stores.users.update(1, NOW + 120, 123)
+            await stores.users.set_subscription_status(1, 1)
         legacy_users = UserExpireCache(legacy_path)
         legacy_blacklist = LegacyBlacklistStore(legacy_path)
         try:
             self.assertEqual(legacy_users.get(1).group_message_timestamp, 123)
+            self.assertEqual(legacy_users.get(1).subscription_status, 1)
+            legacy_users.update(1, NOW + 180)
+            self.assertEqual(legacy_users.set_subscription_status(1, 0).subscription_status, 0)
             self.assertTrue(legacy_blacklist.is_blocked(2))
         finally:
             legacy_users.close()
             legacy_blacklist.close()
+        async with await create_stores(backend="sqlite", sqlite_path=legacy_path) as stores:
+            self.assertEqual((await stores.users.get(1)).subscription_status, 0)
+
+    async def test_sync_legacy_schema_adds_subscription_status(self):
+        await self.stores.close()
+        legacy_path = Path(self.directory.name) / "sync-legacy.sqlite3"
+        with closing(sqlite3.connect(legacy_path)) as conn, conn:
+            conn.execute("CREATE TABLE user_expire (user_id INTEGER PRIMARY KEY, expire_timestamp INTEGER NOT NULL, update_timestamp INTEGER NOT NULL)")
+            conn.execute("INSERT INTO user_expire VALUES (1, ?, ?)", (NOW + 60, NOW))
+        users = UserExpireCache(legacy_path)
+        try:
+            self.assertEqual(users.get(1).subscription_status, 0)
+            self.assertIsNone(users.set_subscription_status(2, 1))
+            self.assertEqual(users.set_subscription_status(1, 1).subscription_status, 1)
+            users.update(1, NOW + 120)
+            with self.assertRaises(ValueError):
+                users.set_subscription_status(1, 2)
+        finally:
+            users.close()
+        async with await create_stores(backend="sqlite", sqlite_path=legacy_path) as stores:
+            self.assertEqual((await stores.users.get(1)).subscription_status, 1)
 
     async def test_sqlite_work_does_not_block_event_loop(self):
         entered, release = threading.Event(), threading.Event()
@@ -284,7 +329,7 @@ class SQLiteStoreTests(StoreContract, unittest.IsolatedAsyncioTestCase):
         database = self.stores._database
 
         def slow_insert():
-            database.conn.connection.execute("INSERT INTO user_expire VALUES (1, 1, 1, 0)")
+            database.conn.connection.execute("INSERT INTO user_expire (user_id, expire_timestamp, update_timestamp, group_message_timestamp) VALUES (1, 1, 1, 0)")
             entered.set()
             release.wait(timeout=2)
 
@@ -320,7 +365,7 @@ class SQLiteStoreTests(StoreContract, unittest.IsolatedAsyncioTestCase):
     async def test_worker_error_rolls_back_without_losing_connection(self):
         with self.assertRaises(sqlite3.OperationalError):
             async with self.stores._database.transaction(write=True) as conn:
-                await conn.execute("INSERT INTO user_expire VALUES ($1, $2, $3, $4)", 1, NOW, NOW, 0)
+                await conn.execute("INSERT INTO user_expire (user_id, expire_timestamp, update_timestamp, group_message_timestamp) VALUES ($1, $2, $3, $4)", 1, NOW, NOW, 0)
                 await conn.execute("invalid SQL")
         self.assertIsNone(await self.stores.users.get(1))
         await self.stores.users.update(2, NOW + 60)

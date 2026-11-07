@@ -9,6 +9,7 @@ import os
 from aiohttp import web
 import errno
 import re
+import secrets
 import time
 from functools import lru_cache
 from aiogram import Dispatcher, Bot, F
@@ -28,7 +29,13 @@ from utils.media_text_sender import MediaDelivery, MediaTextSender, RECOVERY_CAP
 from utils.parse_utils import ParseUtils
 from utils.user_manager import AsyncUserManager, UserManager
 from utils.blacklist_utils import BlacklistEntry
-from utils.async_stores import BlacklistStore, DatabaseStores, UserExpireStore, create_stores
+from utils.async_stores import BlacklistStore, UserExpireStore
+from utils.airport_async_stores import (
+	AirportDatabaseStores,
+	BatchStore,
+	ReceivedMediaStore,
+	create_airport_stores,
+)
 from utils.database_admin import DatabaseAdminCommands
 from utils.peach_exchange_store import (
 	remember_peach_exchange_record,
@@ -257,9 +264,11 @@ default_user_expire_db_path = (
 user_expire_db_path = Path(
 	os.getenv("USER_EXPIRE_DB_PATH", str(default_user_expire_db_path))
 )
-database_stores: DatabaseStores | None = None
+database_stores: AirportDatabaseStores | None = None
 user_expire_cache: UserExpireStore
 blacklist_store: BlacklistStore
+batch_store: BatchStore
+received_media_store: ReceivedMediaStore
 
 # Register administrative commands before the catch-all private text handler.
 # Construction does not open a database; the selected stores are bound at startup.
@@ -277,10 +286,17 @@ database_admin_commands.register(dp)
 
 async def _initialize_database() -> None:
 	global database_stores, user_expire_cache, blacklist_store
+	global batch_store, received_media_store
 	global user_manager, _ban_user, _unban_user, _delete_inactive_user_data
-	database_stores = await create_stores(sqlite_path=user_expire_db_path)
+	database_stores = await create_airport_stores(
+		backend=os.getenv("DATABASE_BACKEND", "sqlite"),
+		sqlite_path=user_expire_db_path,
+		database_url=os.getenv("DATABASE_URL", ""),
+	)
 	user_expire_cache = database_stores.users
 	blacklist_store = database_stores.blacklist
+	batch_store = database_stores.batches
+	received_media_store = database_stores.received_media
 	user_manager = AsyncUserManager(
 		stores=database_stores,
 		bot=bot,
@@ -385,7 +401,9 @@ def _extract_media_dict(message: Message) -> dict:
 	file_type = None
 	caption = None
 	file_id = None
+	file_unique_id = None
 	file_name = None
+	duration = 0
 
 	# print(f"Extracting media from message: {message}")
 	
@@ -405,6 +423,8 @@ def _extract_media_dict(message: Message) -> dict:
 	if message.video:
 		file_type = "video"
 		file_id = message.video.file_id
+		file_unique_id = message.video.file_unique_id
+		duration = int(message.video.duration or 0)
 		cover = getattr(message.video, "cover", None)
 		if isinstance(cover, list) and cover:
 			thumb_file_id = cover[0]
@@ -418,6 +438,8 @@ def _extract_media_dict(message: Message) -> dict:
 		mime_type = str(message.document.mime_type or "").lower()
 		file_type = "video" if mime_type == "video/mp4" else "document"
 		file_id = message.document.file_id
+		file_unique_id = message.document.file_unique_id
+		duration = int(getattr(message.document, "duration", 0) or 0)
 		thumb_file_id = message.document.thumbnail
 
 	file_name = str((message.video or message.document).file_name or "").strip()
@@ -430,7 +452,22 @@ def _extract_media_dict(message: Message) -> dict:
 			caption = EmojiUtils.strip_consecutive_emojis(caption)
 			print(f"Caption cleaned: {caption}")
 
-	return {"file_type": file_type, "caption": caption, "file_id": file_id, "file_name": file_name, "thumb_file_id": thumb_file_id}
+	thumb_file_unique_id = str(
+		getattr(thumb_file_id, "file_unique_id", "") or ""
+	)
+	if thumb_file_id is not None and not isinstance(thumb_file_id, str):
+		thumb_file_id = str(getattr(thumb_file_id, "file_id", "") or "")
+
+	return {
+		"file_type": file_type,
+		"caption": caption,
+		"file_id": file_id,
+		"file_unique_id": file_unique_id,
+		"file_name": file_name,
+		"duration": duration,
+		"thumb_file_id": thumb_file_id,
+		"thumb_file_unique_id": thumb_file_unique_id,
+	}
 
 def _extract_media_info(message: Message) -> tuple[str, str]:
 	if message.video:
@@ -532,6 +569,14 @@ async def on_media(message: Message, state: FSMContext) -> None:
 
 
 	media_info = _extract_media_dict(message)
+	file_unique_id = str(media_info.get("file_unique_id", "") or "").strip()
+	if not file_unique_id:
+		await message.reply("❌ 无法识别媒体唯一编号，请重新上传。")
+		return
+	if await received_media_store.is_accepted(file_unique_id):
+		await message.reply("此媒体已经收过，请勿重复上传。")
+		return
+
 	await _send_media_to_backup_bot(message)
 	file_type = media_info.get("file_type")
 	file_id = media_info.get("file_id")
@@ -548,8 +593,15 @@ async def on_media(message: Message, state: FSMContext) -> None:
 			"media_message_id": message.message_id,
 			"file_type": file_type,
 			"file_id": file_id,
+			"file_unique_id": file_unique_id,
+			"duration": int(media_info.get("duration", 0) or 0),
 			"uploader_id": int(message.from_user.id),
 			"thumb_file_id": thumb_file_id,
+			"thumb_file_unique_id": str(
+				media_info.get("thumb_file_unique_id", "") or ""
+			),
+			"source_chat_id": int(message.chat.id),
+			"source_message_id": int(message.message_id),
 		}
 	)
 
@@ -687,6 +739,74 @@ async def _pin_intro_post(message_id: int) -> None:
 		)
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] pin post_item failed: {exc}", flush=True)
+
+
+def _build_received_media_item(data: dict) -> dict:
+	return {
+		"file_id": str(data.get("file_id", "") or ""),
+		"file_unique_id": str(data.get("file_unique_id", "") or ""),
+		"file_type": str(data.get("file_type", "") or ""),
+		"duration": max(0, int(data.get("duration", 0) or 0)),
+		"source_chat_id": int(data.get("source_chat_id", 0) or 0),
+		"source_message_id": int(data.get("source_message_id", 0) or 0),
+		"thumb_file_id": str(data.get("thumb_file_id", "") or ""),
+		"thumb_file_unique_id": str(
+			data.get("thumb_file_unique_id", "") or ""
+		),
+	}
+
+
+async def _claim_taohua_upload(data: dict, uploader_id: int) -> str | None:
+	"""占用本次投稿媒体；发生重复时返回 None。"""
+	batch_id = secrets.token_urlsafe(12)
+	conflicts = await received_media_store.claim_batch(
+		[_build_received_media_item(data)],
+		int(uploader_id),
+		batch_id,
+	)
+	return None if conflicts else batch_id
+
+
+async def _record_taohua_upload(
+	*,
+	batch_id: str,
+	data: dict,
+	uploader_id: int,
+	post_message_id: int,
+	batch_content: str,
+	tags: str,
+) -> None:
+	"""将已发布投稿写入桃花版自己的 batch 与 received_media 表。"""
+	batch_saved = False
+	try:
+		await batch_store.upsert_channel_location(
+			batch_id=batch_id,
+			channel_chat_id=CHAT_PUBLIC_GROUP_ID,
+			channel_message_id=int(post_message_id),
+			batch_content=batch_content,
+			tag=tags,
+			uploader_user_id=int(uploader_id),
+		)
+		batch_saved = True
+	except Exception as exc:
+		print(f"[BATCH] 桃花投稿位置保存失败: {exc}", flush=True)
+
+	try:
+		accepted_count = await received_media_store.accept_batch(
+			[str(data.get("file_unique_id", "") or "")],
+			batch_id,
+		)
+	except Exception as exc:
+		print(f"[RECEIVED_MEDIA] 桃花投稿确认失败: {exc}", flush=True)
+		return
+
+	if not batch_saved or accepted_count != 1:
+		print(
+			f"[RECEIVED_MEDIA] 桃花投稿记录不完整 "
+			f"(batch_id={batch_id}, batch_saved={batch_saved}, "
+			f"accepted_count={accepted_count})",
+			flush=True,
+		)
 
 
 @dp.message(IntroStates.waiting_intro, F.chat.type == "private", F.text,
@@ -900,6 +1020,17 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 	post_text = f'🌼 {html.escape(text)}<a href="{html.escape(url, quote=True)}">ㅤ</a> '
 	if tags_string:
 		post_text = f"{post_text}\n{html.escape(tags_string)}"
+
+	try:
+		batch_id = await _claim_taohua_upload(data, int(message.from_user.id))
+	except Exception as exc:
+		print(f"[RECEIVED_MEDIA] 桃花投稿占用失败: {exc}", flush=True)
+		await message.reply("❌ 无法记录本次投稿，请稍后重试。")
+		return
+	if batch_id is None:
+		await state.clear()
+		await message.reply("此媒体已经收过或正在处理中，请勿重复上传。")
+		return
 	
 	try:
 		post_item = await _telegram_call_with_retry(
@@ -923,6 +1054,13 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 	except Exception as exc:
 		# 发布失败（含限流）：清理 FSM 状态并提示重试，避免用户卡在介绍流程
 		print(f"[ENCODED_FORWARD] publish intro post failed: {exc}", flush=True)
+		try:
+			await received_media_store.release_pending_batch(batch_id)
+		except Exception as release_exc:
+			print(
+				f"[RECEIVED_MEDIA] 桃花投稿 pending 释放失败: {release_exc}",
+				flush=True,
+			)
 		await state.clear()
 		try:
 			await _telegram_call_with_retry(
@@ -933,6 +1071,15 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		except Exception as reply_exc:
 			print(f"[ENCODED_FORWARD] notify publish failure failed: {reply_exc}", flush=True)
 		return
+
+	await _record_taohua_upload(
+		batch_id=batch_id,
+		data=data,
+		uploader_id=int(message.from_user.id),
+		post_message_id=int(post_item.message_id),
+		batch_content=text,
+		tags=tags_string,
+	)
 
 	# 将 post_item 置顶（带节流，见 _pin_intro_post）
 	await _pin_intro_post(post_item.message_id)

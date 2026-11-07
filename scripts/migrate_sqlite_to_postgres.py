@@ -28,7 +28,8 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 TABLES = {
-    "user_expire": ("user_id", "expire_timestamp", "update_timestamp", "group_message_timestamp"),
+    "user_expire": ("user_id", "expire_timestamp", "update_timestamp", "group_message_timestamp",
+                    "subscription_status"),
     "user_blacklist": ("user_id", "reason", "created_by", "created_at", "expires_at"),
 }
 AIRPORT_TABLES = {
@@ -59,7 +60,7 @@ NULLABLE_COLUMNS = {
 }
 # Defaults apply only to absent legacy columns; existing NULL/empty values are preserved.
 LEGACY_DEFAULTS = {
-    "user_expire": {"group_message_timestamp": 0},
+    "user_expire": {"group_message_timestamp": 0, "subscription_status": 0},
     "user_blacklist": {"expires_at": 0},
     "batch": {"batch_content": None, "tag": None, "uploader_user_id": 0,
               "no_forward": 0, "if_spoiler": 0, "anonymous": 1, "flash_seconds": 0,

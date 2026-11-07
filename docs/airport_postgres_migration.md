@@ -9,7 +9,7 @@
 
 | 表 | 唯一键 | 保留内容 |
 | --- | --- | --- |
-| `user_expire` | `user_id` | 通行证期限、更新时间、最近发言时间 |
+| `user_expire` | `user_id` | 通行证期限、更新时间、最近发言时间、频道订阅状态 |
 | `user_blacklist` | `user_id` | 原因、管理员、封禁及到期时间，包括过期历史 |
 | `batch` | `batch_id`，另有频道与消息 ID 唯一约束 | 频道及讨论区位置、内容、标签、上传者、发送设置和时间 |
 | `batch_view` | `(batch_id, user_id)` | 每位用户对每个批次的浏览记录 |
@@ -46,7 +46,9 @@ DATABASE_URL=postgresql://user:password@host:5432/airport
 退出码为 1，但仍输出差异统计。没有目标数据时可以预检查通过。
 
 检查源 SQLite 完整性、字段类型、主键及频道位置唯一性。已有 PostgreSQL
-表须具备 BIGINT/TEXT 字段及必要唯一约束。机场标准表没有自定义外键或
+表须具备 BIGINT/TEXT 字段及必要唯一约束，包括
+`user_expire.subscription_status BIGINT NOT NULL DEFAULT 0`。旧表可先由更新后的
+机场程序启动完成结构升级，再停写迁移。机场标准表没有自定义外键或
 触发器，若目标存在这些扩展，工具拒绝执行，避免级联删除或隐式写入。
 工具全量读取所选表以逐字段比较，演练时应留意实际数据量和内存占用。
 

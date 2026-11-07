@@ -4,6 +4,7 @@ import copy
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 import __future__
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -13,6 +14,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from utils.async_stores import create_stores
+from utils.airport_async_stores import create_airport_stores
 from utils.database_admin import DatabaseAdminCommands
 from utils.format_utils import FormatUtils
 from utils.user_manager import AsyncUserManager, UserManager
@@ -49,7 +51,9 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "users.sqlite3"
-        self.stores = await create_stores(backend="sqlite", sqlite_path=self.path)
+        self.stores = await create_airport_stores(
+            backend="sqlite", sqlite_path=self.path
+        )
         self.addAsyncCleanup(self.stores.close)
         self.bot = SimpleNamespace(ban_chat_member=AsyncMock(), unban_chat_member=AsyncMock())
 
@@ -80,17 +84,28 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         factory = AsyncMock(return_value=self.stores)
         admin = SimpleNamespace(database_stores=None, register=Mock())
         namespace = {
-            "asyncio": asyncio, "create_stores": factory,
+            "asyncio": asyncio, "os": os,
+            "create_airport_stores": factory,
             "user_expire_db_path": self.path, "database_admin_commands": admin,
             "AsyncUserManager": AsyncUserManager, "bot": self.bot,
             "_telegram_call_with_retry": self.telegram_call,
             "CHAT_SCHOOL_GROUP_ID": 100, "CHAT_PUBLIC_GROUP_ID": 200,
         }
         load_functions({"_initialize_database"}, namespace)
-        await namespace["_initialize_database"]()
-        factory.assert_awaited_once_with(sqlite_path=self.path)
+        with patch.dict(
+            os.environ,
+            {"DATABASE_BACKEND": "sqlite", "DATABASE_URL": ""},
+        ):
+            await namespace["_initialize_database"]()
+        factory.assert_awaited_once_with(
+            backend="sqlite", sqlite_path=self.path, database_url=""
+        )
         self.assertIs(namespace["user_expire_cache"], self.stores.users)
         self.assertIs(namespace["blacklist_store"], self.stores.blacklist)
+        self.assertIs(namespace["batch_store"], self.stores.batches)
+        self.assertIs(
+            namespace["received_media_store"], self.stores.received_media
+        )
         self.assertIs(admin.database_stores, self.stores)
         # Keep original registration order; do not register a second copy.
         admin.register.assert_not_called()
@@ -98,6 +113,55 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await namespace["_ban_user"](1, "test", 99, target_chats=[])
         self.assertTrue(await self.stores.blacklist.is_blocked(1))
         self.assertIsNone(await self.stores.users.get(1))
+
+    async def test_taohua_upload_records_received_media_and_batch(self):
+        namespace = {
+            "received_media_store": self.stores.received_media,
+            "batch_store": self.stores.batches,
+            "CHAT_PUBLIC_GROUP_ID": -100200,
+            "secrets": SimpleNamespace(token_urlsafe=lambda _size: "peach-batch"),
+        }
+        load_functions(
+            {
+                "_build_received_media_item",
+                "_claim_taohua_upload",
+                "_record_taohua_upload",
+            },
+            namespace,
+        )
+        data = {
+            "file_id": "file-1",
+            "file_unique_id": "unique-1",
+            "file_type": "video",
+            "duration": 12,
+            "source_chat_id": 42,
+            "source_message_id": 7,
+            "thumb_file_id": "thumb-1",
+            "thumb_file_unique_id": "thumb-unique-1",
+        }
+
+        batch_id = await namespace["_claim_taohua_upload"](data, 99)
+        self.assertEqual(batch_id, "peach-batch")
+        await namespace["_record_taohua_upload"](
+            batch_id=batch_id,
+            data=data,
+            uploader_id=99,
+            post_message_id=123,
+            batch_content="投稿介绍",
+            tags="#标签",
+        )
+
+        batch = await self.stores.batches.get(batch_id)
+        self.assertEqual(batch["channel_chat_id"], -100200)
+        self.assertEqual(batch["channel_message_id"], 123)
+        self.assertEqual(batch["uploader_user_id"], 99)
+        media = await self.stores.received_media.get_media_by_batch_id(batch_id)
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["file_unique_id"], "unique-1")
+        self.assertTrue(await self.stores.received_media.is_accepted("unique-1"))
+        self.assertIsNone(
+            await namespace["_claim_taohua_upload"](data, 99)
+        )
 
     async def test_concurrent_group_messages_reward_once(self):
         load_functions({"on_reward_group_message"}, self.namespace)

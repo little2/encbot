@@ -21,7 +21,7 @@ TEST_DSN = os.getenv("ASYNC_STORES_TEST_POSTGRES_DSN", "")
 
 def make_source(path, *, legacy=False):
     with closing(sqlite3.connect(path)) as conn, conn:
-        extra_user = "" if legacy else ", group_message_timestamp INTEGER NOT NULL DEFAULT 0"
+        extra_user = "" if legacy else ", group_message_timestamp INTEGER NOT NULL DEFAULT 0, subscription_status INTEGER NOT NULL DEFAULT 0"
         extra_ban = "" if legacy else ", expires_at INTEGER NOT NULL DEFAULT 0"
         conn.execute("CREATE TABLE user_expire (user_id INTEGER PRIMARY KEY, expire_timestamp INTEGER NOT NULL, update_timestamp INTEGER NOT NULL" + extra_user + ")")
         conn.execute("CREATE TABLE user_blacklist (user_id INTEGER PRIMARY KEY, reason TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL" + extra_ban + ")")
@@ -30,7 +30,7 @@ def make_source(path, *, legacy=False):
         conn.execute("INSERT INTO user_blacklist (user_id, reason, created_by, created_at) VALUES (?, ?, ?, ?)",
                      (9_000_000_002, "测试 Unicode 🍑 %_", 9_000_000_003, 1_700_000_001))
         if not legacy:
-            conn.execute("UPDATE user_expire SET group_message_timestamp = 123")
+            conn.execute("UPDATE user_expire SET group_message_timestamp = 123, subscription_status = 1")
             conn.execute("UPDATE user_blacklist SET expires_at = 1700000002")
 
 
@@ -44,12 +44,18 @@ class MigrationSourceTests(unittest.TestCase):
         make_source(self.source, legacy=True)
         with migration.open_source(self.source, freeze=True) as conn:
             snapshot = migration.read_sqlite(conn)
-            self.assertEqual(snapshot.tables["user_expire"][0][-1], 0)
+            self.assertEqual(snapshot.tables["user_expire"][0][-2:], (0, 0))
             self.assertEqual(snapshot.tables["user_blacklist"][0][-1], 0)
             backup = migration.backup_source(self.source, Path(self.directory.name) / "backups", snapshot)
         self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
         with migration.open_source(backup) as conn:
             self.assertEqual(migration.read_sqlite(conn).tables, snapshot.tables)
+
+    def test_subscription_status_is_included_in_snapshot(self):
+        make_source(self.source)
+        with migration.open_source(self.source) as conn:
+            snapshot = migration.read_sqlite(conn)
+        self.assertEqual(snapshot.tables["user_expire"][0][-2:], (123, 1))
 
     def test_apply_freezes_writers_and_releases_lock(self):
         make_source(self.source)
@@ -77,11 +83,11 @@ class MigrationSourceTests(unittest.TestCase):
         for value in (None, "not-an-integer", 2**63):
             with self.subTest(value=value):
                 with self.assertRaises(migration.MigrationError):
-                    migration.validate_rows("user_expire", [(1, value, 0, 0)])
+                    migration.validate_rows("user_expire", [(1, value, 0, 0, 0)])
 
     def test_conflict_extra_and_missing_are_distinguished(self):
-        source = migration.Snapshot({"user_expire": ((1, 2, 3, 4), (5, 6, 7, 8)), "user_blacklist": ()})
-        target = migration.Snapshot({"user_expire": ((1, 2, 3, 9), (9, 9, 9, 9)), "user_blacklist": ()})
+        source = migration.Snapshot({"user_expire": ((1, 2, 3, 4, 0), (5, 6, 7, 8, 1)), "user_blacklist": ()})
+        target = migration.Snapshot({"user_expire": ((1, 2, 3, 9, 0), (9, 9, 9, 9, 0)), "user_blacklist": ()})
         diff = migration.compare(source, target)
         self.assertEqual(diff["user_expire"]["missing"], 1)
         self.assertEqual(diff["user_expire"]["conflicting"], 1)
@@ -89,7 +95,7 @@ class MigrationSourceTests(unittest.TestCase):
         self.assertEqual(diff["user_expire"]["conflict_fields"], {"group_message_timestamp": 1})
         with self.assertRaises(migration.MigrationError):
             migration.assert_compatible(diff)
-        target.tables["user_expire"] = ((1, 2, 3, 9),)
+        target.tables["user_expire"] = ((1, 2, 3, 9, 0),)
         diff = migration.compare(source, target)
         with self.assertRaises(migration.MigrationError):
             migration.assert_compatible(diff)
@@ -139,7 +145,7 @@ class MigrationPostgresTests(unittest.IsolatedAsyncioTestCase):
     async def test_apply_overwrites_conflicts_and_deletes_target_extras(self):
         await self.run_migration("apply")
         await self.admin.execute(f'UPDATE "{self.schema}".user_expire SET expire_timestamp = 999')
-        await self.admin.execute(f'INSERT INTO "{self.schema}".user_expire VALUES (123, 1, 1, 0)')
+        await self.admin.execute(f'INSERT INTO "{self.schema}".user_expire (user_id, expire_timestamp, update_timestamp, group_message_timestamp) VALUES (123, 1, 1, 0)')
         report = await self.run_migration("apply")
         self.assertEqual(report["before"]["user_expire"]["conflict_fields"],
                          {"expire_timestamp": 1})

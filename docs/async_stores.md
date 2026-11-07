@@ -28,8 +28,11 @@ DATABASE_BACKEND=postgresql
 DATABASE_URL=postgresql://user:password@host:5432/encbot
 ```
 
-工厂在启动时创建两张表，并补充旧表缺失的 `group_message_timestamp` 和
-`expires_at` 字段。PostgreSQL 的 ID 和时间戳使用 BIGINT。
+工厂在启动时创建两张表，并补充旧表缺失的 `group_message_timestamp`、
+`subscription_status` 和 `expires_at` 字段。`user_expire.subscription_status`
+为整数，默认为 0（未订阅），1 表示已订阅。使用
+`users.set_subscription_status(user_id, status)` 更新已有用户，用户不存在时返回
+`None`；该字段不会自动查询 Telegram 频道状态。PostgreSQL 的 ID 和时间戳使用 BIGINT。
 已有 PostgreSQL 表若字段类型不符合要求，需要另行迁移。
 
 ### 机场使用独立数据库

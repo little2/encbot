@@ -7642,7 +7642,7 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 		return None
 	first_line = normalized_text.splitlines()[0]
 	match = re.fullmatch(
-		r"(?:zttower|afu)\d+bot_([A-Za-z0-9_-]{16})",
+		r"(?:zttower|afu|zttatai)\d+bot_([A-Za-z0-9_-]{16})",
 		first_line.strip(),
 		flags=re.IGNORECASE,
 	)

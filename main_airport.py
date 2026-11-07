@@ -1662,23 +1662,6 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 
 
-	## TODO
-	try:
-		# print("发送至 X-Man 机器人",flush=True)
-		await _send_media_forward_to_destination(
-			task,
-			"BKMAN",
-			8473892643,
-		)
-	finally:
-		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
-
-	
-
-	''' 
-	TODO: 关掉备份
-	'''
-	return
 	print("准备发送至备用机器人",flush=True)
 	if BACKUP_BOT_NAME is None:
 		return
@@ -5295,8 +5278,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 			return
 
 		else:
-			message.reply("功能暂时关掉")
-			return
+			
 
 			try:
 				preview_settings = await _get_batch_preview_message_settings(args)
@@ -7714,9 +7696,7 @@ async def on_text(message: Message) -> None:
 	if not text:
 		return
 
-	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
-		await message.reply(f"功能暂关闭")
-		return
+
 
 
 
@@ -7792,6 +7772,37 @@ def _report_backup_bot_exit(task: asyncio.Task) -> None:
 			f"[BACKUP_BOT_ERROR] {type(exception).__name__}: {exception}",
 			flush=True,
 		)
+
+
+async def _update_lobby_description() -> None:
+	if AIRPORT_LOBBY_GROUP_ID == 0:
+		print("[AIRPORT_LOBBY] 群组未配置，无法更新群组介绍", flush=True)
+		return
+	try:
+		description = f'''
+欢迎来到航站大厅！感谢您选择本机场作为您的起飞的地点。🛫
+
+您可以通过「塔台」机器人 进行导航，前往以下场所：
+
+✈️ 飞机场 —— 开启您的飞行旅程  
+🛍️ 免税场 —— 文字版及历史班机
+
+📡 目前正在运行的塔台机场人：
+@{bot_name}
+
+请各位旅客认准以上塔台机器人，并按照指引前往相应场所。
+		'''
+		await _telegram_call_with_retry(
+			"update airport lobby description",
+			lambda: bot.set_chat_description(
+				chat_id=AIRPORT_LOBBY_GROUP_ID,
+				description=description,
+				
+			),
+		)
+	except Exception as exc:
+		print(f"[AIRPORT_LOBBY] 更新群组介绍失败: {exc}", flush=True)
+
 
 async def main() -> None:
 	global bot_name
@@ -7903,6 +7914,7 @@ async def main() -> None:
 			scope=BotCommandScopeAllPrivateChats(),
 		)
 
+		await _update_lobby_description()
 
 		await reload_config()
 		await dp.start_polling(bot)

@@ -67,6 +67,37 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                        MESSAGE_REWARD_MINUTES=60, MEDIA_VIEW_CONSUMPTION_MINUTES=60,
                        IGNORED_TEXT_SUBSTRINGS=[], FormatUtils=FormatUtils, escape=escape)
 
+    async def test_update_lobby_description(self):
+        self.bot.set_chat_description = AsyncMock()
+        self.ns.update(AIRPORT_LOBBY_GROUP_ID=-123, _telegram_call_with_retry=self.telegram_call)
+        load_functions({"_update_lobby_description"}, self.ns)
+
+        await self.ns["_update_lobby_description"]()
+
+        self.bot.set_chat_description.assert_awaited_once()
+        call = self.bot.set_chat_description.await_args
+        self.assertEqual(call.kwargs["chat_id"], -123)
+        description = call.kwargs["description"]
+        self.assertIn("欢迎来到航站大厅", description)
+        self.assertIn("\n@airport_test\n", description)
+        self.assertNotIn("`", description)
+        self.assertLessEqual(len(description), 255)
+
+    async def test_update_lobby_description_logs_failure_and_unconfigured_group(self):
+        self.bot.set_chat_description = AsyncMock(side_effect=RuntimeError("permission denied"))
+        self.ns.update(AIRPORT_LOBBY_GROUP_ID=-123, _telegram_call_with_retry=self.telegram_call)
+        load_functions({"_update_lobby_description"}, self.ns)
+        with patch("builtins.print") as print_mock:
+            await self.ns["_update_lobby_description"]()
+        self.assertIn("permission denied", print_mock.call_args.args[0])
+
+        self.ns["AIRPORT_LOBBY_GROUP_ID"] = 0
+        self.bot.set_chat_description.reset_mock()
+        with patch("builtins.print") as print_mock:
+            await self.ns["_update_lobby_description"]()
+        self.bot.set_chat_description.assert_not_awaited()
+        self.assertIn("群组未配置", print_mock.call_args.args[0])
+
     async def test_initialize_binds_six_stores_and_atomic_manager(self):
         states = {name: {1: "pending"} for name in (
             "PENDING_AIRPORT_JOIN_INVITES", "AIRPORT_QUIZ_PROGRESS",

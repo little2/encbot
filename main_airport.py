@@ -1337,6 +1337,7 @@ async def _ask_media_by_type(
 
 			file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
 			x_man_reply = await _request_x_man(file_unique_id)
+			return false
 
 			# if file_type == "document":
 			# 	result = await from_bot.send_document(chat_id=chat_id, document=file_id)
@@ -1666,22 +1667,22 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 
 
-	print("准备发送至备用机器人",flush=True)
-	if BACKUP_BOT_NAME is None:
-		return
-	backup_bot_username = str(BACKUP_BOT_NAME).strip().lstrip("@")
-	# print(f"备用机器人名称: {backup_bot_username}",flush=True)
-	if not backup_bot_username:
-		return
-	try:
-		# print("发送至备用机器人")
-		await _send_media_forward_to_destination(
-			task,
-			"BACKUP_BOT_NAME",
-			f"@{backup_bot_username}",
-		)
-	finally:
-		await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
+	# print("准备发送至备用机器人",flush=True)
+	# if BACKUP_BOT_NAME is None:
+	# 	return
+	# backup_bot_username = str(BACKUP_BOT_NAME).strip().lstrip("@")
+	# # print(f"备用机器人名称: {backup_bot_username}",flush=True)
+	# if not backup_bot_username:
+	# 	return
+	# try:
+	# 	# print("发送至备用机器人")
+	# 	await _send_media_forward_to_destination(
+	# 		task,
+	# 		"BACKUP_BOT_NAME",
+	# 		f"@{backup_bot_username}",
+	# 	)
+	# finally:
+	# 	await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
 
 
 async def _run_media_forward_operation(

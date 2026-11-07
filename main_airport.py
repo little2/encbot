@@ -1334,46 +1334,50 @@ async def _ask_media_by_type(
 	# file_id = "BAACAgUAAxkBAAINwmrlpgxDhMiacHKhRjYkpVcK4KLrAAKkAQACfieoVU45E5GMHULFPQQ"
 	try:
 		async with BACKUP_FORWARD_SEND_LOCK:
-			if file_type == "document":
-				result = await from_bot.send_document(chat_id=chat_id, document=file_id)
-			if file_type == "photo":
 
-				result = await from_bot.send_photo(
-					chat_id=chat_id,
-					photo=file_id
-				)
-			if file_type == "video":
-				result =  await from_bot.send_video(
-					chat_id=chat_id,
-					video=file_id
-				)
-			if file_type == "audio":
-				result = await from_bot.send_audio(chat_id=chat_id, audio=file_id)
-			if file_type == "voice":
-				result = await from_bot.send_voice(chat_id=chat_id, voice=file_id)
-			if file_type == "animation":
-				result = await from_bot.send_animation(
-					chat_id=chat_id,
-					animation=file_id,
-				)
-			if file_type == "sticker":
-				result =  await from_bot.send_sticker(chat_id=chat_id, sticker=file_id)
-	except Exception as exc:
-
-		if "wrong file identifier" in str(exc):
-			print(f"❌ {exc} , 找 x_man",flush=True)
 			file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
 			x_man_reply = await _request_x_man(file_unique_id)
-			print(f"x_man_reply={x_man_reply}")
-			if x_man_reply == "na":
-				return False
-			else:
-				
-				return True
-				
-		else:
-			print(f"1326:{exc}",flush=True)
 
+			# if file_type == "document":
+			# 	result = await from_bot.send_document(chat_id=chat_id, document=file_id)
+			# if file_type == "photo":
+
+			# 	result = await from_bot.send_photo(
+			# 		chat_id=chat_id,
+			# 		photo=file_id
+			# 	)
+			# if file_type == "video":
+			# 	result =  await from_bot.send_video(
+			# 		chat_id=chat_id,
+			# 		video=file_id
+			# 	)
+			# if file_type == "audio":
+			# 	result = await from_bot.send_audio(chat_id=chat_id, audio=file_id)
+			# if file_type == "voice":
+			# 	result = await from_bot.send_voice(chat_id=chat_id, voice=file_id)
+			# if file_type == "animation":
+			# 	result = await from_bot.send_animation(
+			# 		chat_id=chat_id,
+			# 		animation=file_id,
+			# 	)
+			# if file_type == "sticker":
+			# 	result =  await from_bot.send_sticker(chat_id=chat_id, sticker=file_id)
+	except Exception as exc:
+
+		# if "wrong file identifier" in str(exc):
+		# 	print(f"❌ {exc} , 找 x_man",flush=True)
+		# 	file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
+		# 	x_man_reply = await _request_x_man(file_unique_id)
+		# 	print(f"x_man_reply={x_man_reply}")
+		# 	if x_man_reply == "na":
+		# 		return False
+		# 	else:
+				
+		# 		return True
+				
+		# else:
+		# 	print(f"1326:{exc}",flush=True)
+		print(f"1326:{exc}",flush=True)
 		return False
 
 

@@ -128,6 +128,28 @@ class AirportStoreContract:
         self.assertEqual(await store.release_pending_batch("batch"), 1)
         self.assertEqual(await store.get_batch_ids(["a", "b"]), {"a": "batch"})
 
+    async def test_taohua_finalization_is_atomic_when_claim_is_missing(self):
+        store = self.stores.received_media
+        self.assertEqual(
+            await store.claim_batch([media("actual", 1)], 7, "atomic"), []
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "claimed received_media"):
+            await self.stores.finalize_taohua_upload(
+                batch_id="atomic",
+                file_unique_id="missing",
+                channel_chat_id=-100,
+                channel_message_id=10,
+                batch_content="content",
+                uploader_user_id=7,
+            )
+
+        self.assertIsNone(await self.stores.batches.get("atomic"))
+        self.assertFalse(await store.is_accepted("actual"))
+        self.assertEqual(
+            await store.get_batch_ids(["actual"]), {"actual": "atomic"}
+        )
+
     async def test_release_pending_many_and_stale_cleanup(self):
         store = self.stores.received_media
         await store.claim_batch([media("a", 1), media("b", 2)], 1, "batch")

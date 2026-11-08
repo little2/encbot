@@ -57,7 +57,7 @@ class ControlPanelTests(unittest.IsolatedAsyncioTestCase):
 			)
 
 		self.assertIn("example_bot", result)
-		self.assertIn("群組檢查成功", result)
+		self.assertIn("群组检查成功", result)
 		bot.get_chat_member.assert_awaited_once_with(
 			chat_id=-100456,
 			user_id=123,

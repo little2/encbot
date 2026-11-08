@@ -58,6 +58,10 @@ class ReceivedMediaStore(Protocol):
     async def release_pending_many(self, file_unique_ids: list[str]) -> int: ...
     async def release_pending_batch(self, batch_id: str) -> int: ...
     async def accept_batch(self, file_unique_ids: list[str], batch_id: str) -> int: ...
+    async def update_thumbnail(
+        self, file_unique_id: str, batch_id: str,
+        thumb_file_id: str = "", thumb_file_unique_id: str = "",
+    ) -> bool: ...
     async def get_batch_ids(self, file_unique_ids: list[str]) -> dict[str, str | None]: ...
     async def get_media_by_batch_id(self, batch_id: str) -> list[dict[str, str | int]]: ...
 
@@ -393,6 +397,31 @@ class _ReceivedMediaStore:
             """, *params)
             return len(rows)
 
+    async def update_thumbnail(
+        self, file_unique_id, batch_id,
+        thumb_file_id="", thumb_file_unique_id="",
+    ):
+        unique_id = str(file_unique_id or "").strip()
+        normalized_batch_id = str(batch_id or "").strip()
+        reusable_thumb_id = str(thumb_file_id or "").strip()
+        unique_thumb_id = str(thumb_file_unique_id or "").strip()
+        if not unique_id or not normalized_batch_id:
+            return False
+        if not reusable_thumb_id and not unique_thumb_id:
+            return False
+        async with self.database.transaction(write=True) as conn:
+            row = await conn.fetchrow("""
+                UPDATE received_media SET
+                    thumb_file_id = CASE
+                        WHEN $1 <> '' THEN $1 ELSE thumb_file_id END,
+                    thumb_file_unique_id = CASE
+                        WHEN $2 <> '' THEN $2 ELSE thumb_file_unique_id END
+                WHERE file_unique_id = $3 AND batch_id = $4
+                RETURNING file_unique_id
+            """, reusable_thumb_id, unique_thumb_id, unique_id,
+                 normalized_batch_id)
+            return row is not None
+
     async def get_batch_ids(self, file_unique_ids):
         unique_ids = list(dict.fromkeys(str(value).strip() for value in file_unique_ids if str(value).strip()))
         if not unique_ids:
@@ -489,6 +518,75 @@ class AirportDatabaseStores(DatabaseStores):
     async def _initialize_restored_schema(self, conn) -> None:
         await super()._initialize_restored_schema(conn)
         await _initialize_airport_schema_on_connection(conn, self.backend)
+
+    async def finalize_taohua_upload(
+        self,
+        *,
+        batch_id: str,
+        file_unique_id: str,
+        channel_chat_id: int,
+        channel_message_id: int,
+        batch_content: str = "",
+        tag: str = "",
+        uploader_user_id: int = 0,
+        thumb_file_id: str = "",
+        thumb_file_unique_id: str = "",
+    ) -> None:
+        """Atomically save a 桃花 batch and accept its claimed media."""
+        normalized_batch_id = str(batch_id or "").strip()
+        normalized_unique_id = str(file_unique_id or "").strip()
+        if not normalized_batch_id:
+            raise ValueError("batch_id is required")
+        if not normalized_unique_id:
+            raise ValueError("file_unique_id is required")
+
+        now = int(time.time())
+        reusable_thumb_id = str(thumb_file_id or "").strip()
+        unique_thumb_id = str(thumb_file_unique_id or "").strip()
+        async with self._database.transaction(write=True) as conn:
+            await conn.execute("""
+                INSERT INTO batch (
+                    batch_id, channel_chat_id, channel_message_id,
+                    discussion_chat_id, discussion_message_id, batch_content,
+                    tag, uploader_user_id, no_forward, if_spoiler, anonymous,
+                    flash_seconds, valid_until, created_at, updated_at
+                ) VALUES ($1, $2, $3, NULL, NULL, $4, $5, $6, 0, 0,
+                          1, 0, '99991231235959', $7, $7)
+                ON CONFLICT(batch_id) DO UPDATE SET
+                    discussion_chat_id = CASE
+                        WHEN batch.channel_chat_id = excluded.channel_chat_id
+                         AND batch.channel_message_id = excluded.channel_message_id
+                        THEN batch.discussion_chat_id ELSE NULL END,
+                    discussion_message_id = CASE
+                        WHEN batch.channel_chat_id = excluded.channel_chat_id
+                         AND batch.channel_message_id = excluded.channel_message_id
+                        THEN batch.discussion_message_id ELSE NULL END,
+                    channel_chat_id = excluded.channel_chat_id,
+                    channel_message_id = excluded.channel_message_id,
+                    batch_content = excluded.batch_content,
+                    tag = excluded.tag,
+                    uploader_user_id = excluded.uploader_user_id,
+                    updated_at = excluded.updated_at
+            """, normalized_batch_id, int(channel_chat_id),
+                 int(channel_message_id), str(batch_content or "").strip(),
+                 str(tag or "").strip(), int(uploader_user_id), now)
+
+            row = await conn.fetchrow("""
+                UPDATE received_media SET
+                    status = 'accepted', accepted_at = $1,
+                    thumb_file_id = CASE
+                        WHEN $2 <> '' THEN $2 ELSE thumb_file_id END,
+                    thumb_file_unique_id = CASE
+                        WHEN $3 <> '' THEN $3 ELSE thumb_file_unique_id END
+                WHERE status = 'pending' AND batch_id = $4
+                  AND file_unique_id = $5
+                RETURNING file_unique_id
+            """, now, reusable_thumb_id, unique_thumb_id,
+                 normalized_batch_id, normalized_unique_id)
+            if row is None:
+                raise RuntimeError(
+                    "claimed received_media row was not found during finalization"
+                )
 
 
 async def _ensure_columns(conn, backend, table, columns):

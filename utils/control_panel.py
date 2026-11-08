@@ -22,12 +22,12 @@ class ControlPanel:
 		],
 	) -> str:
 		control_panel_chat_id = self.config.get("control_channel")
-		notice_text = f"🔔 機器人名稱: @{bot_name}\n"
+		notice_text = f"🔔 机器人名称: @{bot_name}\n"
 
 		for setting_name, chat_id in groups:
 			if chat_id == 0:
 				print(
-					f"❌[群組設定錯誤] {setting_name} 尚未配置。",
+					f"❌[群组设置错误] {setting_name} 尚未配置。",
 					flush=True,
 				)
 				continue
@@ -40,29 +40,29 @@ class ControlPanel:
 			except TelegramBadRequest as exc:
 				if "chat not found" in str(exc).lower():
 					notice_text += (
-						f"❌[群組設定錯誤] {setting_name}={chat_id} 找不到群組。"
-						"請確認群組 ID 正確，並將機器人加入群組及設為管理員。\n"
+						f"❌[群组设置错误] {setting_name}={chat_id} 找不到群组。"
+						"请确认群组 ID 正确，并将机器人加入群组及设为管理员。\n"
 					)
 					continue
 
 				notice_text += (
-					f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
+					f"❌[群组检查失败] 无法检查 {setting_name}={chat_id}: {exc}\n"
 				)
 				continue
 			except Exception as exc:
 				notice_text += (
-					f"❌[群組檢查失敗] 無法檢查 {setting_name}={chat_id}: {exc}\n"
+					f"❌[群组检查失败] 无法检查 {setting_name}={chat_id}: {exc}\n"
 				)
 				continue
 
 			if bot_status.status not in ("administrator", "creator"):
 				notice_text += (
-					f"❌[群組权限不足] 機器人在 {setting_name} = {chat_id} 中的身分為 "
-					f"{bot_status.status}，請將機器人設為管理員。\n"
+					f"❌[群组权限不足] 机器人在 {setting_name} = {chat_id} 中的身份为 "
+					f"{bot_status.status}，请将机器人设为管理员。\n"
 				)
 				continue
 			notice_text += (
-				f"✅[群組檢查成功] 機器人已在 {setting_name} = {chat_id} 中並具有管理員權限。\n"
+				f"✅[群组检查成功] 机器人已在 {setting_name} = {chat_id} 中并具有管理员权限。\n"
 			)
 
 		if notice_text:
@@ -75,23 +75,23 @@ class ControlPanel:
 					)
 				except TelegramBadRequest as exc:
 					print(
-						f"⚠️ [群組檢查通知未送出] ControlPanel={control_panel_chat_id}: {exc}",
+						f"⚠️ [群组检查通知未发送] ControlPanel={control_panel_chat_id}: {exc}",
 						flush=True,
 					)
 					if "chat not found" in str(exc).lower():
 						print(
-							"請確認 control_panel_chat_id 是正確"
-							f" @{bot_name} 私訊，按下 Start 或傳送 /start。",
+							"请确认 control_panel_chat_id 正确，并向"
+							f" @{bot_name} 发送私聊消息，按下 Start 或发送 /start。",
 							flush=True,
 						)
 				except Exception as exc:
 					print(
-						f"⚠️ [群組檢查通知未送出] control_panel_chat_id={control_panel_chat_id}: {exc}",
+						f"⚠️ [群组检查通知未发送] control_panel_chat_id={control_panel_chat_id}: {exc}",
 						flush=True,
 					)
 			else:
 				print(
-					"⚠️ [群組檢查通知未送出] control_panel_chat_id 尚未配置。",
+					"⚠️ [群组检查通知未发送] control_panel_chat_id 尚未配置。",
 					flush=True,
 				)
 		return notice_text

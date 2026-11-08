@@ -24,7 +24,7 @@ from utils.parse_utils import ParseUtils
 from config import MAX_HP_CAPACITY_MINUTES
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
-from aiogram.methods import SendMediaGroup
+from aiogram.methods import SendMediaGroup, SendMessage
 from utils.media_text_sender import MediaDelivery, MediaTextSender, media_batches
 from utils.telegram_gate import TelegramGate
 
@@ -118,6 +118,7 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         namespace = {
             "received_media_store": self.stores.received_media,
             "batch_store": self.stores.batches,
+            "database_stores": self.stores,
             "CHAT_PUBLIC_GROUP_ID": -100200,
             "secrets": SimpleNamespace(token_urlsafe=lambda _size: "peach-batch"),
         }
@@ -142,14 +143,16 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         batch_id = await namespace["_claim_taohua_upload"](data, 99)
         self.assertEqual(batch_id, "peach-batch")
-        await namespace["_record_taohua_upload"](
+        data["thumb_file_id"] = "updated-thumb-1"
+        data["thumb_file_unique_id"] = "updated-thumb-unique-1"
+        self.assertTrue(await namespace["_record_taohua_upload"](
             batch_id=batch_id,
             data=data,
             uploader_id=99,
             post_message_id=123,
             batch_content="投稿介绍",
             tags="#标签",
-        )
+        ))
 
         batch = await self.stores.batches.get(batch_id)
         self.assertEqual(batch["channel_chat_id"], -100200)
@@ -158,10 +161,93 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         media = await self.stores.received_media.get_media_by_batch_id(batch_id)
         self.assertEqual(len(media), 1)
         self.assertEqual(media[0]["file_unique_id"], "unique-1")
+        self.assertEqual(media[0]["thumb_file_id"], "updated-thumb-1")
+        self.assertEqual(
+            media[0]["thumb_file_unique_id"], "updated-thumb-unique-1"
+        )
         self.assertTrue(await self.stores.received_media.is_accepted("unique-1"))
         self.assertIsNone(
             await namespace["_claim_taohua_upload"](data, 99)
         )
+
+    async def test_violating_intro_bans_even_when_delete_fails(self):
+        ban_user = AsyncMock(return_value=(SimpleNamespace(user_id=42), None))
+        namespace = {
+            "_ban_user": ban_user,
+            "TARGET_CHATS": [("桃花林", -1001)],
+        }
+        load_functions({"_ban_violating_intro"}, namespace)
+        message = SimpleNamespace(
+            message_id=7,
+            from_user=SimpleNamespace(id=42),
+            delete=AsyncMock(side_effect=RuntimeError("cannot delete")),
+        )
+
+        await namespace["_ban_violating_intro"](message, "违规内容")
+
+        message.delete.assert_awaited_once()
+        ban_user.assert_awaited_once_with(
+            user_id=42,
+            reason="投稿违规内容:违规内容 ",
+            created_by=0,
+            target_chats=[("桃花林", -1001)],
+        )
+
+    async def test_uncertain_intro_publish_keeps_pending_claim(self):
+        release_pending_batch = AsyncMock()
+        namespace = {
+            "TelegramNetworkError": TelegramNetworkError,
+            "received_media_store": SimpleNamespace(
+                release_pending_batch=release_pending_batch
+            ),
+        }
+        load_functions({"_handle_intro_publish_failure"}, namespace)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=42),
+            reply=AsyncMock(),
+        )
+        state = SimpleNamespace(clear=AsyncMock())
+        error = TelegramNetworkError(
+            SendMessage(chat_id=-1001, text="post"), "timeout"
+        )
+
+        await namespace["_handle_intro_publish_failure"](
+            message, state, "uncertain-batch", error
+        )
+
+        release_pending_batch.assert_not_awaited()
+        state.clear.assert_awaited_once()
+        message.reply.assert_awaited_once_with(
+            "⚠️ 发布结果尚未确认，请勿重复投稿；管理员确认后会继续处理。"
+        )
+
+    async def test_definite_intro_publish_failure_releases_pending_claim(self):
+        release_pending_batch = AsyncMock(return_value=1)
+
+        async def telegram_call(_label, operation, **_kwargs):
+            return await operation()
+
+        namespace = {
+            "TelegramNetworkError": TelegramNetworkError,
+            "received_media_store": SimpleNamespace(
+                release_pending_batch=release_pending_batch
+            ),
+            "_telegram_call_with_retry": telegram_call,
+        }
+        load_functions({"_handle_intro_publish_failure"}, namespace)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=42),
+            reply=AsyncMock(),
+        )
+        state = SimpleNamespace(clear=AsyncMock())
+
+        await namespace["_handle_intro_publish_failure"](
+            message, state, "failed-batch", RuntimeError("rejected")
+        )
+
+        release_pending_batch.assert_awaited_once_with("failed-batch")
+        state.clear.assert_awaited_once()
+        message.reply.assert_awaited_once_with("❌ 发布失败，请稍后再试一次。")
 
     async def test_concurrent_group_messages_reward_once(self):
         load_functions({"on_reward_group_message"}, self.namespace)
@@ -170,6 +256,178 @@ class TaohuaDatabaseTests(unittest.IsolatedAsyncioTestCase):
         user = await self.stores.users.get(1)
         self.assertEqual(user.expire_timestamp, NOW + 3600)
         self.assertEqual(user.group_message_timestamp, NOW)
+
+    async def test_send_batch_is_admin_only_and_replies_with_batch_content(self):
+        await self.stores.batches.upsert_channel_location(
+            "batch-test", -100200, 123, batch_content="批次内容"
+        )
+        media_items = [
+            {
+                "file_id": "file-2", "file_unique_id": "unique-2",
+                "file_type": "video", "duration": 2,
+                "source_chat_id": 99, "source_message_id": 2,
+                "thumb_file_id": "thumb-2",
+                "thumb_file_unique_id": "thumb-unique-2",
+            },
+            {
+                "file_id": "file-1", "file_unique_id": "unique-1",
+                "file_type": "video", "duration": 1,
+                "source_chat_id": 99, "source_message_id": 1,
+                "thumb_file_id": "thumb-1",
+                "thumb_file_unique_id": "thumb-unique-1",
+            },
+        ]
+        self.assertEqual(
+            await self.stores.received_media.claim_batch(
+                media_items, 99, "batch-test"
+            ),
+            [],
+        )
+        self.assertEqual(
+            await self.stores.received_media.accept_batch(
+                ["unique-1", "unique-2"], "batch-test"
+            ),
+            2,
+        )
+        send_photo = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        recover_file = AsyncMock(return_value="recovered-thumb-1")
+        request_x_man = AsyncMock(return_value="x-man-thumb-1")
+        backup_bot = SimpleNamespace(id=888)
+        namespace = {
+            "UserManager": UserManager,
+            "ADMIN_USER_IDS": {99},
+            "batch_store": self.stores.batches,
+            "received_media_store": self.stores.received_media,
+            "bot": SimpleNamespace(send_photo=send_photo),
+            "bkbot": backup_bot,
+            "media_text_sender": SimpleNamespace(_recover_file=recover_file),
+            "_request_x_man": request_x_man,
+            "_telegram_call_with_retry": self.telegram_call,
+        }
+        load_functions({"cmd_send_batch"}, namespace)
+
+        admin_message = SimpleNamespace(
+            from_user=SimpleNamespace(id=99),
+            chat=SimpleNamespace(id=99),
+            reply=AsyncMock(),
+        )
+        await namespace["cmd_send_batch"](
+            admin_message,
+            SimpleNamespace(args="batch-test"),
+        )
+        recover_file.assert_awaited_once_with(
+            namespace["bot"], backup_bot, "p", "thumb-1"
+        )
+        send_photo.assert_awaited_once_with(
+            chat_id=99,
+            photo="recovered-thumb-1",
+            caption="批次内容",
+        )
+        admin_message.reply.assert_not_awaited()
+        request_x_man.assert_not_awaited()
+
+        recover_file.reset_mock(side_effect=True)
+        recover_file.side_effect = RuntimeError("backup file unavailable")
+        send_photo.reset_mock()
+        await namespace["cmd_send_batch"](
+            admin_message,
+            SimpleNamespace(args="batch-test"),
+        )
+        request_x_man.assert_awaited_once_with("thumb-unique-1")
+        send_photo.assert_awaited_once_with(
+            chat_id=99,
+            photo="x-man-thumb-1",
+            caption="批次内容",
+        )
+
+        recover_file.reset_mock(side_effect=True)
+        request_x_man.reset_mock()
+        send_photo.reset_mock()
+        namespace["bkbot"] = None
+        await namespace["cmd_send_batch"](
+            admin_message,
+            SimpleNamespace(args="batch-test"),
+        )
+        recover_file.assert_not_awaited()
+        request_x_man.assert_awaited_once_with("thumb-unique-1")
+        send_photo.assert_awaited_once_with(
+            chat_id=99,
+            photo="x-man-thumb-1",
+            caption="批次内容",
+        )
+
+        regular_message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            reply=AsyncMock(),
+        )
+        await namespace["cmd_send_batch"](
+            regular_message,
+            SimpleNamespace(args="batch-test"),
+        )
+        regular_message.reply.assert_awaited_once_with("❌ 无效指令")
+
+        admin_message.reply.reset_mock()
+        await namespace["cmd_send_batch"](
+            admin_message,
+            SimpleNamespace(args="missing"),
+        )
+        admin_message.reply.assert_awaited_once_with("❌ 找不到批次：missing")
+
+    async def test_x_man_request_waits_for_matching_reply_content(self):
+        send_message = AsyncMock(return_value=SimpleNamespace(message_id=321))
+        namespace = {
+            "asyncio": asyncio,
+            "X_MAN_BOT_ID": 777,
+            "X_MAN_REQUEST_LOCK": asyncio.Lock(),
+            "X_MAN_PENDING_REPLY": None,
+            "X_MAN_PENDING_REQUEST_MESSAGE_ID": None,
+            "X_MAN_PENDING_FILE_UNIQUE_ID": None,
+            "X_MAN_REPLY_TIMEOUT_SECONDS": 1,
+            "bot": SimpleNamespace(send_message=send_message),
+            "_telegram_call_with_retry": self.telegram_call,
+        }
+        load_functions({"_request_x_man"}, namespace)
+
+        request = asyncio.create_task(
+            namespace["_request_x_man"]("thumb-unique-1")
+        )
+        await asyncio.sleep(0)
+        send_message.assert_awaited_once_with(777, "thumb-unique-1")
+        self.assertEqual(namespace["X_MAN_PENDING_REQUEST_MESSAGE_ID"], 321)
+        namespace["X_MAN_PENDING_REPLY"].set_result("reply-file-id")
+        self.assertEqual(await request, "reply-file-id")
+        self.assertIsNone(namespace["X_MAN_PENDING_REPLY"])
+
+    async def test_x_man_reply_returns_photo_file_id(self):
+        pending_reply = asyncio.get_running_loop().create_future()
+        namespace = {
+            "X_MAN_PENDING_REPLY": pending_reply,
+            "X_MAN_PENDING_REQUEST_MESSAGE_ID": 321,
+            "X_MAN_PENDING_FILE_UNIQUE_ID": "thumb-unique-1",
+        }
+        load_functions(
+            {"_get_x_man_reply_content", "on_x_man_reply"}, namespace
+        )
+        empty_media = {
+            name: None
+            for name in (
+                "video", "document", "audio", "voice", "animation", "sticker"
+            )
+        }
+        message = SimpleNamespace(
+            photo=[SimpleNamespace(file_id="reply-photo-id")],
+            text=None,
+            caption=None,
+            reply_to_message=SimpleNamespace(
+                message_id=321,
+                text="thumb-unique-1",
+                caption=None,
+            ),
+            **empty_media,
+        )
+        await namespace["on_x_man_reply"](message)
+        self.assertEqual(pending_reply.result(), "reply-photo-id")
 
     async def test_bonus_fills_peach_capacity_for_self_and_target(self):
         self.namespace.update(UserManager=UserManager, ParseUtils=ParseUtils,

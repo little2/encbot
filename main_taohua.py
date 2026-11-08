@@ -75,7 +75,7 @@ SUBSRCIBE_PREVIEW_CHANNEL_ID = int(os.getenv("SUBSRCIBE_PREVIEW_CHANNEL_ID",0))
 SUBSRCIBE_PREVIEW_GROUP_ID = int(os.getenv("SUBSRCIBE_PREVIEW_GROUP_ID", 0))
 
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
-X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
+X_MAN_BOT_ID = int(SharedConfig.get("x_man_bot_id", 0) or 0)
 KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
 BOT_TOKEN = SharedConfig.get("my_bot_token", "")
 CHAT_ROW = SharedConfig.get("chat","")
@@ -113,6 +113,11 @@ TAKEOFF_USER_LOCKS: dict[int, asyncio.Lock] = {}
 MESSAGE_REWARD_LOCKS: dict[int, asyncio.Lock] = {}
 JUHUA_JOIN_LOCKS: dict[int, asyncio.Lock] = {}
 JUHUA_JOIN_COST_MINUTES = 24 * 60
+X_MAN_REQUEST_LOCK = asyncio.Lock()
+X_MAN_PENDING_REPLY: asyncio.Future[str] | None = None
+X_MAN_PENDING_REQUEST_MESSAGE_ID: int | None = None
+X_MAN_PENDING_FILE_UNIQUE_ID: str | None = None
+X_MAN_REPLY_TIMEOUT_SECONDS = 30
 TAKEOFF_KICK_LOCKS: dict[int, asyncio.Lock] = {}
 TAKEOFF_KICK_ACTION_STATE: dict[tuple[int, int, int], str] = {}
 TAKEOFF_KICK_ORIGINAL_MARKUPS: dict[
@@ -493,6 +498,94 @@ async def say_hello_to_x_man(bot_name):
 	else:
 		print("❌ No SWITCHBOT_TOKEN found, skipping hello to X-Man bot.", flush=True)
 
+
+async def _request_x_man(file_unique_id: str) -> str | None:
+	global X_MAN_PENDING_REPLY
+	global X_MAN_PENDING_REQUEST_MESSAGE_ID, X_MAN_PENDING_FILE_UNIQUE_ID
+
+	if X_MAN_BOT_ID <= 0:
+		print("[X_MAN] x_man_bot_id is not configured", flush=True)
+		return None
+
+	async with X_MAN_REQUEST_LOCK:
+		pending_reply = asyncio.get_running_loop().create_future()
+		X_MAN_PENDING_REPLY = pending_reply
+		X_MAN_PENDING_FILE_UNIQUE_ID = file_unique_id
+		try:
+			request_message = await _telegram_call_with_retry(
+				"request thumbnail from X-Man Bot",
+				lambda: bot.send_message(X_MAN_BOT_ID, file_unique_id),
+				chat_id=X_MAN_BOT_ID,
+			)
+			X_MAN_PENDING_REQUEST_MESSAGE_ID = request_message.message_id
+			try:
+				return await asyncio.wait_for(
+					pending_reply,
+					timeout=X_MAN_REPLY_TIMEOUT_SECONDS,
+				)
+			except TimeoutError:
+				print(
+					f"[X_MAN] reply timed out for file_unique_id={file_unique_id}",
+					flush=True,
+				)
+				return None
+		except Exception as exc:
+			print(f"[X_MAN] request failed: {exc}", flush=True)
+			return None
+		finally:
+			if X_MAN_PENDING_REPLY is pending_reply:
+				X_MAN_PENDING_REPLY = None
+				X_MAN_PENDING_REQUEST_MESSAGE_ID = None
+				X_MAN_PENDING_FILE_UNIQUE_ID = None
+
+
+def _get_x_man_reply_content(message: Message) -> str:
+	if message.photo:
+		return str(message.photo[-1].file_id)
+	for media in (
+		message.video,
+		message.document,
+		message.audio,
+		message.voice,
+		message.animation,
+		message.sticker,
+	):
+		if media is not None:
+			return str(media.file_id)
+	return str(message.text or message.caption or "").strip()
+
+
+@dp.message(F.chat.type == "private", F.from_user.id == X_MAN_BOT_ID)
+async def on_x_man_reply(message: Message) -> None:
+	pending_reply = X_MAN_PENDING_REPLY
+	if pending_reply is None or pending_reply.done():
+		print("[X_MAN] received an unexpected reply", flush=True)
+		return
+
+	replied_message = message.reply_to_message
+	if replied_message is None:
+		print("[X_MAN] response is not a reply to a request", flush=True)
+		return
+	if (
+		X_MAN_PENDING_REQUEST_MESSAGE_ID is not None
+		and replied_message.message_id != X_MAN_PENDING_REQUEST_MESSAGE_ID
+	):
+		print("[X_MAN] reply does not match the pending request", flush=True)
+		return
+
+	replied_file_unique_id = str(
+		replied_message.text or replied_message.caption or ""
+	).strip()
+	if replied_file_unique_id != X_MAN_PENDING_FILE_UNIQUE_ID:
+		print("[X_MAN] reply file_unique_id does not match", flush=True)
+		return
+
+	reply_content = _get_x_man_reply_content(message)
+	if not reply_content:
+		print("[X_MAN] reply has no usable content", flush=True)
+		return
+	pending_reply.set_result(reply_content)
+
 async def _send_media_to_backup_bot(message: Message) -> None:
 	"""将完整媒体消息复制给 BACKUP_BOT_NAME，保留原媒体和说明文字。"""
 	global BACKUP_BOT_NAME
@@ -775,36 +868,94 @@ async def _record_taohua_upload(
 	post_message_id: int,
 	batch_content: str,
 	tags: str,
-) -> None:
-	"""将已发布投稿写入桃花版自己的 batch 与 received_media 表。"""
-	batch_saved = False
+) -> bool:
+	"""以单一事务保存已发布投稿及接受媒体。"""
 	try:
-		await batch_store.upsert_channel_location(
+		await database_stores.finalize_taohua_upload(
 			batch_id=batch_id,
 			channel_chat_id=CHAT_PUBLIC_GROUP_ID,
 			channel_message_id=int(post_message_id),
 			batch_content=batch_content,
 			tag=tags,
 			uploader_user_id=int(uploader_id),
+			file_unique_id=str(data.get("file_unique_id", "") or ""),
+			thumb_file_id=str(data.get("thumb_file_id", "") or ""),
+			thumb_file_unique_id=str(
+				data.get("thumb_file_unique_id", "") or ""
+			),
 		)
-		batch_saved = True
 	except Exception as exc:
-		print(f"[BATCH] 桃花投稿位置保存失败: {exc}", flush=True)
+		print(
+			f"[RECEIVED_MEDIA] 桃花投稿事务保存失败 "
+			f"(batch_id={batch_id}): {exc}",
+			flush=True,
+		)
+		return False
+	return True
 
+
+async def _ban_violating_intro(message: Message, text: str):
+	"""尽力删除违规消息；删除失败时仍继续封禁用户。"""
 	try:
-		accepted_count = await received_media_store.accept_batch(
-			[str(data.get("file_unique_id", "") or "")],
-			batch_id,
-		)
+		await message.delete()
 	except Exception as exc:
-		print(f"[RECEIVED_MEDIA] 桃花投稿确认失败: {exc}", flush=True)
+		print(
+			f"[BAN] failed to delete violating message "
+			f"message_id={message.message_id}: {exc}",
+			flush=True,
+		)
+	return await _ban_user(
+		user_id=message.from_user.id,
+		reason=f"投稿违规内容:{text} ",
+		created_by=0,
+		target_chats=TARGET_CHATS,
+	)
+
+
+async def _handle_intro_publish_failure(
+	message: Message,
+	state: FSMContext,
+	batch_id: str,
+	exc: Exception,
+) -> None:
+	if isinstance(exc, TelegramNetworkError):
+		# 网络超时不能证明 Telegram 没有发布成功。保留 pending 占用，
+		# 防止用户重试后产生重复公开帖子。
+		print(
+			f"[ENCODED_FORWARD] publish outcome unknown; "
+			f"batch_id={batch_id}: {exc}",
+			flush=True,
+		)
+		await state.clear()
+		try:
+			await message.reply(
+				"⚠️ 发布结果尚未确认，请勿重复投稿；管理员确认后会继续处理。"
+			)
+		except Exception as reply_exc:
+			print(
+				f"[ENCODED_FORWARD] notify uncertain publish failed: {reply_exc}",
+				flush=True,
+			)
 		return
 
-	if not batch_saved or accepted_count != 1:
+	print(f"[ENCODED_FORWARD] publish intro post failed: {exc}", flush=True)
+	try:
+		await received_media_store.release_pending_batch(batch_id)
+	except Exception as release_exc:
 		print(
-			f"[RECEIVED_MEDIA] 桃花投稿记录不完整 "
-			f"(batch_id={batch_id}, batch_saved={batch_saved}, "
-			f"accepted_count={accepted_count})",
+			f"[RECEIVED_MEDIA] 桃花投稿 pending 释放失败: {release_exc}",
+			flush=True,
+		)
+	await state.clear()
+	try:
+		await _telegram_call_with_retry(
+			"notify intro publish failure",
+			lambda: message.reply("❌ 发布失败，请稍后再试一次。"),
+			chat_id=message.chat.id,
+		)
+	except Exception as reply_exc:
+		print(
+			f"[ENCODED_FORWARD] notify publish failure failed: {reply_exc}",
 			flush=True,
 		)
 
@@ -847,13 +998,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 	check_result = censor.check_content(text)
 	if check_result == "ban":
 		print(f"[BAN] message banned: {text}")
-		await message.delete()
-		entry, group_ban_error = await _ban_user(
-			user_id=message.from_user.id,
-			reason=f"投稿违规内容:{text} ",
-			created_by=0,
-			target_chats=TARGET_CHATS,
-		)
+		await _ban_violating_intro(message, text)
 		return
 	else:
 		print(f"[ENCODED_FORWARD] message passed: {text}, check_result={check_result}")
@@ -970,10 +1115,12 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 				print(f"[ENCODED_FORWARD] thumbnail seek failed: {exc}", flush=True)
 			
 
-			print(f"thumb_result2_file_id={thumb_result.photo[-1].file_id}", flush=True)
-			
-			thumb_file_id = thumb_result.photo[-1].file_id
+			thumb_photo = thumb_result.photo[-1]
+			print(f"thumb_result2_file_id={thumb_photo.file_id}", flush=True)
+
+			thumb_file_id = thumb_photo.file_id
 			data["thumb_file_id"] = thumb_file_id
+			data["thumb_file_unique_id"] = thumb_photo.file_unique_id
 			
 
 
@@ -1052,27 +1199,10 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 			chat_id=CHAT_PUBLIC_GROUP_ID,
 		)
 	except Exception as exc:
-		# 发布失败（含限流）：清理 FSM 状态并提示重试，避免用户卡在介绍流程
-		print(f"[ENCODED_FORWARD] publish intro post failed: {exc}", flush=True)
-		try:
-			await received_media_store.release_pending_batch(batch_id)
-		except Exception as release_exc:
-			print(
-				f"[RECEIVED_MEDIA] 桃花投稿 pending 释放失败: {release_exc}",
-				flush=True,
-			)
-		await state.clear()
-		try:
-			await _telegram_call_with_retry(
-				"notify intro publish failure",
-				lambda: message.reply("❌ 发布失败（网络或 Telegram 限流），请稍后再试一次。"),
-				chat_id=message.chat.id,
-			)
-		except Exception as reply_exc:
-			print(f"[ENCODED_FORWARD] notify publish failure failed: {reply_exc}", flush=True)
+		await _handle_intro_publish_failure(message, state, batch_id, exc)
 		return
 
-	await _record_taohua_upload(
+	recorded = await _record_taohua_upload(
 		batch_id=batch_id,
 		data=data,
 		uploader_id=int(message.from_user.id),
@@ -1080,9 +1210,44 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		batch_content=text,
 		tags=tags_string,
 	)
+	if not recorded:
+		await state.clear()
+		try:
+			await message.reply(
+				"⚠️ 内容已发布，但数据库记录失败。请勿重复投稿，并联系管理员处理。"
+			)
+		except Exception as reply_exc:
+			print(
+				f"[RECEIVED_MEDIA] notify transaction failure failed: {reply_exc}",
+				flush=True,
+			)
+		return
 
 	# 将 post_item 置顶（带节流，见 _pin_intro_post）
 	await _pin_intro_post(post_item.message_id)
+
+	try:
+		pass
+	except Exception as exc:
+		pass
+
+
+	if SUBSRCIBE_PREVIEW_CHANNEL_ID != 0:
+		try:
+			thumb_result = await _telegram_call_with_retry(
+				"send to SUBSRCIBE_PREVIEW_CHANNEL_ID",
+				lambda: bot.send_photo(
+					chat_id=SUBSRCIBE_PREVIEW_CHANNEL_ID,
+					photo=data["thumb_file_id"],
+					caption=thumb_caption,
+					parse_mode="HTML",
+					reply_markup=thumb_reply_markup,
+					protect_content=True,
+				),
+				chat_id=SUBSRCIBE_PREVIEW_CHANNEL_ID,
+			)
+		except Exception as exc:
+			pass
 
 
 	# 因为初期已复制给 backup bot > xman, 因此媒体不直接到 peach_channel,而是用 thumb 送到 peach_channel
@@ -2834,6 +2999,7 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"/baninfo [用户id] — 查看黑名单资料",
 		"/banlist [页码] — 查看黑名单列表",		
 		"/userinfo [用户id] — 查询用户时限及黑名单状态",		
+		"/send_batch [batch_id] — 查看指定批次内容",
 		"/rule — 查看机场规则与奖励机制",		
 		"/start — 进入入口流程",		
 		"/admin — 查看管理员命令说明",
@@ -2841,7 +3007,76 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 	await message.reply("\n".join(lines))
 
 
-@dp.message(F.chat.type == "private", F.text == "加入菊花台")
+@dp.message(F.chat.type == "private", Command("send_batch"))
+async def cmd_send_batch(message: Message, command: CommandObject) -> None:
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		await message.reply("❌ 无效指令")
+		return
+
+	batch_id = str(command.args or "").strip()
+	if not batch_id or len(batch_id) > 64:
+		await message.reply("用法：/send_batch [batch_id]")
+		return
+
+	batch = await batch_store.get(batch_id)
+	if batch is None:
+		await message.reply(f"❌ 找不到批次：{batch_id}")
+		return
+
+	batch_content = str(batch.get("batch_content", "") or "").strip()
+	media_items = await received_media_store.get_media_by_batch_id(batch_id)
+	if not media_items:
+		await message.reply(f"❌ 批次没有媒体：{batch_id}")
+		return
+
+	thumb_file_id = str(media_items[0].get("thumb_file_id", "") or "").strip()
+	thumb_file_unique_id = str(media_items[0].get("thumb_file_unique_id", "") or "").strip()
+	if not thumb_file_id:
+		await message.reply(f"❌ 批次第一笔媒体没有缩略图：{batch_id}")
+		return
+	recovered_thumb_file_id = None
+	if bkbot is not None:
+		try:
+			recovered_thumb_file_id = await media_text_sender._recover_file(
+				bot,
+				bkbot,
+				"p",
+				thumb_file_id,
+			)
+		except Exception as exc:
+			print(f"[SEND_BATCH] backup recovery failed: {exc}", flush=True)
+	else:
+		print("[SEND_BATCH] backup Bot is not configured", flush=True)
+
+	if not recovered_thumb_file_id:
+		if not thumb_file_unique_id:
+			await message.reply(f"❌ 批次第一笔媒体没有缩略图唯一编号：{batch_id}")
+			return
+		print(
+			f"[SEND_BATCH] requesting X Bot with "
+			f"thumb_file_unique_id={thumb_file_unique_id}",
+			flush=True,
+		)
+		recovered_thumb_file_id = await _request_x_man(thumb_file_unique_id)
+		if not recovered_thumb_file_id:
+			await message.reply("❌ 无法从 X Bot 取得缩略图")
+			return
+
+	print(f"recovered_thumb_file_id={recovered_thumb_file_id}", flush=True)
+
+	await _telegram_call_with_retry(
+		"send batch thumbnail",
+		lambda: bot.send_photo(
+			chat_id=message.chat.id,
+			photo=recovered_thumb_file_id,
+			caption=batch_content or None,
+		),
+		chat_id=message.chat.id,
+	)
+
+
+
+
 @dp.message(F.chat.type == "private", Command("join_juhua"))
 async def cmd_join_juhua(message: Message) -> None:
 	if not message.from_user:
@@ -3528,8 +3763,7 @@ async def main() -> None:
 				[
 					BotCommand(command="me", description="查询我的信息"),
 					BotCommand(command="rule", description="查看村规"),
-					BotCommand(command="home", description="回村"),
-					BotCommand(command="join_juhua", description="加入菊花台"),
+					BotCommand(command="home", description="回村")
 				],
 				scope=BotCommandScopeAllPrivateChats(),
 			),

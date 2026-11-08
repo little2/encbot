@@ -48,8 +48,8 @@ def _build_dispatcher(
 	@dispatcher.message(F.chat.type == "private")
 	async def copy_message(message: Message) -> None:
 		if x_man_bot_id is not None:
-			# result = await message.copy_to(chat_id=x_man_bot_id)
-			# print(f"🎒 Message copied to x_man_bot_id={x_man_bot_id}: {result}", flush=True)
+			result = await message.copy_to(chat_id=x_man_bot_id)
+			print(f"🎒 Message copied to x_man_bot_id={x_man_bot_id}: {result}", flush=True)
 			pass
 
 	return dispatcher

@@ -16,6 +16,8 @@ import sqlite3
 import time
 from typing import Any, Protocol, runtime_checkable
 
+from asyncpg import Pool
+
 from config import MAX_HP_CAPACITY_MINUTES
 from utils.blacklist_utils import BlacklistEntry
 from utils.user_utils import UserExpire
@@ -344,6 +346,22 @@ class _BlacklistStore:
                 ORDER BY created_at ASC, user_id ASC
             """, len(prefix), prefix, int(time.time()))
             return [_blacklist_entry(row) for row in rows]
+
+
+class _BorrowedPostgresDatabase:
+    def __init__(self, pool: Pool):
+        self.pool = pool
+
+    @asynccontextmanager
+    async def transaction(self, *, write=False):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
+
+
+def blacklist_store_from_pool(pool: Pool) -> BlacklistStore:
+    """Use an existing asyncpg pool without initializing schema or owning the pool."""
+    return _BlacklistStore(_BorrowedPostgresDatabase(pool))
 
 
 @dataclass

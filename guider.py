@@ -129,7 +129,7 @@ async def on_media(
     if await blacklist_store.is_blocked(message.from_user.id):
         return
     upload_count = await batch_store.count_by_uploader(message.from_user.id)
-    tower = "zttower12bot" if upload_count >= 30 else "zttower18bot"
+    tower = "zttower12bot" if upload_count >= 30 else "xiaolongyang_lite_bot"
 
     text = f'''
 📢 各位旅客请注意：

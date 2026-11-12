@@ -5883,7 +5883,7 @@ async def _send_lobby_welcome(user: User) -> None:
 		f"🎉 欢迎抵达航站大厅，{mention}！\n\n"
 		"🏢 航站大厅(本群)：与其他旅客交流，发言可延长飞行通行证。\n"
 		"🛫 飞机场：查看航班并获取资源。\n"
-		"🛍️ 免税店：不会直接展示预览图，也可与其他旅客交流，发言也可延长飞行通行证。\n"
+		"🛍️ 免税店：不会直接展示预览图，也可与其他旅客交流，发言也可延长飞行通行证。(整修中)\n"
 		"🗼 塔台：提交、分享资源与邀请他人。\n"
 		"请先和其他旅客进行有内容的交流。问候语、刷屏或为了取得时数而发送的无意义内容不会获得奖励。\n\n"
 		"祝你候机愉快，航程顺利。"
@@ -5896,31 +5896,33 @@ async def _send_lobby_welcome(user: User) -> None:
 		if bot_name
 		else "https://t.me/ztTowerRobot"
 	)
-	duty_free_url = tower_url
-	if AIRPORT_DUTY_FREE_GROUP_ID != 0:
-		try:
-			duty_free_url = await _get_or_create_chat_invite_link(
-				chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
-				link_key="airport-duty-free-approved",
-				link_name="airport-duty-free-approved-url",
-				creates_join_request=True,
-			)
-		except Exception as exc:
-			print(
-				f"[AIRPORT_INVITE] duty free invite creation failed: {exc}",
-				flush=True,
-			)
+	# 免税店
+	# duty_free_url = tower_url
+	# if AIRPORT_DUTY_FREE_GROUP_ID != 0:
+	# 	try:
+	# 		duty_free_url = await _get_or_create_chat_invite_link(
+	# 			chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
+	# 			link_key="airport-duty-free-approved",
+	# 			link_name="airport-duty-free-approved-url",
+	# 			creates_join_request=True,
+	# 		)
+	# 	except Exception as exc:
+	# 		print(
+	# 			f"[AIRPORT_INVITE] duty free invite creation failed: {exc}",
+	# 			flush=True,
+	# 		)
 	welcome_keyboard = InlineKeyboardMarkup(
 		inline_keyboard=[
 			[
 				InlineKeyboardButton(text="🛫 飞机场", url=airport_url),
-				InlineKeyboardButton(text="🛍️ 免税店", url=duty_free_url),
+				# InlineKeyboardButton(text="🛍️ 免税店", url=duty_free_url),
 			],
 			[
 				InlineKeyboardButton(text="🗼 塔台", url=tower_url),
 				InlineKeyboardButton(text="🪧 指路牌", url="https://telegra.ph/zfly-10-27"),
 			],
 		],
+		
 	)
 
 	if TRADE_IMAGE_PATHS[0].is_file():

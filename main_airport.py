@@ -892,9 +892,10 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 
 def _build_keyboard() -> InlineKeyboardMarkup:
 	tower_bot_name = str(bot_name or "").strip().lstrip("@")
-	buttons = [
-		InlineKeyboardButton(text="🈲 立即停飞", callback_data="takeoff:ban"),
-	]
+	# buttons = [
+	# 	InlineKeyboardButton(text="🈲 立即停飞", callback_data="takeoff:ban"),
+	# ]
+	buttons = []
 	if tower_bot_name:
 		buttons.append(
 			InlineKeyboardButton(
@@ -1112,8 +1113,8 @@ async def _build_controls_keyboard(state: dict[str, Any], encoded: str) -> Inlin
 
 	now_timestamp = int(app_now().timestamp())
 	user_expire = await user_expire_cache.get(int(owner_user_id))
-	if not user_expire or user_expire.expire_timestamp <= now_timestamp:
-		
+	# if not user_expire or user_expire.expire_timestamp <= now_timestamp:
+	if True:
 		rows = [
 			[
 				InlineKeyboardButton(

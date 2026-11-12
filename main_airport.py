@@ -171,6 +171,11 @@ AIRPORT_LOBBY_GROUP_ID = int(AIRPORT_LOBBY_GROUP_ID or 0)
 zttower_duty_free_group = _get_shared_chat_config("zttower_duty_free_group")
 AIRPORT_DUTY_FREE_GROUP_ID =  int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", str(zttower_duty_free_group.get("chat_id", 0))))
 AIRPORT_DUTY_FREE_GROUP_ID = int(AIRPORT_DUTY_FREE_GROUP_ID or 0)
+# 开启后暂时关闭免税店入群申请及欢迎消息中的入口。
+AIRPORT_DUTY_FREE_MAINTENANCE = (
+	os.getenv("AIRPORT_DUTY_FREE_MAINTENANCE", "false").strip().lower()
+	in {"1", "true", "yes", "on"}
+)
 
 zttower_airport_flight_board_channel = _get_shared_chat_config("zttower_airport_flight_board_channel")
 AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", str(zttower_airport_flight_board_channel.get("chat_id", 0))))
@@ -5862,9 +5867,21 @@ async def _process_join_request(context: AirportJoinContext) -> None:
 
 	await _after_join_approved(context)
 
-
 @dp.chat_join_request(F.chat.id.in_({AIRPORT_LOBBY_GROUP_ID, TERMINAL_CHANNEL_ID, AIRPORT_DUTY_FREE_GROUP_ID}))
 async def on_airport_join_request(join_request: ChatJoinRequest) -> None:
+	if (
+		AIRPORT_DUTY_FREE_MAINTENANCE
+		and AIRPORT_DUTY_FREE_GROUP_ID != 0
+		and int(join_request.chat.id) == AIRPORT_DUTY_FREE_GROUP_ID
+	):
+		try:
+			await bot.decline_chat_join_request(
+				chat_id=join_request.chat.id,
+				user_id=join_request.from_user.id,
+			)
+		except Exception as exc:
+			print(f"[DUTY_FREE] join rejection failed: {exc}", flush=True)
+		return
 	context = _build_join_context(join_request)
 	if context.is_paid_invite:
 		_prune_used_paid_invites()
@@ -5883,7 +5900,8 @@ async def _send_lobby_welcome(user: User) -> None:
 		f"🎉 欢迎抵达航站大厅，{mention}！\n\n"
 		"🏢 航站大厅(本群)：与其他旅客交流，发言可延长飞行通行证。\n"
 		"🛫 飞机场：查看航班并获取资源。\n"
-		"🛍️ 免税店：不会直接展示预览图，也可与其他旅客交流，发言也可延长飞行通行证。(整修中)\n"
+		"🛍️ 免税店：不会直接展示预览图，也可与其他旅客交流，发言也可延长飞行通行证。"
+		f"{'(整修中)' if AIRPORT_DUTY_FREE_MAINTENANCE else ''}\n"
 		"🗼 塔台：提交、分享资源与邀请他人。\n"
 		"请先和其他旅客进行有内容的交流。问候语、刷屏或为了取得时数而发送的无意义内容不会获得奖励。\n\n"
 		"祝你候机愉快，航程顺利。"
@@ -5896,33 +5914,31 @@ async def _send_lobby_welcome(user: User) -> None:
 		if bot_name
 		else "https://t.me/ztTowerRobot"
 	)
-	# 免税店
-	# duty_free_url = tower_url
-	# if AIRPORT_DUTY_FREE_GROUP_ID != 0:
-	# 	try:
-	# 		duty_free_url = await _get_or_create_chat_invite_link(
-	# 			chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
-	# 			link_key="airport-duty-free-approved",
-	# 			link_name="airport-duty-free-approved-url",
-	# 			creates_join_request=True,
-	# 		)
-	# 	except Exception as exc:
-	# 		print(
-	# 			f"[AIRPORT_INVITE] duty free invite creation failed: {exc}",
-	# 			flush=True,
-	# 		)
+	first_row = [InlineKeyboardButton(text="🛫 飞机场", url=airport_url)]
+	if not AIRPORT_DUTY_FREE_MAINTENANCE:
+		duty_free_url = tower_url
+		if AIRPORT_DUTY_FREE_GROUP_ID != 0:
+			try:
+				duty_free_url = await _get_or_create_chat_invite_link(
+					chat_id=AIRPORT_DUTY_FREE_GROUP_ID,
+					link_key="airport-duty-free-approved",
+					link_name="airport-duty-free-approved-url",
+					creates_join_request=True,
+				)
+			except Exception as exc:
+				print(
+					f"[AIRPORT_INVITE] duty free invite creation failed: {exc}",
+					flush=True,
+				)
+		first_row.append(InlineKeyboardButton(text="🛍️ 免税店", url=duty_free_url))
 	welcome_keyboard = InlineKeyboardMarkup(
 		inline_keyboard=[
-			[
-				InlineKeyboardButton(text="🛫 飞机场", url=airport_url),
-				# InlineKeyboardButton(text="🛍️ 免税店", url=duty_free_url),
-			],
+			first_row,
 			[
 				InlineKeyboardButton(text="🗼 塔台", url=tower_url),
 				InlineKeyboardButton(text="🪧 指路牌", url="https://telegra.ph/zfly-10-27"),
 			],
 		],
-		
 	)
 
 	if TRADE_IMAGE_PATHS[0].is_file():

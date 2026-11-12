@@ -8,8 +8,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 from typing import Protocol, runtime_checkable
+from asyncpg import Pool
 
-from utils.async_stores import DatabaseStores, create_stores
+from utils.async_stores import DatabaseStores, _BorrowedPostgresDatabase, create_stores
 from utils.invite_link_utils import SharedInviteLink
 
 
@@ -112,6 +113,11 @@ def _invite(row) -> SharedInviteLink | None:
         invite_link=str(row["invite_link"]), name=str(row["name"]),
         created_at=int(row["created_at"]), validated_at=int(row["validated_at"]),
     )
+
+
+def batch_store_from_pool(pool: Pool) -> BatchStore:
+    """Query existing batch data without initializing schema or owning the pool."""
+    return _BatchStore(_BorrowedPostgresDatabase(pool))
 
 
 class _BatchStore:

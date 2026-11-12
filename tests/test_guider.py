@@ -8,6 +8,7 @@ from aiogram import Bot
 from aiogram.types import Update
 
 from shared_config import SharedConfig
+from utils.airport_async_stores import batch_store_from_pool
 from utils.async_stores import blacklist_store_from_pool, create_stores
 
 with patch.object(SharedConfig, "load"):
@@ -18,6 +19,7 @@ class GuiderMessageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bot = Bot(token="123456:TEST_TOKEN")
         self.blacklist = SimpleNamespace(is_blocked=AsyncMock(return_value=False))
+        self.batches = SimpleNamespace(count_by_uploader=AsyncMock(return_value=7))
         self.request = AsyncMock(return_value=True)
         self.request_patch = patch.object(self.bot.session, "make_request", self.request)
         self.request_patch.start()
@@ -37,7 +39,9 @@ class GuiderMessageTests(unittest.IsolatedAsyncioTestCase):
                 **content,
             },
         }, context={"bot": self.bot})
-        await guider.dp.feed_update(self.bot, update, blacklist_store=self.blacklist)
+        await guider.dp.feed_update(
+            self.bot, update, blacklist_store=self.blacklist, batch_store=self.batches,
+        )
 
     def assert_reply_text(self, text):
         self.assertEqual(self.request.await_count, 1)
@@ -48,13 +52,23 @@ class GuiderMessageTests(unittest.IsolatedAsyncioTestCase):
     async def test_text_gets_text_reply(self):
         await self.feed_message({"text": "你好"})
         self.blacklist.is_blocked.assert_awaited_once_with(456)
-        self.assert_reply_text("收到文字信息。")
+        self.batches.count_by_uploader.assert_awaited_once_with(456)
+        self.assertEqual(self.request.await_count, 1)
+        text = self.request.await_args.args[1].text
+        self.assertIn("📤 上传批次数：7", text)
+        self.assertIn("请先提供一份资源", text)
+
+    async def test_user_with_no_uploads_sees_zero(self):
+        self.batches.count_by_uploader.return_value = 0
+        await self.feed_message({"text": "你好"})
+        self.assertIn("📤 上传批次数：0", self.request.await_args.args[1].text)
 
     async def test_blocked_text_gets_no_reply(self):
         self.blacklist.is_blocked.return_value = True
         await self.feed_message({"text": "你好"})
         self.blacklist.is_blocked.assert_awaited_once_with(456)
         self.request.assert_not_awaited()
+        self.batches.count_by_uploader.assert_not_awaited()
 
     async def test_text_without_sender_is_not_processed(self):
         with self.assertLogs(level="WARNING"):
@@ -88,8 +102,17 @@ class GuiderMessageTests(unittest.IsolatedAsyncioTestCase):
             "photo": [{"file_id": "id", "file_unique_id": "unique", "width": 1, "height": 1}],
             "caption": "说明文字",
         })
-        self.assert_reply_text("收到媒体信息。")
-        self.blacklist.is_blocked.assert_not_awaited()
+        self.assert_reply_text("收到媒体信息。\n📤 上传批次数：7")
+        self.blacklist.is_blocked.assert_awaited_once_with(456)
+        self.batches.count_by_uploader.assert_awaited_once_with(456)
+
+    async def test_blocked_media_does_not_query_upload_count(self):
+        self.blacklist.is_blocked.return_value = True
+        await self.feed_message({
+            "photo": [{"file_id": "id", "file_unique_id": "unique", "width": 1, "height": 1}],
+        })
+        self.batches.count_by_uploader.assert_not_awaited()
+        self.request.assert_not_awaited()
 
     async def test_video_note_gets_media_reply(self):
         await self.feed_message({
@@ -97,7 +120,7 @@ class GuiderMessageTests(unittest.IsolatedAsyncioTestCase):
                 "file_id": "id", "file_unique_id": "unique", "length": 1, "duration": 1,
             },
         })
-        self.assert_reply_text("收到媒体信息。")
+        self.assert_reply_text("收到媒体信息。\n📤 上传批次数：7")
 
 
 class GuiderStartupTests(unittest.IsolatedAsyncioTestCase):
@@ -110,18 +133,23 @@ class GuiderStartupTests(unittest.IsolatedAsyncioTestCase):
         db = SimpleNamespace(fetchval=AsyncMock(return_value=1), close=AsyncMock())
         bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
         blacklist = SimpleNamespace(is_blocked=AsyncMock())
+        batches = SimpleNamespace(count_by_uploader=AsyncMock())
         with (
             patch.dict("os.environ", {"GUIDER_BOT_TOKEN": "token", "DATABASE_URL": "postgresql://test"}),
             patch.object(guider, "Bot", return_value=bot),
             patch.object(guider.asyncpg, "create_pool", new=AsyncMock(return_value=db)) as create_pool,
             patch.object(guider, "blacklist_store_from_pool", return_value=blacklist) as make_blacklist,
+            patch.object(guider, "batch_store_from_pool", return_value=batches) as make_batches,
             patch.object(guider.dp, "start_polling", new=AsyncMock()) as poll,
         ):
             await guider.main()
         create_pool.assert_awaited_once_with(dsn="postgresql://test", min_size=1, max_size=5)
         db.fetchval.assert_awaited_once_with("SELECT 1")
         make_blacklist.assert_called_once_with(db)
-        poll.assert_awaited_once_with(bot, blacklist_store=blacklist, close_bot_session=False)
+        make_batches.assert_called_once_with(db)
+        poll.assert_awaited_once_with(
+            bot, blacklist_store=blacklist, batch_store=batches, close_bot_session=False,
+        )
         db.close.assert_awaited_once()
         bot.session.close.assert_awaited_once()
 
@@ -173,6 +201,21 @@ class BorrowedBlacklistStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args.args[1:], (456, 100))
         conn.transaction.assert_called_once()
         pool.acquire.assert_called_once()
+        pool.close.assert_not_called()
+
+
+class BorrowedBatchStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_counts_uploads_for_sender_using_existing_pool(self):
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value={"total": 7})
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__.return_value = conn
+        store = batch_store_from_pool(pool)
+
+        self.assertEqual(await store.count_by_uploader(456), 7)
+        conn.fetchrow.assert_awaited_once_with(
+            "SELECT COUNT(*) AS total FROM batch WHERE uploader_user_id = $1", 456,
+        )
         pool.close.assert_not_called()
 
 

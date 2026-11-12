@@ -43,6 +43,23 @@ class GuiderMessageTests(unittest.IsolatedAsyncioTestCase):
             self.bot, update, blacklist_store=self.blacklist, batch_store=self.batches,
         )
 
+    async def test_service_command_replies_with_service_station(self):
+        for text in ("/service", "/service 连络地勤大叔"):
+            with self.subTest(text=text):
+                self.request.reset_mock()
+                await self.feed_message({"text": text})
+                self.assertEqual(self.request.await_count, 1)
+                self.assertEqual(
+                    self.request.await_args.args[1].text, "服务站: @ztTowerServiceBOT",
+                )
+        self.batches.count_by_uploader.assert_not_awaited()
+
+    async def test_blocked_service_command_gets_no_reply(self):
+        self.blacklist.is_blocked.return_value = True
+        await self.feed_message({"text": "/service"})
+        self.blacklist.is_blocked.assert_awaited_once_with(456)
+        self.request.assert_not_awaited()
+
     async def test_text_gets_text_reply(self):
         await self.feed_message({"text": "你好"})
         self.blacklist.is_blocked.assert_awaited_once_with(456)

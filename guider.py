@@ -20,6 +20,7 @@ import signal
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
@@ -144,6 +145,15 @@ async def on_media(
     await message.reply(text, protect_content=True)
 
 
+@dp.message(Command("service"))
+async def on_service(message: Message, blacklist_store: BlacklistStore) -> None:
+    if not message.from_user:
+        return
+    if await blacklist_store.is_blocked(message.from_user.id):
+        return
+    await message.reply("服务站: @ztTowerServiceBOT")
+
+
 @dp.message(F.text)
 async def on_text(message: Message, blacklist_store: BlacklistStore) -> None:
     if not message.from_user:
@@ -176,6 +186,7 @@ async def main() -> None:
         await bot.set_my_commands(
 			[
 				BotCommand(command="start", description="开始"),
+				BotCommand(command="service", description="连络地勤大叔"),
 			],
 			scope=BotCommandScopeAllPrivateChats(),
 		)

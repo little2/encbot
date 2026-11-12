@@ -20,7 +20,7 @@ import signal
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 from yarl import URL
@@ -172,6 +172,15 @@ async def main() -> None:
 
     bot = Bot(token=token)
     try:
+
+        await bot.set_my_commands(
+			[
+				BotCommand(command="start", description="开始"),
+			],
+			scope=BotCommandScopeAllPrivateChats(),
+		)
+
+
         db = await asyncpg.create_pool(dsn=database_url, min_size=1, max_size=5)
         try:
             await db.fetchval("SELECT 1")

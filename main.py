@@ -7,11 +7,7 @@ load_dotenv(
 )
 import asyncio
 
-
-
 PROGRAM = os.getenv("PROGRAM")
-
-
 
 if PROGRAM == "TAOHUA":
 	print("\n\nRunning TAOHUA program")

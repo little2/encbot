@@ -16,6 +16,8 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+from aiogram.methods import GetMe
 from utils.airport_async_stores import create_airport_stores
 from utils.postgres_backup import get_backup_directory
 from utils.database_admin import DatabaseAdminCommands
@@ -525,10 +527,13 @@ class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ns.update(AIRPORT_LOBBY_GROUP_ID=0, TERMINAL_CHANNEL_ID=0, AIRPORT_DUTY_FREE_GROUP_ID=0,
                   AIRPORT_FLIGHT_BOARD_CHANNEL_ID=0, APRON_CHANNEL_IDS=[],
                   ControlPanel=Mock(return_value=SimpleNamespace(check_bot_group_admin_permissions=AsyncMock())),
-                  SharedConfig=SimpleNamespace(get_all=lambda: {}), _telegram_call_with_retry=AsyncMock(),
+                  SharedConfig=SimpleNamespace(get_all=lambda: {}),
+                  ENCODED_FORWARD_SEND_LOCK=asyncio.Lock(),
+                  TelegramNetworkError=TelegramNetworkError, TelegramRetryAfter=TelegramRetryAfter,
+                  _update_lobby_description=AsyncMock(),
                   BotCommand=Mock(), BotCommandScopeAllPrivateChats=Mock())
         ns['bot'].set_my_commands = AsyncMock()
-        return load_functions({"main", "_report_backup_bot_exit"}, ns)
+        return load_functions({"main", "_report_backup_bot_exit", "_telegram_call_with_retry"}, ns)
 
     async def test_database_initialization_failure_closes_session(self):
         ns = self.namespace()
@@ -543,6 +548,64 @@ class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ns = self.namespace()
         ns["bot"].get_me.side_effect = RuntimeError("Telegram unavailable")
         await ns["main"]()
+        ns["database_stores"].close.assert_awaited_once()
+        ns["bot"].session.close.assert_awaited_once()
+        ns["bot"].get_me.assert_awaited_once()
+        ns["dp"].start_polling.assert_not_awaited()
+
+    async def test_startup_retries_network_failure_then_polls(self):
+        ns = self.namespace()
+        ns["bot"].get_me.side_effect = [
+            TelegramNetworkError(GetMe(), "connection unavailable"),
+            SimpleNamespace(username="airport_test"),
+        ]
+        with (
+            patch.dict(os.environ, {"VIDEO_BOT_ENABLED": "false"}),
+            patch.object(ns["asyncio"], "sleep", new=AsyncMock()) as sleep,
+        ):
+            await ns["main"]()
+        self.assertEqual(ns["bot"].get_me.await_count, 2)
+        sleep.assert_awaited_once_with(2)
+        ns["dp"].start_polling.assert_awaited_once_with(ns["bot"])
+        ns["database_stores"].close.assert_awaited_once()
+        ns["bot"].session.close.assert_awaited_once()
+
+    async def test_startup_network_retry_exhaustion_closes_resources(self):
+        ns = self.namespace()
+        ns["bot"].get_me.side_effect = TelegramNetworkError(GetMe(), "connection unavailable")
+        with patch.object(ns["asyncio"], "sleep", new=AsyncMock()) as sleep:
+            await ns["main"]()
+        self.assertEqual(ns["bot"].get_me.await_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [2, 4, 8])
+        ns["dp"].start_polling.assert_not_awaited()
+        ns["database_stores"].close.assert_awaited_once()
+        ns["bot"].session.close.assert_awaited_once()
+
+    async def test_startup_retries_rate_limit(self):
+        ns = self.namespace()
+        ns["bot"].get_me.side_effect = [
+            TelegramRetryAfter(GetMe(), "rate limited", retry_after=3),
+            SimpleNamespace(username="airport_test"),
+        ]
+        with (
+            patch.dict(os.environ, {"VIDEO_BOT_ENABLED": "false"}),
+            patch.object(ns["asyncio"], "sleep", new=AsyncMock()) as sleep,
+        ):
+            await ns["main"]()
+        self.assertEqual(ns["bot"].get_me.await_count, 2)
+        sleep.assert_awaited_once_with(4)
+        ns["dp"].start_polling.assert_awaited_once_with(ns["bot"])
+        ns["database_stores"].close.assert_awaited_once()
+        ns["bot"].session.close.assert_awaited_once()
+
+    async def test_cancel_during_network_retry_closes_resources(self):
+        ns = self.namespace()
+        ns["bot"].get_me.side_effect = TelegramNetworkError(GetMe(), "connection unavailable")
+        with patch.object(ns["asyncio"], "sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await ns["main"]()
+        ns["bot"].get_me.assert_awaited_once()
+        ns["dp"].start_polling.assert_not_awaited()
         ns["database_stores"].close.assert_awaited_once()
         ns["bot"].session.close.assert_awaited_once()
 

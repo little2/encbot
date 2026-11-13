@@ -4,6 +4,21 @@ from utils.emoji_utils import EmojiUtils
 
 
 class EmojiUtilsTests(unittest.TestCase):
+    def test_strip_leading_emoji_brackets_handles_combined_emojis(self):
+        for text in (
+            "[👒🎤🚋📢🌀🕞👁️🤼‍♂️][番外篇]网调",
+            "[👩🏽‍💻🇨🇳1️⃣][番外篇]网调",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    EmojiUtils.strip_leading_emoji_brackets(text), "[番外篇]网调",
+                )
+
+    def test_strip_leading_emoji_brackets_preserves_text_brackets(self):
+        for text in ("[番外篇]网调", "[👁️番外篇]网调", "[]网调", "[👁️网调", "正文[👁️]", ""):
+            with self.subTest(text=text):
+                self.assertEqual(EmojiUtils.strip_leading_emoji_brackets(text), text)
+
     def test_strip_consecutive_emojis_removes_leading_run(self) -> None:
         text = "😀😀😀😀😀😀😀😀说明文字"
         self.assertEqual(EmojiUtils.strip_consecutive_emojis(text), "说明文字")

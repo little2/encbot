@@ -10,6 +10,22 @@ class EmojiUtils:
     )
 
     @classmethod
+    def strip_leading_emoji_brackets(cls, text: str) -> str:
+        """移除开头仅含 Emoji 的方括号，支持变体、肤色和 ZWJ 组合。"""
+        if not text.startswith("["):
+            return text
+        closing = text.find("]", 1)
+        if closing <= 1:
+            return text
+        index = 1
+        while index < closing:
+            end = cls._consume_emoji(text, index)
+            if end is None or end > closing:
+                return text
+            index = end
+        return text[closing + 1:]
+
+    @classmethod
     def strip_consecutive_emojis(cls, text: str, count: int = 8) -> str:
         """去掉字符串中连续达到阈值的 emoji 段落。"""
         if not text:

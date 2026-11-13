@@ -15,6 +15,7 @@ import base64
 from email.mime import message
 import hashlib
 import hmac
+
 import json
 import re
 import asyncio
@@ -34,7 +35,7 @@ from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import imagehash
-from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, html
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import (
@@ -62,6 +63,7 @@ from utils.control_panel import ControlPanel
 from utils.utf_utils import UtfConverter
 from utils.format_utils import FormatUtils
 from utils.parse_utils import ParseUtils
+from utils.emoji_utils import EmojiUtils
 from utils.user_manager import AsyncUserManager, UserManager
 from utils.blacklist_utils import BlacklistEntry
 from utils.async_stores import BlacklistStore, UserExpireStore
@@ -171,11 +173,14 @@ AIRPORT_LOBBY_GROUP_ID = int(AIRPORT_LOBBY_GROUP_ID or 0)
 zttower_duty_free_group = _get_shared_chat_config("zttower_duty_free_group")
 AIRPORT_DUTY_FREE_GROUP_ID =  int(os.getenv("AIRPORT_DUTY_FREE_GROUP_ID", str(zttower_duty_free_group.get("chat_id", 0))))
 AIRPORT_DUTY_FREE_GROUP_ID = int(AIRPORT_DUTY_FREE_GROUP_ID or 0)
+
 # 开启后暂时关闭免税店入群申请及欢迎消息中的入口。
 AIRPORT_DUTY_FREE_MAINTENANCE = (
 	os.getenv("AIRPORT_DUTY_FREE_MAINTENANCE", "false").strip().lower()
 	in {"1", "true", "yes", "on"}
 )
+
+AIRPORT_EXTRA_CODE_MAINTENANCE = True
 
 zttower_airport_flight_board_channel = _get_shared_chat_config("zttower_airport_flight_board_channel")
 AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", str(zttower_airport_flight_board_channel.get("chat_id", 0))))
@@ -3110,7 +3115,7 @@ async def _finish_upload(
 		"sent_revision": 0,
 		"send_status": "idle",
 		"send_confirm_pending": False,
-		"batch_content": "",
+		"batch_content": str(session.get("batch_content", "") or "").strip(),
 		"editing_content": False,
 		"selected_tags": [],
 		"tag_draft": [],
@@ -6234,6 +6239,19 @@ async def on_x_man_reply(message: Message) -> None:
 	pending_reply.set_result(_get_x_man_reply_file_id(message))
 
 
+def _extract_caption(message: Message) -> dict[str, str]:
+	"""打印并返回 caption 开头至首个 💽 或 📹 之前的内容。"""
+	print(f"{message}",flush=True)
+	caption = message.caption or ""
+	if not caption:
+		return {}
+	positions = [position for marker in ("💽", "📹","📦") if (position := caption.find(marker)) >= 0]
+	content = caption[:min(positions, default=len(caption))]
+	content = EmojiUtils.strip_leading_emoji_brackets(content)
+	print(content, flush=True)
+	return {"content": content}
+
+
 @dp.message(
 	F.chat.type == "private",
 	F.document | F.photo | F.video | F.audio | F.voice | F.animation | F.sticker,
@@ -6260,7 +6278,7 @@ async def on_media(message: Message) -> None:
 
 	try:
 		file_type, file_id = _extract_media_info(message)
-
+		media_info = _extract_caption(message)
 
 		global receive_file_id
 		receive_file_id = file_id
@@ -6308,6 +6326,9 @@ async def on_media(message: Message) -> None:
 		await _notify_media_limit(message, "系统正在处理较多媒体，请稍后再试")
 		return
 
+	caption_content = str(media_info.get("content", "") or "").strip()
+	if caption_content and not session.get("batch_content"):
+		session["batch_content"] = caption_content
 	session["accepted_count"] = int(session["accepted_count"]) + 1
 	USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
 
@@ -7427,16 +7448,33 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				int(callback.from_user.id),
 			)
 			if value == "edit":
+				_batch_content = state['batch_content'] or ""
+				orignal_text = ""
+				button_set = []
+
+				if _batch_content:
+					orignal_text = f"当前内容: \n<a href=\"https://t.me/{bot_name}?text={_batch_content}\">{escape(_batch_content)}</a>\n\n" 
+					button_set.append([
+						InlineKeyboardButton(
+							text="📋 复制",
+							copy_text=CopyTextButton(text=f"{escape(_batch_content)}"),
+						)
+					])
+
+				orignal_text +="📌 请输入内容介绍（5–250 字），完成后送出："
+
+				button_set.append([
+					InlineKeyboardButton(
+						text="返回",
+						callback_data="enc:content:back",
+					)
+				])
+
+
 				await callback.message.edit_text(
-					"📌 请输入内容介绍（5–250 字），完成后送出：",
-					reply_markup=InlineKeyboardMarkup(
-						inline_keyboard=[[
-							InlineKeyboardButton(
-								text="返回",
-								callback_data="enc:content:back",
-							),
-						]],
-					),
+					orignal_text,
+					parse_mode="HTML",
+					reply_markup=InlineKeyboardMarkup(inline_keyboard=button_set),
 				)
 				state["editing_content"] = True
 				ENCODER_CONTENT_INPUT_STATE[content_input_key] = state_key
@@ -7722,45 +7760,46 @@ async def on_text(message: Message) -> None:
 
 
 
+	if not AIRPORT_EXTRA_CODE_MAINTENANCE or (UserManager._is_admin_message(message, ADMIN_USER_IDS)):
+		batch_id = _extract_takeoff_batch_id(text)
+		if batch_id:
+			# print(f"batch_id={batch_id}", flush=True)
+			try:
+				preview_settings = await _get_batch_preview_message_settings(batch_id)
+				preview_settings["chat_id"] = int(message.chat.id)
+				preview_settings["user_id"] = int(message.from_user.id)
+				await _send_encoded_preview_message(preview_settings)
+			except ValueError as exc:
+				await message.reply(str(exc))
+			except Exception as exc:
+				print(f"[TAKEOFF] batch preview delivery failed: {exc}", flush=True)
+				await message.reply("批次縮圖傳送失敗，請稍後再試。")
+			return
+
+		if len(text) < 15:
+			return
+
+		
 
 
-	batch_id = _extract_takeoff_batch_id(text)
-	if batch_id:
-		# print(f"batch_id={batch_id}", flush=True)
 		try:
-			preview_settings = await _get_batch_preview_message_settings(batch_id)
-			preview_settings["chat_id"] = int(message.chat.id)
-			preview_settings["user_id"] = int(message.from_user.id)
-			await _send_encoded_preview_message(preview_settings)
-		except ValueError as exc:
-			await message.reply(str(exc))
+			print(f"[ENCODED_TEXT] text={text}", flush=True)
+			parse_text = text
+			START = "⟦["
+			END = "]⟧"
+			pattern = re.escape(START) + r"(.*?)" + re.escape(END)
+			matches = re.findall(pattern, text, flags=re.S)
+
+			for item in matches:
+				parse_text = item.strip()
+				break
+
+			await extract_encode(parse_text, message)
+
 		except Exception as exc:
-			print(f"[TAKEOFF] batch preview delivery failed: {exc}", flush=True)
-			await message.reply("批次縮圖傳送失敗，請稍後再試。")
-		return
-
-	if len(text) < 15:
-		return
-
-	
-
-
-	try:
-		print(f"[ENCODED_TEXT] text={text}", flush=True)
-		parse_text = text
-		START = "⟦["
-		END = "]⟧"
-		pattern = re.escape(START) + r"(.*?)" + re.escape(END)
-		matches = re.findall(pattern, text, flags=re.S)
-
-		for item in matches:
-			parse_text = item.strip()
-			break
-
-		await extract_encode(parse_text, message)
-
-	except Exception as exc:
-		await message.reply(f"❌ 解码或解析失败: {exc}")
+			await message.reply(f"❌ 解码或解析失败: {exc}")
+	else:
+		await message.reply("功能维护中")
 
 async def say_hello_to_x_man(bot_name):
 
@@ -7836,7 +7875,7 @@ async def main() -> None:
 	try:
 		await _initialize_database()
 		try:
-			me = await bot.get_me()
+			me = await _telegram_call_with_retry("main bot get_me", bot.get_me)
 			bot_name = str(getattr(me, "username", "") or "").strip().lstrip("@")
 			if not bot_name:
 				raise RuntimeError("Telegram get_me 未返回机器人用户名，停止启动")

@@ -1032,9 +1032,13 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			]]
 		)
 		thumb_caption = ""
-		thumb_caption = f'🌼 {html.escape(text)} '
+		thumb_caption_complete = f'🌼 {html.escape(text)} '
 		if tags_string:
-			thumb_caption = f"{thumb_caption}\n\n{html.escape(tags_string)}"
+			thumb_caption_complete = f"{thumb_caption}\n\n{html.escape(tags_string)}"
+
+		# todo 
+
+		thumb_caption = f'🌼 嫩菊初放 '
 
 		try:
 			if SUBSRCIBE_PREVIEW_CHANNEL_ID != 0:
@@ -1088,7 +1092,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 							buffer.getvalue(),
 							filename="thumbnail.jpg",
 						),
-						caption=thumb_caption,
+						caption=thumb_caption_complete,
 						parse_mode="HTML",
 						reply_markup=thumb_reply_markup,
 						protect_content=True,
@@ -1104,7 +1108,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 							buffer.getvalue(),
 							filename="thumbnail.jpg",
 						),
-						caption=thumb_caption,
+						caption=thumb_caption_complete,
 						parse_mode="HTML",
 						reply_markup=thumb_reply_markup,
 						protect_content=True,

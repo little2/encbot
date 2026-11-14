@@ -6348,7 +6348,7 @@ def _extract_caption(message: Message) -> dict:
 	if tag_string:
 		tag_dic = parse_bj_tag_for_file(tag_string)
 
-	positions = [position for marker in ("💽", "📹","📦") if (position := caption.find(marker)) >= 0]
+	positions = [position for marker in ("🖼️","💽", "📹","📦") if (position := caption.find(marker)) >= 0]
 	content = caption[:min(positions, default=len(caption))]
 	content = EmojiUtils.strip_leading_emoji_brackets(content)
 

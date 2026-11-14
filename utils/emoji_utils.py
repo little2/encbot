@@ -1,4 +1,18 @@
 class EmojiUtils:
+    # Unicode Emoji 中有一部分字符位于主要 Emoji 区段之外。
+    _EMOJI_BASES = frozenset({
+        0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139,
+        0x231A, 0x231B, 0x2328, 0x23CF,
+        *range(0x23E9, 0x23F4),
+        *range(0x23F8, 0x23FB),
+        0x24C2, 0x25AA, 0x25AB, 0x25B6, 0x25C0,
+        *range(0x25FB, 0x25FF),
+        0x2934, 0x2935,
+        *range(0x2B05, 0x2B08),
+        0x2B1B, 0x2B1C, 0x2B50, 0x2B55,
+        0x3030, 0x303D, 0x3297, 0x3299,
+    })
+
     _EMOJI_RANGES = (
         (0x2190, 0x21FF),
         (0x2600, 0x27BF),
@@ -98,7 +112,9 @@ class EmojiUtils:
     def _is_emoji_base(cls, codepoint: int) -> bool:
         if 0x1F3FB <= codepoint <= 0x1F3FF:
             return False
-        return any(start <= codepoint <= end for start, end in cls._EMOJI_RANGES)
+        return codepoint in cls._EMOJI_BASES or any(
+            start <= codepoint <= end for start, end in cls._EMOJI_RANGES
+        )
 
     @staticmethod
     def _consume_emoji_suffix(text: str, index: int) -> int:

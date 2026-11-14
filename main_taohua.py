@@ -1032,13 +1032,13 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 			]]
 		)
 		thumb_caption = ""
-		thumb_caption_complete = f'🌼 {html.escape(text)} '
+		thumb_caption = f'🌼 {html.escape(text)} '
 		if tags_string:
-			thumb_caption_complete = f"{thumb_caption}\n\n{html.escape(tags_string)}"
+			thumb_caption = f"{thumb_caption}\n\n{html.escape(tags_string)}"
 
 		# todo 
 
-		thumb_caption = f'🌼 嫩菊初放 '
+		
 
 		try:
 			if SUBSRCIBE_PREVIEW_CHANNEL_ID != 0:
@@ -1092,7 +1092,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 							buffer.getvalue(),
 							filename="thumbnail.jpg",
 						),
-						caption=thumb_caption_complete,
+						caption=thumb_caption,
 						parse_mode="HTML",
 						reply_markup=thumb_reply_markup,
 						protect_content=True,
@@ -1108,7 +1108,7 @@ async def on_intro_text(message: Message, state: FSMContext) -> None:
 							buffer.getvalue(),
 							filename="thumbnail.jpg",
 						),
-						caption=thumb_caption_complete,
+						caption=thumb_caption,
 						parse_mode="HTML",
 						reply_markup=thumb_reply_markup,
 						protect_content=True,
@@ -1171,6 +1171,30 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 	post_text = f'🌼 {html.escape(text)}<a href="{html.escape(url, quote=True)}">ㅤ</a> '
 	if tags_string:
 		post_text = f"{post_text}\n{html.escape(tags_string)}"
+
+	# todo
+	tags_string2 = tags_string
+	if "偷拍" in tags_string:
+		tags_string2=tags_string2.replace("偷拍","窥桃")
+		alter = "隔墙偷看桃花影，未敢惊春一瓣红。"
+	if "婴幼儿" in tags_string:
+		alter = "桃蕾初含三月雨，未经风暖已生春。"
+		tags_string2=tags_string2.replace("婴幼儿","新芽")
+	if "网路调教" in tags_string:
+		tags_string2=tags_string2.replace("网路调教","驯枝")
+		alter = "隔屏传令驯花枝，千里桃香听指挥。"
+	if "监视器" in tags_string:
+		tags_string2=tags_string2.replace("监视器","暗菊")
+		alter = "暗窗自有菊花眼，日夜窥春不语声。"
+	if "享受被操" in tags_string:
+		tags_string2=tags_string2.replace("享受被操","承露")
+		alter = "甘为春泥承雨露，任凭桃枝入花深。"
+	if "喊痛或哭" in tags_string:
+		tags_string2=tags_string2.replace("喊痛或哭","泣花")
+		alter = "菊畔风急花含泪，几声啼露诉春寒。"
+		
+	post_text = f'🌼 {alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a> '	
+	post_text = f"{post_text}\n{html.escape(tags_string2)}"
 
 	try:
 		batch_id = await _claim_taohua_upload(data, int(message.from_user.id))

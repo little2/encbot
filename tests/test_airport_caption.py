@@ -15,7 +15,7 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
         tree = ast.parse(source.read_text())
         names = {
             "parse_bj_tag_for_file", "_extract_caption", "_normalize_tag_list",
-            "_ordered_tags", "on_media", "_finish_upload",
+            "_ordered_tags", "_update_upload_panel", "on_media", "_finish_upload",
         }
         nodes = [node for node in tree.body if isinstance(
             node, (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -30,6 +30,8 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
             "UPLOAD_SESSIONS": {}, "USER_MEDIA_PENDING": {}, "ENCODER_UI_STATE": {},
             "USER_MEDIA_LOCKS": {}, "DEFAULT_TAG_CHOICES": [],
             "MAX_USER_PENDING": 10, "MAX_BATCH_MEDIA": 10, "MEDIA_QUEUE": asyncio.Queue(),
+            "bot": SimpleNamespace(edit_message_text=AsyncMock()),
+            "_upload_keyboard": lambda *, processing=False: {"processing": processing},
             "_extract_media_info": lambda message: ("video", str(message.message_id)),
             "_extract_media_unique_id": lambda message: str(message.message_id),
             "_notify_media_limit": AsyncMock(),
@@ -110,8 +112,42 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
         session = self.ns["UPLOAD_SESSIONS"][(123, 456)]
         self.assertEqual(session["accepted_count"], 3)
         self.assertEqual(session["file_unique_ids"], {"1", "2", "3"})
+        self.assertEqual(sum(message.reply.await_count for message in messages), 1)
+        self.assertEqual(self.ns["bot"].edit_message_text.await_count, 2)
         queued_sessions = [
             (await self.ns["MEDIA_QUEUE"].get())[1]
             for _ in range(3)
         ]
         self.assertTrue(all(queued_session is session for queued_session in queued_sessions))
+
+    async def test_single_media_shows_panel_before_background_processing(self):
+        message = self.message(None)
+        await self.upload(message)
+
+        session = self.ns["UPLOAD_SESSIONS"][(123, 456)]
+        message.reply.assert_awaited_once()
+        panel_text = message.reply.await_args.args[0]
+        self.assertIn("📥 已接收 1 个媒体", panel_text)
+        self.assertIn("正在处理 1 个媒体", panel_text)
+        self.assertEqual(
+            message.reply.await_args.kwargs["reply_markup"],
+            {"processing": True},
+        )
+        self.assertEqual(session["items"], [])
+
+    async def test_processed_media_updates_existing_panel(self):
+        message = self.message(None)
+        await self.upload(message)
+        session = self.ns["UPLOAD_SESSIONS"][(123, 456)]
+        session["items"].append({"file_id": "1", "file_type": "video"})
+
+        await self.ns["_update_upload_panel"](message, session)
+
+        update_text = self.ns["bot"].edit_message_text.await_args.kwargs["text"]
+        self.assertIn("📥 已接收 1 个媒体", update_text)
+        self.assertIn("继续发送媒体", update_text)
+        self.assertNotIn("正在处理", update_text)
+        self.assertEqual(
+            self.ns["bot"].edit_message_text.await_args.kwargs["reply_markup"],
+            {"processing": False},
+        )

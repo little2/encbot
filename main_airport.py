@@ -3009,13 +3009,13 @@ async def _handle_cancel_encoded(
 	await callback.answer("配置已关闭" if was_sent else "已取消")
 
 
-def _upload_keyboard() -> InlineKeyboardMarkup:
+def _upload_keyboard(*, processing: bool = False) -> InlineKeyboardMarkup:
 	return InlineKeyboardMarkup(
 		inline_keyboard=[
 			[
 				InlineKeyboardButton(
-					text="⚙️ 上传已完成，进入配置",
-					callback_data="enc:upload:done",
+					text="⏳ 媒体处理中" if processing else "⚙️ 上传已完成，进入配置",
+					callback_data="enc:nothing" if processing else "enc:upload:done",
 				),
 			],
 			[
@@ -3059,14 +3059,20 @@ async def _notify_media_limit(
 
 
 async def _update_upload_panel(message: Message, session: dict[str, Any]) -> None:
-	count = len(session["items"])
-	next_step_text = (
-		"本批次已达上传上限，请点击“上传完成”进入编辑菜单。"
-		if count >= MAX_BATCH_MEDIA
-		else "继续发送媒体，或点击“上传完成”进入编辑菜单。"
+	processed_count = len(session["items"])
+	accepted_count = max(
+		processed_count,
+		int(session.get("accepted_count", processed_count)),
 	)
+	pending_count = max(0, accepted_count - processed_count)
+	if pending_count:
+		next_step_text = f"正在处理 {pending_count} 个媒体，请稍候。"
+	elif accepted_count >= MAX_BATCH_MEDIA:
+		next_step_text = "本批次已达上传上限，请点击“上传完成”进入编辑菜单。"
+	else:
+		next_step_text = "继续发送媒体，或点击“上传完成”进入编辑菜单。"
 	text = (
-		f"📥 已收到 {count} 个媒体 ( 不同系列请一定要分开传，每批次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
+		f"📥 已接收 {accepted_count} 个媒体 ( 不同系列请一定要分开传，每批次最多 {MAX_BATCH_MEDIA} 个 )\n\n"
 		f"{next_step_text}"
 	)
 	panel_message_id = session.get("panel_message_id")
@@ -3075,11 +3081,14 @@ async def _update_upload_panel(message: Message, session: dict[str, Any]) -> Non
 			chat_id=message.chat.id,
 			message_id=int(panel_message_id),
 			text=text,
-			reply_markup=_upload_keyboard(),
+			reply_markup=_upload_keyboard(processing=pending_count > 0),
 		)
 		return
 
-	panel = await message.reply(text, reply_markup=_upload_keyboard())
+	panel = await message.reply(
+		text,
+		reply_markup=_upload_keyboard(processing=pending_count > 0),
+	)
 	session["panel_message_id"] = panel.message_id
 
 
@@ -6434,6 +6443,11 @@ async def on_media(message: Message) -> None:
 			)
 		session["accepted_count"] = int(session["accepted_count"]) + 1
 		USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
+		try:
+			# 入队后立即给用户反馈；后续媒体只更新同一个面板。
+			await _update_upload_panel(message, session)
+		except Exception as exc:
+			print(f"[UPLOAD_PANEL] immediate update failed: {exc}", flush=True)
 
 
 def _build_takeoff_admin_keyboard(

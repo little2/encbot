@@ -7609,7 +7609,10 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				# return
 			# todo 标签一定要选择,至少选3个标签
 			selected_tags = state.get("selected_tags", [])
-			if len(selected_tags) < 3:
+
+			is_admin = callback.from_user.id in ADMIN_USER_IDS
+			
+			if len(selected_tags) < 3 and not is_admin:
 				state["send_confirm_pending"] = False
 				pending_reason_text += "\n❌ 必须选择至少三个标签。"
 				# await callback.answer(

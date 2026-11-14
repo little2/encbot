@@ -6357,19 +6357,6 @@ async def on_media(message: Message) -> None:
 		return
 
 	key = (message.chat.id, message.from_user.id)
-	if USER_MEDIA_PENDING.get(key, 0) >= MAX_USER_PENDING:
-		await _notify_media_limit(message, "发送速度过快，请稍后再试")
-		return
-
-	session = UPLOAD_SESSIONS.get(key)
-	if session and int(session["accepted_count"]) >= MAX_BATCH_MEDIA:
-		await _notify_media_limit(
-			message,
-			"每批最多上传 10 个媒体，多余媒体未加入",
-			show_cancel_upload=True,
-		)
-		return
-
 	try:
 		file_type, file_id = _extract_media_info(message)
 		media_info = _extract_caption(message)
@@ -6387,50 +6374,66 @@ async def on_media(message: Message) -> None:
 		await _notify_media_limit(message, "此媒体已经收过，本批未计入")
 		return
 
-	if not session:
-		session = {
-			"items": [],
-			"file_unique_ids": set(),
-			"accepted_count": 0,
-			"processed_count": 0,
-			"tag_dic": [],
-			"panel_message_id": None,
-			"cancel_notice_message_ids": set(),
-		}
-		UPLOAD_SESSIONS[key] = session
+	lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())
+	async with lock:
+		if USER_MEDIA_PENDING.get(key, 0) >= MAX_USER_PENDING:
+			await _notify_media_limit(message, "发送速度过快，请稍后再试")
+			return
 
-	file_unique_ids = session.setdefault(
-		"file_unique_ids",
-		{
-			str(item.get("file_unique_id", ""))
-			for item in session.get("items", [])
-		},
-	)
+		# 必须在锁内重新读取；多个相册项目会并发进入此处理器。
+		session = UPLOAD_SESSIONS.get(key)
+		if session and int(session["accepted_count"]) >= MAX_BATCH_MEDIA:
+			await _notify_media_limit(
+				message,
+				"每批最多上传 10 个媒体，多余媒体未加入",
+				show_cancel_upload=True,
+			)
+			return
 
-	if file_unique_id in file_unique_ids:
-		await _notify_media_limit(message, "此媒体已在当前批次中，本批未重复加入")
-		return
-	file_unique_ids.add(file_unique_id)
+		if not session:
+			session = {
+				"items": [],
+				"file_unique_ids": set(),
+				"accepted_count": 0,
+				"processed_count": 0,
+				"tag_dic": [],
+				"panel_message_id": None,
+				"cancel_notice_message_ids": set(),
+			}
+			UPLOAD_SESSIONS[key] = session
 
-	try:
-		MEDIA_QUEUE.put_nowait((message, session))
-	except asyncio.QueueFull:
-		file_unique_ids.discard(file_unique_id)
-		if int(session["accepted_count"]) == 0:
-			UPLOAD_SESSIONS.pop(key, None)
-		await _notify_media_limit(message, "系统正在处理较多媒体，请稍后再试")
-		return
-
-	caption_content = str(media_info.get("content", "") or "").strip()
-	if caption_content and not session.get("batch_content"):
-		session["batch_content"] = caption_content
-	media_tags = _normalize_tag_list(media_info.get("tag_dic", []))
-	if media_tags:
-		session["tag_dic"] = _ordered_tags(
-			_normalize_tag_list(session.get("tag_dic", [])) + media_tags
+		file_unique_ids = session.setdefault(
+			"file_unique_ids",
+			{
+				str(item.get("file_unique_id", ""))
+				for item in session.get("items", [])
+			},
 		)
-	session["accepted_count"] = int(session["accepted_count"]) + 1
-	USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
+
+		if file_unique_id in file_unique_ids:
+			await _notify_media_limit(message, "此媒体已在当前批次中，本批未重复加入")
+			return
+		file_unique_ids.add(file_unique_id)
+
+		try:
+			MEDIA_QUEUE.put_nowait((message, session))
+		except asyncio.QueueFull:
+			file_unique_ids.discard(file_unique_id)
+			if int(session["accepted_count"]) == 0:
+				UPLOAD_SESSIONS.pop(key, None)
+			await _notify_media_limit(message, "系统正在处理较多媒体，请稍后再试")
+			return
+
+		caption_content = str(media_info.get("content", "") or "").strip()
+		if caption_content and not session.get("batch_content"):
+			session["batch_content"] = caption_content
+		media_tags = _normalize_tag_list(media_info.get("tag_dic", []))
+		if media_tags:
+			session["tag_dic"] = _ordered_tags(
+				_normalize_tag_list(session.get("tag_dic", [])) + media_tags
+			)
+		session["accepted_count"] = int(session["accepted_count"]) + 1
+		USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
 
 
 def _build_takeoff_admin_keyboard(

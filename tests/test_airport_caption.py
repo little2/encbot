@@ -13,7 +13,10 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         source = Path(__file__).resolve().parents[1] / "main_airport.py"
         tree = ast.parse(source.read_text())
-        names = {"_extract_caption", "on_media", "_finish_upload"}
+        names = {
+            "parse_bj_tag_for_file", "_extract_caption", "_normalize_tag_list",
+            "_ordered_tags", "on_media", "_finish_upload",
+        }
         nodes = [node for node in tree.body if isinstance(
             node, (ast.FunctionDef, ast.AsyncFunctionDef)
         ) and node.name in names]
@@ -25,6 +28,7 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
             "blacklist_store": SimpleNamespace(is_blocked=AsyncMock(return_value=False)),
             "received_media_store": SimpleNamespace(is_accepted=AsyncMock(return_value=False)),
             "UPLOAD_SESSIONS": {}, "USER_MEDIA_PENDING": {}, "ENCODER_UI_STATE": {},
+            "USER_MEDIA_LOCKS": {}, "DEFAULT_TAG_CHOICES": [],
             "MAX_USER_PENDING": 10, "MAX_BATCH_MEDIA": 10, "MEDIA_QUEUE": asyncio.Queue(),
             "_extract_media_info": lambda message: ("video", str(message.message_id)),
             "_extract_media_unique_id": lambda message: str(message.message_id),
@@ -37,7 +41,7 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
 
     def message(self, caption, message_id=1):
         return SimpleNamespace(
-            caption=caption, message_id=message_id,
+            text=None, entities=[], caption=caption, caption_entities=[], message_id=message_id,
             chat=SimpleNamespace(id=123), from_user=SimpleNamespace(id=456),
             reply=AsyncMock(return_value=SimpleNamespace(message_id=99)),
         )
@@ -85,3 +89,29 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
         await self.upload(self.message("重复媒体介绍💽详情"))
         self.assertEqual(self.ns["UPLOAD_SESSIONS"], {})
         self.assertTrue(self.ns["MEDIA_QUEUE"].empty())
+
+    async def test_concurrent_album_items_share_one_upload_session(self):
+        all_checked = asyncio.Event()
+        check_count = 0
+
+        async def is_accepted(_file_unique_id):
+            nonlocal check_count
+            check_count += 1
+            if check_count == 3:
+                all_checked.set()
+            await all_checked.wait()
+            return False
+
+        self.ns["received_media_store"].is_accepted.side_effect = is_accepted
+        messages = [self.message(None, message_id) for message_id in (1, 2, 3)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            await asyncio.gather(*(self.ns["on_media"](message) for message in messages))
+
+        session = self.ns["UPLOAD_SESSIONS"][(123, 456)]
+        self.assertEqual(session["accepted_count"], 3)
+        self.assertEqual(session["file_unique_ids"], {"1", "2", "3"})
+        queued_sessions = [
+            (await self.ns["MEDIA_QUEUE"].get())[1]
+            for _ in range(3)
+        ]
+        self.assertTrue(all(queued_session is session for queued_session in queued_sessions))

@@ -3097,6 +3097,9 @@ async def _finish_upload(
 		for item in items
 		if item.get("file_type") == "video"
 	]
+	default_tags = _ordered_tags(
+		_normalize_tag_list(session.get("tag_dic", []))
+	)
 
 	state = {
 		"owner_user_id": key[1],
@@ -3117,8 +3120,8 @@ async def _finish_upload(
 		"send_confirm_pending": False,
 		"batch_content": str(session.get("batch_content", "") or "").strip(),
 		"editing_content": False,
-		"selected_tags": [],
-		"tag_draft": [],
+		"selected_tags": default_tags,
+		"tag_draft": list(default_tags),
 	}
 	token, encoded, parsed = _build_token_and_encoded(state)
 	state["token"] = token
@@ -6239,17 +6242,108 @@ async def on_x_man_reply(message: Message) -> None:
 	pending_reply.set_result(_get_x_man_reply_file_id(message))
 
 
-def _extract_caption(message: Message) -> dict[str, str]:
+
+def parse_bj_tag_for_file(tag_str):
+    tag_cn_list = []
+    if tag_str:
+       # 将 tag_str 按空白符号分割
+        tag_list = tag_str.split()
+        for tag in tag_list:
+            # 移除 tag 前的 #
+            tag = tag.lstrip('#')
+
+            tag_mapping = {
+                "白种人": "白人",
+                "黑种人": "黑人",
+                "露脸": "有露脸",
+                "遮挡": "带了面罩",
+                "未露脸": "没有露脸",
+                "无毛": "高年级_小五",
+                "中毛": "少年_高中",
+                "黑森林": "少年_高中",
+                "幼儿": "低年级_小二",
+                "小学": "低年级_小二",
+                "初中": "初毛",
+                "高中": "少年_高中",
+                "合法": "少年_高中",
+                "清水": "没有裸体",
+                "写真": "正太主题汇整",
+                "动画": "卡通动漫",
+                "母子": "正太与阿姨",
+                "肛交": "爆菊",
+                "口交": "口交",
+                "足交": "恋足",
+                "自撸": "撸管",
+                "射精": "射精",
+                "展示": "正太独秀",
+                "摸": "手交",
+                "偷拍": "偷拍",
+                "胖太": "胖太",
+                "TK挠痒": "瘙痒",
+                "SP打屁股": "打屁股",
+                "恋物": "恋物",
+                "猎奇重口": "猎奇",
+                "医学类": "医学",
+                "霸凌": "霸凌",
+                "监视": "监视器",
+                "直播录屏": "直播",
+                "冰淇淋": "冰淇淋",
+                "奶黄包": "奶黄包",
+                "眼镜哥": "眼镜哥系列",
+                "西边的风":"西边的风",
+                "日本全方位":"日本全方位",
+                "小孩不笨":"小孩不笨",  #
+                "网调大神":"网调大神",  #
+                "猫系列":"猫系列",
+                "雨花石":"雨花石系列",
+                "早点睡觉caodidi":"Caodidi系列",
+                "BB嵬":"BB嵬",
+                "we出品":"WE系列",
+                "堂山天草":"堂山",
+                "么么哒视频":"么么哒视频", #
+                "么么哒举牌原创":"么么哒举牌原创", #
+                "小6童模":"小六摄影",
+                "ledi二维码":"二维码系列"
+            }
+
+            # 替换标签
+            tag = tag_mapping.get(tag, tag)  # 如果 tag 不在映射中，就保留原值
+            tag_cn_list.append(tag)
+
+    return tag_cn_list
+
+
+def _extract_caption(message: Message) -> dict:
 	"""打印并返回 caption 开头至首个 💽 或 📹 之前的内容。"""
 	print(f"{message}",flush=True)
+	tag_string = ""
+	for text, entities in (
+		(message.text or "", message.entities or []),
+		(message.caption or "", message.caption_entities or []),
+	):
+		# Telegram 的 entity 偏移和长度以 UTF-16 编码单元计算。
+		encoded_text = text.encode("utf-16-le")
+		for entity in entities:
+			if getattr(entity.type, "value", entity.type) == "hashtag":
+				tag = encoded_text[
+					entity.offset * 2:(entity.offset + entity.length) * 2
+				].decode("utf-16-le")
+				tag_string += f" {tag}"
+
+
 	caption = message.caption or ""
 	if not caption:
 		return {}
+
+	tag_dic = []
+	if tag_string:
+		tag_dic = parse_bj_tag_for_file(tag_string)
+
 	positions = [position for marker in ("💽", "📹","📦") if (position := caption.find(marker)) >= 0]
 	content = caption[:min(positions, default=len(caption))]
 	content = EmojiUtils.strip_leading_emoji_brackets(content)
-	print(content, flush=True)
-	return {"content": content}
+
+	return {"content": content, "tag_dic": tag_dic}
 
 
 @dp.message(
@@ -6299,6 +6393,7 @@ async def on_media(message: Message) -> None:
 			"file_unique_ids": set(),
 			"accepted_count": 0,
 			"processed_count": 0,
+			"tag_dic": [],
 			"panel_message_id": None,
 			"cancel_notice_message_ids": set(),
 		}
@@ -6329,6 +6424,11 @@ async def on_media(message: Message) -> None:
 	caption_content = str(media_info.get("content", "") or "").strip()
 	if caption_content and not session.get("batch_content"):
 		session["batch_content"] = caption_content
+	media_tags = _normalize_tag_list(media_info.get("tag_dic", []))
+	if media_tags:
+		session["tag_dic"] = _ordered_tags(
+			_normalize_tag_list(session.get("tag_dic", [])) + media_tags
+		)
 	session["accepted_count"] = int(session["accepted_count"]) + 1
 	USER_MEDIA_PENDING[key] = USER_MEDIA_PENDING.get(key, 0) + 1
 

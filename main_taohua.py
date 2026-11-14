@@ -1321,7 +1321,7 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		)
 		base_timestamp = max(now_timestamp, previous_expire_timestamp)
 		action_notify_text = ""
-		if "享受被操" in tags_string:
+		if "xxyyx" in tags_string:
 			requested_minutes = MEDIA_UPLOAD_EXTEND_MINUTES * 4
 			action_notify_text = "🗿 活动奖励馈赠成功！"
 		else:

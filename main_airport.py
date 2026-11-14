@@ -334,6 +334,7 @@ ENCODER_CONTENT_INPUT_STATE: dict[
 UPLOAD_SESSIONS: dict[tuple[int, int], dict[str, Any]] = {}
 USER_MEDIA_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 USER_MEDIA_PENDING: dict[tuple[int, int], int] = {}
+PENDING_THUMBNAIL_TASKS: dict[int, asyncio.Task[None]] = {}
 OVERFLOW_NOTICE_TIME: dict[tuple[int, int], float] = {}
 TAKEOFF_COUNTER_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 TAKEOFF_COUNTS: dict[tuple[int, int], int] = {}
@@ -2914,6 +2915,7 @@ async def _handle_send_encoded(
 	if not encoded_snapshot:
 		await callback.answer("当前密文无效，请重新上传", show_alert=True)
 		return
+	await _wait_for_pending_thumbnails(list(state.get("items", [])))
 	items_snapshot = [dict(item) for item in state.get("items", [])]
 	batch_content_snapshot = str(state.get("batch_content", "") or "").strip()
 	if not items_snapshot:
@@ -3156,29 +3158,60 @@ async def _finish_upload(
 		UPLOAD_SESSIONS.pop(key, None)
 
 
+async def _prepare_queued_media_thumbnail(
+	item: dict[str, Any],
+	forward_task: MediaForwardTask,
+	thumb_file_id: str,
+) -> None:
+	item_key = id(item)
+	try:
+		thumb_phash, thumb_bytes = await _prepare_thumbnail(thumb_file_id)
+		item["thumb_phash"] = thumb_phash
+		_enqueue_media_forward(MediaForwardTask(
+			from_chat_id=forward_task.from_chat_id,
+			message_id=forward_task.message_id,
+			file_id=forward_task.file_id,
+			file_type=forward_task.file_type,
+			file_unique_id=forward_task.file_unique_id,
+			thumb_bytes=thumb_bytes,
+			thumb_phash=thumb_phash or None,
+		))
+	finally:
+		current_task = PENDING_THUMBNAIL_TASKS.get(item_key)
+		if current_task is asyncio.current_task():
+			PENDING_THUMBNAIL_TASKS.pop(item_key, None)
+
+
+async def _wait_for_pending_thumbnails(items: list[dict[str, Any]]) -> None:
+	tasks = {
+		task
+		for item in items
+		if (task := PENDING_THUMBNAIL_TASKS.get(id(item))) is not None
+	}
+	if tasks:
+		await asyncio.gather(*tasks)
+
+
 async def _process_queued_media(
 	message: Message,
 	expected_session: dict[str, Any],
-) -> MediaForwardTask | None:
+) -> None:
 	if not message.from_user:
-		return None
+		return
 	key = (message.chat.id, message.from_user.id)
 	lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())
 
 	async with lock:
 		session = UPLOAD_SESSIONS.get(key)
 		if session is not expected_session:
-			return None
+			return
 		file_type, file_id = _extract_media_info(message)
 		file_unique_id = _extract_media_unique_id(message)
 		# 根据上传的媒体取得预览图的信息
 		preview_info = _extract_preview_info(message, file_type, file_id)
-		thumb_phash, thumb_bytes = await _prepare_thumbnail(
-			str(preview_info.get("thumb_file_id", "")),
-		)
-		preview_info["thumb_phash"] = thumb_phash
+		preview_info["thumb_phash"] = ""
 		media_metadata = _extract_media_metadata(message, file_type)
-		session["items"].append({
+		item = {
 			"file_id": file_id,
 			"file_unique_id": file_unique_id,
 			"file_type": file_type,
@@ -3186,19 +3219,25 @@ async def _process_queued_media(
 			"source_message_id": int(message.message_id),
 			**media_metadata,
 			**preview_info,
-		})
+		}
+		session["items"].append(item)
 		session["processed_count"] = int(session.get("processed_count", 0)) + 1
 
 		await _update_upload_panel(message, session)
-		return MediaForwardTask(
-			from_chat_id=int(message.chat.id),
-			message_id=int(message.message_id),
-			file_id=file_id,
-			file_type=file_type,
-			file_unique_id=file_unique_id,
-			thumb_bytes=thumb_bytes,
-			thumb_phash=thumb_phash or None,
-		)
+
+	forward_task = MediaForwardTask(
+		from_chat_id=int(message.chat.id),
+		message_id=int(message.message_id),
+		file_id=file_id,
+		file_type=file_type,
+		file_unique_id=file_unique_id,
+	)
+	thumbnail_task = asyncio.create_task(_prepare_queued_media_thumbnail(
+		item,
+		forward_task,
+		str(preview_info.get("thumb_file_id", "")),
+	))
+	PENDING_THUMBNAIL_TASKS[id(item)] = thumbnail_task
 
 
 async def _media_worker(worker_id: int) -> None:
@@ -3210,9 +3249,7 @@ async def _media_worker(worker_id: int) -> None:
 			else None
 		)
 		try:
-			forward_task = await _process_queued_media(message, expected_session)
-			if forward_task is not None:
-				_enqueue_media_forward(forward_task)
+			await _process_queued_media(message, expected_session)
 		except asyncio.CancelledError:
 			raise
 		except Exception as exc:
@@ -8102,7 +8139,7 @@ async def main() -> None:
 		await reload_config()
 		await dp.start_polling(bot)
 	finally:
-		tasks = [*workers, *ENCODED_SEND_TASKS, *(
+		tasks = [*workers, *ENCODED_SEND_TASKS, *PENDING_THUMBNAIL_TASKS.values(), *(
 			task for task in (
 				forward_worker, maintenance_worker, hot_worker,
 				video_bot_task, backup_bot_task,

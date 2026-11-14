@@ -523,7 +523,8 @@ class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
             say_hello_to_x_man=AsyncMock(), reload_config=AsyncMock(),
             dp=SimpleNamespace(start_polling=AsyncMock()), BACKUP_BOT_TOKEN="", MEDIA_WORKER_COUNT=1,
             _media_worker=worker, _media_forward_worker=worker, _daily_maintenance_worker=worker,
-            _daily_hot_worker=worker, ENCODED_SEND_TASKS=set())
+            _daily_hot_worker=worker, ENCODED_SEND_TASKS=set(),
+            PENDING_THUMBNAIL_TASKS={})
         ns.update(AIRPORT_LOBBY_GROUP_ID=0, TERMINAL_CHANNEL_ID=0, AIRPORT_DUTY_FREE_GROUP_ID=0,
                   AIRPORT_FLIGHT_BOARD_CHANNEL_ID=0, APRON_CHANNEL_IDS=[],
                   ControlPanel=Mock(return_value=SimpleNamespace(check_bot_group_admin_permissions=AsyncMock())),

@@ -5,7 +5,7 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from utils.emoji_utils import EmojiUtils
 
 
@@ -16,24 +16,38 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
         names = {
             "parse_bj_tag_for_file", "_extract_caption", "_normalize_tag_list",
             "_ordered_tags", "_update_upload_panel", "on_media", "_finish_upload",
+            "_prepare_queued_media_thumbnail", "_wait_for_pending_thumbnails",
+            "_process_queued_media",
         }
         nodes = [node for node in tree.body if isinstance(
             node, (ast.FunctionDef, ast.AsyncFunctionDef)
         ) and node.name in names]
         for node in nodes:
             node.decorator_list = []
+        class MediaForwardTask:
+            def __init__(self, **values):
+                self.__dict__.update(values)
+
         self.ns = {
             "Message": object, "Any": object, "asyncio": asyncio,
+            "MediaForwardTask": MediaForwardTask,
             "EmojiUtils": EmojiUtils,
             "blacklist_store": SimpleNamespace(is_blocked=AsyncMock(return_value=False)),
             "received_media_store": SimpleNamespace(is_accepted=AsyncMock(return_value=False)),
             "UPLOAD_SESSIONS": {}, "USER_MEDIA_PENDING": {}, "ENCODER_UI_STATE": {},
+            "PENDING_THUMBNAIL_TASKS": {},
             "USER_MEDIA_LOCKS": {}, "DEFAULT_TAG_CHOICES": [],
             "MAX_USER_PENDING": 10, "MAX_BATCH_MEDIA": 10, "MEDIA_QUEUE": asyncio.Queue(),
             "bot": SimpleNamespace(edit_message_text=AsyncMock()),
             "_upload_keyboard": lambda *, processing=False: {"processing": processing},
             "_extract_media_info": lambda message: ("video", str(message.message_id)),
             "_extract_media_unique_id": lambda message: str(message.message_id),
+            "_extract_preview_info": lambda message, file_type, file_id: {
+                "thumb_file_id": f"thumb-{file_id}",
+            },
+            "_extract_media_metadata": lambda message, file_type: {"duration": 10},
+            "_prepare_thumbnail": AsyncMock(return_value=("phash", b"thumb")),
+            "_enqueue_media_forward": Mock(),
             "_notify_media_limit": AsyncMock(),
             "_build_token_and_encoded": lambda state: ("token", "encoded", {}),
             "_build_display": AsyncMock(return_value="preview"),
@@ -151,3 +165,36 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
             self.ns["bot"].edit_message_text.await_args.kwargs["reply_markup"],
             {"processing": False},
         )
+
+    async def test_thumbnail_processing_does_not_block_upload_done_button(self):
+        message = self.message(None)
+        await self.upload(message)
+        queued_message, session = await self.ns["MEDIA_QUEUE"].get()
+        thumbnail_started = asyncio.Event()
+        release_thumbnail = asyncio.Event()
+
+        async def prepare_thumbnail(_file_id):
+            thumbnail_started.set()
+            await release_thumbnail.wait()
+            return "late-phash", b"late-thumb"
+
+        self.ns["_prepare_thumbnail"].side_effect = prepare_thumbnail
+        await self.ns["_process_queued_media"](queued_message, session)
+
+        panel_update = self.ns["bot"].edit_message_text.await_args.kwargs
+        self.assertEqual(panel_update["reply_markup"], {"processing": False})
+        self.assertEqual(session["processed_count"], 1)
+        await thumbnail_started.wait()
+        item = session["items"][0]
+        self.assertEqual(item["thumb_phash"], "")
+
+        wait_task = asyncio.create_task(
+            self.ns["_wait_for_pending_thumbnails"]([item])
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(wait_task.done())
+
+        release_thumbnail.set()
+        await wait_task
+        self.assertEqual(item["thumb_phash"], "late-phash")
+        self.ns["_enqueue_media_forward"].assert_called_once()

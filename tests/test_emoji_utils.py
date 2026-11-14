@@ -5,13 +5,15 @@ from utils.emoji_utils import EmojiUtils
 
 class EmojiUtilsTests(unittest.TestCase):
     def test_strip_leading_emoji_brackets_handles_combined_emojis(self):
-        for text in (
-            "[👒🎤🚋📢🌀🕞👁️🤼‍♂️][番外篇]网调",
-            "[👩🏽‍💻🇨🇳1️⃣][番外篇]网调",
+        for text, expected in (
+            ("[👒🎤🚋📢🌀🕞👁️🤼‍♂️][番外篇]网调", "[番外篇]网调"),
+            ("[👩🏽‍💻🇨🇳1️⃣][番外篇]网调", "[番外篇]网调"),
+            ("[🧟‍♀️🤪↖️🙍💊🌾🐡🤔]弟弟去叔叔家玩", "弟弟去叔叔家玩"),
         ):
             with self.subTest(text=text):
                 self.assertEqual(
-                    EmojiUtils.strip_leading_emoji_brackets(text), "[番外篇]网调",
+                    EmojiUtils.strip_leading_emoji_brackets(text),
+                    expected,
                 )
 
     def test_strip_leading_emoji_brackets_preserves_text_brackets(self):

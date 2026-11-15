@@ -1173,6 +1173,7 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		post_text = f"{post_text}\n{html.escape(tags_string)}"
 
 	# todo
+	alter = "新菊待采"
 	tags_string2 = tags_string
 	if "偷拍" in tags_string:
 		tags_string2=tags_string2.replace("偷拍","窥桃")
@@ -1193,8 +1194,9 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		tags_string2=tags_string2.replace("喊痛或哭","泣花")
 		alter = "菊畔风急花含泪，几声啼露诉春寒。"
 		
-	post_text = f'🌼 {alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a> '	
-	post_text = f"{post_text}\n{html.escape(tags_string2)}"
+	post_text = f'🌼 {alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a> '
+	if tags_string2:	
+		post_text = f"{post_text}\n{html.escape(tags_string2)}"
 
 	try:
 		batch_id = await _claim_taohua_upload(data, int(message.from_user.id))

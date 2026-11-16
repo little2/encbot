@@ -6417,7 +6417,13 @@ async def on_media(message: Message) -> None:
 		return
 
 	if await received_media_store.is_accepted(file_unique_id):
-		await _notify_media_limit(message, "此媒体已经收过，本批未计入")
+		batch_ids = await received_media_store.get_batch_ids([file_unique_id])
+		batch_id = batch_ids.get(file_unique_id)
+		if batch_id:
+			notice = f"此媒体已经收过，已收录于批次 {batch_id}，本批未计入"
+		else:
+			notice = "此媒体已经收过，但找不到原批次编号，本批未计入"
+		await _notify_media_limit(message, notice)
 		return
 
 	lock = USER_MEDIA_LOCKS.setdefault(key, asyncio.Lock())

@@ -33,7 +33,10 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
             "MediaForwardTask": MediaForwardTask,
             "EmojiUtils": EmojiUtils,
             "blacklist_store": SimpleNamespace(is_blocked=AsyncMock(return_value=False)),
-            "received_media_store": SimpleNamespace(is_accepted=AsyncMock(return_value=False)),
+            "received_media_store": SimpleNamespace(
+                is_accepted=AsyncMock(return_value=False),
+                get_batch_ids=AsyncMock(return_value={}),
+            ),
             "UPLOAD_SESSIONS": {}, "USER_MEDIA_PENDING": {}, "ENCODER_UI_STATE": {},
             "PENDING_THUMBNAIL_TASKS": {},
             "USER_MEDIA_LOCKS": {}, "DEFAULT_TAG_CHOICES": [],
@@ -102,9 +105,15 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejected_duplicate_does_not_supply_batch_content(self):
         self.ns["received_media_store"].is_accepted.return_value = True
+        self.ns["received_media_store"].get_batch_ids.return_value = {
+            "1": "batch-abc123",
+        }
         await self.upload(self.message("重复媒体介绍💽详情"))
         self.assertEqual(self.ns["UPLOAD_SESSIONS"], {})
         self.assertTrue(self.ns["MEDIA_QUEUE"].empty())
+        self.ns["received_media_store"].get_batch_ids.assert_awaited_once_with(["1"])
+        notice = self.ns["_notify_media_limit"].await_args.args[1]
+        self.assertIn("batch-abc123", notice)
 
     async def test_concurrent_album_items_share_one_upload_session(self):
         all_checked = asyncio.Event()

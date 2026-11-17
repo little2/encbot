@@ -4358,22 +4358,22 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 						f"notify inactive member {user_id}",
 						lambda: bot.send_message(
 							chat_id=user_id,
-							# text=(
-							# 	"🛫 机场成员清理通知\n\n"
-							# 	f"你的飞行通行证已经过期 {expired_days} 天，"
-							# 	f"超过机场设定的 {INACTIVE_EXPIRE_DAYS} 天不活跃期限。"
-							# 	"系统已将你移出原先所在的「镇泰飞机场」「航站大厅」或「免税店」，"
-							# 	"并清除相关通行证数据。\n\n"
-							# 	"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
-							# 	"https://t.me/+ek6YrGU0Rsg4YmZl"
-							# ),
 							text=(
-								"🛫 机场通知\n\n"
-								"受外部环境影响，机场暂时关闭。如您偏爱本机场风格，欢迎前往服务站留言。\n\n"
-								"这不是黑名单封禁，塔台恢复开放后，将向入选旅客发出邀约。"
-								"静候重逢，平安启航。"
+								"🛫 机场成员清理通知\n\n"
+								f"你的飞行通行证已经过期 {expired_days} 天，"
+								f"超过机场设定的 {INACTIVE_EXPIRE_DAYS} 天不活跃期限。"
+								"系统已将你移出原先所在的「镇泰飞机场」「航站大厅」或「免税店」，"
+								"并清除相关通行证数据。\n\n"
+								"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
 								"https://t.me/+ek6YrGU0Rsg4YmZl"
 							),
+							# text=(
+							# 	"🛫 机场通知\n\n"
+							# 	"受外部环境影响，机场暂时关闭。如您偏爱本机场风格，欢迎前往服务站留言。\n\n"
+							# 	"这不是黑名单封禁，塔台恢复开放后，将向入选旅客发出邀约。"
+							# 	"静候重逢，平安启航。"
+							# 	"https://t.me/+ek6YrGU0Rsg4YmZl"
+							# ),
 						),
 					)
 				except Exception as exc:
@@ -5977,7 +5977,8 @@ async def _send_lobby_welcome(user: User) -> None:
 		if bot_name
 		else "https://t.me/ztTowerRobot"
 	)
-	first_row = [InlineKeyboardButton(text="🛫 飞机场", url=airport_url)]
+	# first_row = [InlineKeyboardButton(text="🛫 飞机场", url=airport_url)]
+	first_row = []
 	if not AIRPORT_DUTY_FREE_MAINTENANCE:
 		duty_free_url = tower_url
 		if AIRPORT_DUTY_FREE_GROUP_ID != 0:
@@ -6004,7 +6005,8 @@ async def _send_lobby_welcome(user: User) -> None:
 		],
 	)
 
-	if TRADE_IMAGE_PATHS[0].is_file():
+	# todo: 暂时只给文字信息
+	if TRADE_IMAGE_PATHS[0].is_file() and False:
 		await bot.send_photo(
 			chat_id=AIRPORT_LOBBY_GROUP_ID,
 			photo=FSInputFile(TRADE_IMAGE_PATHS[0]),

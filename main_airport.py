@@ -914,7 +914,7 @@ def _build_keyboard(encoded: str|None = None) -> InlineKeyboardMarkup:
 		
 
 	buttons.append(
-		InlineKeyboardButton(text="🛫 请求起飞", url=f"https://t.me/share/url?url={encoded}"),
+		InlineKeyboardButton(text="🎟 持票登机", url=f"https://t.me/share/url?url={encoded}"),
 	)
 
 	# buttons.append(

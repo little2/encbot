@@ -896,7 +896,7 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 
 	return return_text
 
-def _build_keyboard() -> InlineKeyboardMarkup:
+def _build_keyboard(encoded: str|None = None) -> InlineKeyboardMarkup:
 	tower_bot_name = str(bot_name or "").strip().lstrip("@")
 	# buttons = [
 	# 	InlineKeyboardButton(text="🈲 立即停飞", callback_data="takeoff:ban"),
@@ -909,9 +909,17 @@ def _build_keyboard() -> InlineKeyboardMarkup:
 				url=f"https://t.me/{tower_bot_name}",
 			)
 		)
+
+
+		
+
 	buttons.append(
-		InlineKeyboardButton(text="🛫 请求起飞", callback_data="takeoff:fly"),
+		InlineKeyboardButton(text="🛫 请求起飞", url=f"https://t.me/share/url?url={encoded}"),
 	)
+
+	# buttons.append(
+	# 	InlineKeyboardButton(text="🛫 请求起飞", callback_data="takeoff:fly"),
+	# )
 	return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
@@ -2360,7 +2368,7 @@ async def _forward_encoded_if_whitelisted(
 		if not parsed_items:
 			raise ValueError("encoded 中没有媒体")
 		display_text = await _build_display(parsed, encoded)
-		display_keyboard = _build_keyboard()
+		display_keyboard = _build_keyboard(encoded=encoded)
 		if_spoiler = bool(parsed.get("if_spoiler", False))
 
 		flash_seconds = parsed.get("flash_seconds", 0)
@@ -7096,8 +7104,17 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		return
 
 	reader_user_id = int(callback.from_user.id)
+	result = await on_takeoff_fly(reader_user_id, parse_text, message=callback.message)
+	await callback.answer(**result["answer"])
 
 
+async def on_takeoff_fly(
+	reader_user_id: int,
+	parse_text: str,
+	*,
+	message: Message,
+) -> dict[str, Any]:
+	"""处理起飞申请，返回 ok 与 answer，由调用方根据结果回应用户。"""
 	is_admin  = False
 	if reader_user_id in ADMIN_USER_IDS:
 		is_admin = True
@@ -7114,18 +7131,22 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		).replace(tzinfo=APP_TIMEZONE)
 	except Exception as exc:
 		print(f"[TAKEOFF] token parse failed: {exc}", flush=True)
-		await callback.answer("❌ 无法解析此航班", show_alert=True, cache_time=0)
-		return
+		return {
+			"ok": False,
+			"answer": {"text": "❌ 无法解析此航班", "show_alert": True, "cache_time": 0},
+		}
 
 	now = app_now()
 	if now > valid_until_dt and not is_admin:
 		# overdue_text = FormatUtils.format_duration(int((now - valid_until_dt).total_seconds()))
-		await callback.answer(
-			text=f"❌ 此航班已过期 ( 超过有效时间 )",
-			show_alert=True,
-			cache_time=100000,
-		)
-		return
+		return {
+			"ok": False,
+			"answer": {
+				"text": "❌ 此航班已过期 ( 超过有效时间 )",
+				"show_alert": True,
+				"cache_time": 100000,
+			},
+		}
 
 	requested_minutes = requested_qty * MEDIA_VIEW_CONSUMPTION_MINUTES
 	user_lock = TAKEOFF_USER_LOCKS.setdefault(reader_user_id, asyncio.Lock())
@@ -7141,23 +7162,23 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			or now_timestamp - user_expire.group_message_timestamp > 24 * 60 * 60
 		):
 
-			await callback.answer(
-				text=(
-					"📢 航站广播\n\n"
-					"为确保航站持续开放，避免因缺少互动而触发电报官方限制，请各位旅客先前往「航站大厅」参与发言交流，让航站保持良好运行。\n\n"
-					"👍 你可以:\n"
-					"回覆对已搭乘班机资源的体验与点评\n"
-					"回应其他旅客的发言\n\n"
-					"👎 不建议: (可能会被踢)\n"
-					"发问候语\n"
-					"述说需要发言\n"
-					"硬要发言(问已知的问题或不知所云)\n"
-				),
-				parse_mode="HTML",
-				show_alert=True,
-			)
-
-			return
+			return {
+				"ok": False,
+				"answer": {
+					"text": (
+						"📢 航站广播\n\n"
+						"为确保航站持续开放，避免因缺少互动而触发电报官方限制，请各位旅客先前往「航站大厅」参与发言交流，让航站保持良好运行。\n\n"
+						"👍 你可以:\n"
+						"回覆对已搭乘班机资源的体验与点评\n"
+						"回应其他旅客的发言\n\n"
+						"👎 不建议: (可能会被踢)\n"
+						"发问候语\n"
+						"述说需要发言\n"
+						"硬要发言(问已知的问题或不知所云)\n"
+					),
+					"show_alert": True,
+				},
+			}
 
 		available_minutes = max(
 			0,
@@ -7169,33 +7190,39 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 			word_qty = _ceil_div(missing_minutes, MESSAGE_REWARD_MINUTES)
 			upload_qty = _ceil_div(missing_minutes, MEDIA_UPLOAD_EXTEND_MINUTES)
 			required_until_text = FormatUtils.format_timestamp_utc8(now_timestamp + requested_minutes * 60)
-			await callback.answer(
-				text=(
-					f"飞行通行证期限需要超过 {required_until_text}。\n"
-					f"你还差 {FormatUtils.minutes_to_day_hour(missing_minutes)[0]}，"
-					f"你可以选择在大厅发言 {word_qty} 句 ( 1 分钟只计 1 句 )，或再分享到塔台 {upload_qty} 个资源。"
-				),
-				show_alert=True,
-				cache_time=0,
-			)
-			return
+			return {
+				"ok": False,
+				"answer": {
+					"text": (
+						f"飞行通行证期限需要超过 {required_until_text}。\n"
+						f"你还差 {FormatUtils.minutes_to_day_hour(missing_minutes)[0]}，"
+						f"你可以选择在大厅发言 {word_qty} 句 ( 1 分钟只计 1 句 )，或再分享到塔台 {upload_qty} 个资源。"
+					),
+					"show_alert": True,
+					"cache_time": 0,
+				},
+			}
 
 		if await user_expire_cache.consume_minutes(reader_user_id, requested_minutes) is None:
-			await callback.answer("飞行通行证余额不足，请重新尝试", show_alert=True, cache_time=0)
-			return
+			return {
+				"ok": False,
+				"answer": {"text": "飞行通行证余额不足，请重新尝试", "show_alert": True, "cache_time": 0},
+			}
 
 		try:
 			send_result = await extract_encode(
 				parse_text,
-				callback.message,
+				message,
 				reader_user_id,
 			)
 
 		except Exception as exc:
 			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
 			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
-			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
-			return
+			return {
+				"ok": False,
+				"answer": {"text": "❌ 媒体发送失败，请稍后重试", "show_alert": True, "cache_time": 0},
+			}
 
 		if not send_result.get("ok", False):
 			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
@@ -7207,8 +7234,10 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				answer_text = "❌ 此闪读密文仅可读取一次"
 			else:
 				answer_text = "❌ 无法解析此 token"
-			await callback.answer(answer_text, show_alert=True, cache_time=0)
-			return
+			return {
+				"ok": False,
+				"answer": {"text": answer_text, "show_alert": True, "cache_time": 0},
+			}
 
 		charged_minutes = requested_minutes
 
@@ -7275,12 +7304,8 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 				])
 
 			if is_admin:
-				if callback:
-					source_chat_id = int(callback.message.chat.id)
-					source_message_id = int(callback.message.message_id)
-				else:
-					source_chat_id = 0
-					source_message_id = 0
+				source_chat_id = int(message.chat.id)
+				source_message_id = int(message.message_id)
 				uploader_text = await FormatUtils.get_user_hyperlink(
 					bot,
 					{"id": uploader_id},
@@ -7321,16 +7346,18 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		except Exception as exc:
 			await user_expire_cache.refund_minutes(reader_user_id, charged_minutes)
 			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
-			await callback.answer("❌ 媒体发送失败，请稍后重试", show_alert=True, cache_time=0)
-			return
+			return {
+				"ok": False,
+				"answer": {"text": "❌ 媒体发送失败，请稍后重试", "show_alert": True, "cache_time": 0},
+			}
 
 
 
-	chat_id = callback.message.chat.id
-	message_id = callback.message.message_id
+	chat_id = message.chat.id
+	message_id = message.message_id
 	try:
-		takeoff_count = await _increment_takeoff_count(callback.message)
-		print(f"{callback.message.chat.id}/{callback.message.message_id} takeoff count updated: {takeoff_count}", flush=True)
+		takeoff_count = await _increment_takeoff_count(message)
+		print(f"{chat_id}/{message_id} takeoff count updated: {takeoff_count}", flush=True)
 	except Exception as exc:
 		print(f"[TAKEOFF] counter update failed: {exc}", flush=True)
 		takeoff_count = 0
@@ -7426,10 +7453,13 @@ async def on_takeoff(callback: CallbackQuery) -> None:
 		except Exception as exc:
 			print(f"[TAKEOFF] lobby broadcast failed: {exc}", flush=True)
 
-	await callback.answer(
-		url=f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
-		cache_time=0,
-	)
+	return {
+		"ok": True,
+		"answer": {
+			"url": f"https://t.me/{bot_name}?start=fly_{chat_id}_{message_id}",
+			"cache_time": 0,
+		},
+	}
 
 
 @dp.callback_query(F.data.startswith("enc:"))
@@ -7952,12 +7982,16 @@ async def on_text(message: Message) -> None:
 			END = "]⟧"
 			pattern = re.escape(START) + r"(.*?)" + re.escape(END)
 			matches = re.findall(pattern, text, flags=re.S)
-
+			reader_user_id = int(message.from_user.id)
 			for item in matches:
 				parse_text = item.strip()
 				break
 
-			await extract_encode(parse_text, message)
+			result = await on_takeoff_fly(reader_user_id, parse_text, message=message)
+			if not result["ok"]:
+				await message.reply(result["answer"]["text"], parse_mode=None)
+			# 成功时已发送媒体和扣时通知，私聊无需执行 callback 的跳转。
+			return
 
 		except Exception as exc:
 			await message.reply(f"❌ 解码或解析失败: {exc}")

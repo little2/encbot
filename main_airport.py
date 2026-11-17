@@ -914,7 +914,7 @@ def _build_keyboard(encoded: str|None = None) -> InlineKeyboardMarkup:
 		
 
 	buttons.append(
-		InlineKeyboardButton(text="🎟 持票登机", url=f"https://t.me/share/url?url={encoded}"),
+		InlineKeyboardButton(text="🎟 持码起飞", url=f"https://t.me/share/url?url={encoded}"),
 	)
 
 	# buttons.append(
@@ -1357,7 +1357,7 @@ async def _ask_media_by_type(
 
 			file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
 			x_man_reply = await _request_x_man(file_unique_id)
-			return false
+			return None
 
 			# if file_type == "document":
 			# 	result = await from_bot.send_document(chat_id=chat_id, document=file_id)
@@ -1502,8 +1502,10 @@ async def _send_all_media(
 	skipped_items: list[dict[str, Any]] = []
 	pending_group: list[dict[str, Any]] = []
 	pending_kind: str | None = None
+	recovery_notice_sent = False
 
 	async def send_item(item: dict[str, Any]) -> None:
+		nonlocal recovery_notice_sent
 		item_data = dict(data)
 		item_data.update(item)
 		try:
@@ -1524,6 +1526,21 @@ async def _send_all_media(
 				if backup_bot is None:
 					raise RuntimeError("backup bot is not available")
 
+				if not recovery_notice_sent:
+					recovery_notice_sent = True
+					try:
+						await bot.send_message(
+							chat_id=_normalize_receiver_chat_id(
+								receiver_id,
+								default_chat_id=message.from_user.id if message.from_user else None,
+							),
+							text="⏳ 部分资源暂时无法直接发送，正在通过备份机器人恢复，请稍候，恢复后会继续发送。",
+						)
+					except Exception as notice_exc:
+						print(f"[MEDIA_SEND] recovery notice failed: {notice_exc}", flush=True)
+
+				print(f"{str(exc.message).casefold()}")
+
 				sent2 = await _ask_media_by_type(
 					backup_bot,
 					bot_name,
@@ -1532,6 +1549,9 @@ async def _send_all_media(
 
 				if sent2:
 					await send_item(item)
+					sent_messages.append(sent2)
+				else:
+					skipped_items.append(item)
 
 			except Exception as recovery_exc:
 				skipped_items.append(item)
@@ -1548,7 +1568,7 @@ async def _send_all_media(
 				f"#{item.get('_item_index', '?')} to {receiver_id}",
 				flush=True,
 			)
-			sent_messages.append(sent2)
+			
 			return
 		sent_messages.append(sent)
 
@@ -5962,10 +5982,12 @@ async def _send_lobby_welcome(user: User) -> None:
 	welcome_text = (
 		f"🎉 欢迎抵达航站大厅，{mention}！\n\n"
 		"🏢 航站大厅(本群)：与其他旅客交流，发言可延长飞行通行证。\n"
-		"🛫 飞机场：查看航班并获取资源。\n"
-		"🛍️ 免税店：不会直接展示预览图，也可与其他旅客交流，发言也可延长飞行通行证。"
-		f"{'(整修中)' if AIRPORT_DUTY_FREE_MAINTENANCE else ''}\n"
-		"🗼 塔台：提交、分享资源与邀请他人。\n"
+		# "🛫 飞机场：查看航班并获取资源。\n"
+		# "🛍️ 免税店：不会直接展示预览图，也可与其他旅客交流，发言也可延长飞行通行证。"
+		# f"{'(整修中)' if AIRPORT_DUTY_FREE_MAINTENANCE else ''}\n"
+		"🗼 塔台：提交、分享资源与邀请他人。\n\n"
+		"🛫 将「🎟 起飞码」传送给塔台，即可起飞\n"
+
 		"请先和其他旅客进行有内容的交流。问候语、刷屏或为了取得时数而发送的无意义内容不会获得奖励。\n\n"
 		"祝你候机愉快，航程顺利。"
 	)

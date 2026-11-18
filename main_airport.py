@@ -180,7 +180,7 @@ AIRPORT_DUTY_FREE_MAINTENANCE = (
 	in {"1", "true", "yes", "on"}
 )
 
-AIRPORT_EXTRA_CODE_MAINTENANCE = True
+AIRPORT_EXTRA_CODE_MAINTENANCE = False
 
 zttower_airport_flight_board_channel = _get_shared_chat_config("zttower_airport_flight_board_channel")
 AIRPORT_FLIGHT_BOARD_CHANNEL_ID = int(os.getenv("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", str(zttower_airport_flight_board_channel.get("chat_id", 0))))

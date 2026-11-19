@@ -33,6 +33,12 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from utils.bot_cache import BotCache
+
+BOT_CACHE_MAX_SIZE = 5
+BOT_CACHE_IDLE_SECONDS = 1800
+SEND_BOT_CACHE = BotCache(BOT_CACHE_MAX_SIZE, BOT_CACHE_IDLE_SECONDS)
+
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import imagehash
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, html
@@ -1298,6 +1304,7 @@ async def _send_media_by_type(
 	message: Message,
 	data: dict[str, Any],
 	receiver_id: int | str | None = None,
+	bot_token: str | None = None,
 ) -> Message:
 	file_type = str(data["file_type"])
 	file_id = str(data["file_id"])
@@ -1308,11 +1315,19 @@ async def _send_media_by_type(
 		default_chat_id=message.from_user.id if message.from_user else None,
 	)
 
+	token = str(bot_token or "").strip()
+	if token and token != bot.token:
+		async with SEND_BOT_CACHE.use(token) as sending_bot:
+			return await _send_media_with_bot(sending_bot, file_type, file_id, chat_id, no_forward, if_spoiler)
+	return await _send_media_with_bot(bot, file_type, file_id, chat_id, no_forward, if_spoiler)
+
+
+async def _send_media_with_bot(sending_bot, file_type, file_id, chat_id, no_forward, if_spoiler) -> Message:
 	if file_type == "document":
-		return await bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward)
+		return await sending_bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward)
 	if file_type == "photo":
 		async with ENCODED_FORWARD_SEND_LOCK:
-			return await bot.send_photo(
+			return await sending_bot.send_photo(
 				chat_id=chat_id,
 				photo=file_id,
 				protect_content=no_forward,
@@ -1320,25 +1335,25 @@ async def _send_media_by_type(
 			)
 	if file_type == "video":
 		async with ENCODED_FORWARD_SEND_LOCK:
-			return await bot.send_video(
+			return await sending_bot.send_video(
 				chat_id=chat_id,
 				video=file_id,
 				protect_content=no_forward,
 				has_spoiler=if_spoiler,
 			)
 	if file_type == "audio":
-		return await bot.send_audio(chat_id=chat_id, audio=file_id, protect_content=no_forward)
+		return await sending_bot.send_audio(chat_id=chat_id, audio=file_id, protect_content=no_forward)
 	if file_type == "voice":
-		return await bot.send_voice(chat_id=chat_id, voice=file_id, protect_content=no_forward)
+		return await sending_bot.send_voice(chat_id=chat_id, voice=file_id, protect_content=no_forward)
 	if file_type == "animation":
-		return await bot.send_animation(
+		return await sending_bot.send_animation(
 			chat_id=chat_id,
 			animation=file_id,
 			protect_content=no_forward,
 			has_spoiler=if_spoiler,
 		)
 	if file_type == "sticker":
-		return await bot.send_sticker(chat_id=chat_id, sticker=file_id, protect_content=no_forward)
+		return await sending_bot.send_sticker(chat_id=chat_id, sticker=file_id, protect_content=no_forward)
 
 	raise ValueError(f"Unsupported file_type: {file_type}")
 
@@ -1488,6 +1503,20 @@ async def _send_all_media(
 	message: Message,
 	data: dict[str, Any],
 	receiver_id: int | str | None = None,
+	bot_token: str | None = None,
+) -> tuple[list[Message], list[dict[str, Any]]]:
+	token = str(bot_token or "").strip()
+	if token and token != bot.token:
+		async with SEND_BOT_CACHE.use(token) as sending_bot:
+			return await _send_all_media_with_bot(message, data, receiver_id, sending_bot)
+	return await _send_all_media_with_bot(message, data, receiver_id, bot)
+
+
+async def _send_all_media_with_bot(
+	message: Message,
+	data: dict[str, Any],
+	receiver_id: int | str | None,
+	sending_bot: Bot,
 ) -> tuple[list[Message], list[dict[str, Any]]]:
 	source_items = data.get("items") or [{
 		"file_id": data["file_id"],
@@ -1511,10 +1540,16 @@ async def _send_all_media(
 		item_data = dict(data)
 		item_data.update(item)
 		try:
-			sent = await _send_media_by_type(
-				message,
-				item_data,
-				receiver_id=receiver_id,
+			sent = await _send_media_with_bot(
+				sending_bot,
+				str(item_data["file_type"]),
+				str(item_data["file_id"]),
+				_normalize_receiver_chat_id(
+					receiver_id,
+					default_chat_id=message.from_user.id if message.from_user else None,
+				),
+				bool(item_data.get("no_forward", False)),
+				bool(item_data.get("if_spoiler", False)),
 			)
 		except TelegramBadRequest as exc:
 			if not _is_invalid_media_reference_error(exc):
@@ -1531,7 +1566,7 @@ async def _send_all_media(
 				if not recovery_notice_sent:
 					recovery_notice_sent = True
 					try:
-						await bot.send_message(
+						await sending_bot.send_message(
 							chat_id=_normalize_receiver_chat_id(
 								receiver_id,
 								default_chat_id=message.from_user.id if message.from_user else None,
@@ -1589,7 +1624,7 @@ async def _send_all_media(
 
 			try:
 				async with ENCODED_FORWARD_SEND_LOCK:
-					result = await bot.send_media_group(
+					result = await sending_bot.send_media_group(
 						chat_id=_normalize_receiver_chat_id(
 							receiver_id,
 							default_chat_id=(
@@ -8145,6 +8180,7 @@ async def main() -> None:
 	forward_worker = maintenance_worker = hot_worker = None
 	video_bot_task = backup_bot_task = None
 	userbot_task = None
+	cache_cleanup_task = asyncio.create_task(SEND_BOT_CACHE.cleanup_worker())
 	try:
 		await _initialize_database()
 		try:
@@ -8271,7 +8307,7 @@ async def main() -> None:
 		tasks = [*workers, *ENCODED_SEND_TASKS, *PENDING_THUMBNAIL_TASKS.values(), *(
 			task for task in (
 				forward_worker, maintenance_worker, hot_worker,
-				video_bot_task, backup_bot_task, userbot_task,
+				video_bot_task, backup_bot_task, userbot_task, cache_cleanup_task,
 			) if task is not None
 		)]
 		for task in tasks:
@@ -8281,7 +8317,10 @@ async def main() -> None:
 			if database_stores is not None:
 				await database_stores.close()
 		finally:
-			await bot.session.close()
+			try:
+				await SEND_BOT_CACHE.close()
+			finally:
+				await bot.session.close()
 
 
 if __name__ == "__main__":

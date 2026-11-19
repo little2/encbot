@@ -3,6 +3,7 @@ from html import escape
 from typing import Union
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import User
 
 from config import MEDIA_VIEW_CONSUMPTION_MINUTES
@@ -78,11 +79,16 @@ class FormatUtils:
 			username = user_info.get("username")
 
 		if not first_name.strip() and user_id:
-			user = await bot.get_chat(user_id)
-			first_name = user.first_name or ""
-			last_name = user.last_name or ""
-			username = user.username
-			user_id = user.id
+			try:
+				user = await bot.get_chat(user_id)
+			except TelegramBadRequest as exc:
+				if "chat not found" not in str(exc).casefold():
+					raise
+			else:
+				first_name = user.first_name or ""
+				last_name = user.last_name or ""
+				username = user.username
+				user_id = user.id
 
 		user_title = first_name
 		if last_name:

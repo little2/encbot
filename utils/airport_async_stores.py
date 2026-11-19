@@ -46,6 +46,7 @@ class BatchViewStore(Protocol):
 class ReceivedMediaStore(Protocol):
     async def update_storage_location(self, media_type: str, media_id: int,
                                       chat_id: int, message_id: int) -> int: ...
+    async def get_by_file_id(self, file_id: str) -> list[dict]: ...
     async def update_media_identity(self, file_unique_id: str, metadata: dict) -> None: ...
     async def cleanup_stale_pending(self) -> int: ...
     async def claim(
@@ -250,17 +251,58 @@ class _ClaimConflict(Exception):
 
 
 class _ReceivedMediaStore:
+    async def get_by_file_id(self, file_id: str) -> list[dict]:
+        normalized_file_id = str(file_id or "").strip()
+        if not normalized_file_id:
+            return []
+        async with self.database.transaction() as conn:
+            rows = await conn.fetch("""
+                SELECT file_unique_id, file_id, file_type, media_type, media_id,
+                       bot_id, storage_chat_id, storage_message_id
+                FROM received_media
+                WHERE file_id = $1
+                ORDER BY created_at DESC
+            """, normalized_file_id)
+        return [dict(row) for row in rows]
+
     async def update_storage_location(self, media_type: str, media_id: int,
                                       chat_id: int, message_id: int) -> int:
         if media_type not in {"document", "photo"}:
+            print(
+                f"[USERBOT_MEDIA] ignored unsupported media: "
+                f"type={media_type}, media_id={media_id}",
+                flush=True,
+            )
             return 0
+
+        print(
+            f"[USERBOT_MEDIA] updating storage location: "
+            f"type={media_type}, media_id={media_id}, "
+            f"chat_id={chat_id}, message_id={message_id}",
+            flush=True,
+        )
         async with self.database.transaction(write=True) as conn:
             rows = await conn.fetch("""
                 UPDATE received_media SET storage_chat_id=$1, storage_message_id=$2
                 WHERE media_type=$3 AND media_id=$4
                 RETURNING file_unique_id
             """, int(chat_id), int(message_id), media_type, int(media_id))
-            return len(rows)
+            updated_count = len(rows)
+
+        if updated_count:
+            file_unique_ids = [str(row["file_unique_id"]) for row in rows]
+            print(
+                f"[USERBOT_MEDIA] storage location updated: "
+                f"count={updated_count}, file_unique_ids={file_unique_ids}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[USERBOT_MEDIA] no matching record: "
+                f"type={media_type}, media_id={media_id}",
+                flush=True,
+            )
+        return updated_count
 
     async def update_media_identity(self, file_unique_id: str, metadata: dict) -> None:
         if not metadata.get("media_type") or metadata.get("media_id") is None:

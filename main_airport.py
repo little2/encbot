@@ -875,11 +875,11 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 		return_text += f"📦 {media_count}  (  {' '.join(media_composition)} )\n"
 
 	for item in media_items:
-		
+
 		_file_type = str(item.get("file_type", ""))
 		if _file_type not in {"document", "audio", "voice"}:
 			continue
-		
+
 		parts = [
 			_short_media_type(str(item.get("file_type", ""))),
 			_format_file_size(int(item.get("file_size", 0) or 0)),
@@ -1300,27 +1300,6 @@ def _normalize_receiver_chat_id(
 	return f"@{username}"
 
 
-async def _send_media_by_type(
-	message: Message,
-	data: dict[str, Any],
-	receiver_id: int | str | None = None,
-	bot_token: str | None = None,
-) -> Message:
-	file_type = str(data["file_type"])
-	file_id = str(data["file_id"])
-	no_forward = bool(data.get("no_forward", False))
-	if_spoiler = bool(data.get("if_spoiler", False))
-	chat_id = _normalize_receiver_chat_id(
-		receiver_id,
-		default_chat_id=message.from_user.id if message.from_user else None,
-	)
-
-	token = str(bot_token or "").strip()
-	if token and token != bot.token:
-		async with SEND_BOT_CACHE.use(token) as sending_bot:
-			return await _send_media_with_bot(sending_bot, file_type, file_id, chat_id, no_forward, if_spoiler)
-	return await _send_media_with_bot(bot, file_type, file_id, chat_id, no_forward, if_spoiler)
-
 
 async def _send_media_with_bot(sending_bot, file_type, file_id, chat_id, no_forward, if_spoiler) -> Message:
 	if file_type == "document":
@@ -1461,14 +1440,62 @@ def _is_invalid_media_reference_error(exc: TelegramBadRequest) -> bool:
 	))
 
 
-async def _request_x_man(file_unique_id: str) -> str:
+async def _wait_for_x_man_reply_with_bot(
+	active_bot: Bot,
+	request_message_id: int,
+	file_unique_id: str,
+) -> str | None:
+	"""Poll a dynamically selected bot until X_MAN replies to this request."""
+	x_man_bot_id = int(SharedConfig.get("x_man_bot_id", 0) or 0)
+	loop = asyncio.get_running_loop()
+	deadline = loop.time() + X_MAN_REPLY_TIMEOUT_SECONDS
+	offset: int | None = None
+
+	while True:
+		remaining = deadline - loop.time()
+		if remaining <= 0:
+			raise TimeoutError
+		poll_timeout = max(1, min(10, int(remaining)))
+		updates = await asyncio.wait_for(
+			active_bot.get_updates(
+				offset=offset,
+				timeout=poll_timeout,
+				allowed_updates=["message"],
+				request_timeout=poll_timeout + 5,
+			),
+			timeout=remaining,
+		)
+		for update in updates:
+			offset = update.update_id + 1
+			message = update.message
+			if message is None or message.from_user is None:
+				continue
+			if int(message.from_user.id) != x_man_bot_id:
+				continue
+			replied_message = message.reply_to_message
+			if replied_message is None or replied_message.message_id != request_message_id:
+				continue
+			replied_file_unique_id = str(
+				replied_message.text or replied_message.caption or ""
+			).strip()
+			if replied_file_unique_id != file_unique_id:
+				continue
+			reply_file_id = _get_x_man_reply_file_id(message)
+			return reply_file_id if reply_file_id != "na" else None
+
+
+async def _request_x_man(
+	file_unique_id: str,
+	sending_bot: Bot | None = None,
+) -> str | None:
 	global X_MAN_PENDING_REPLY
 	global X_MAN_PENDING_REQUEST_MESSAGE_ID, X_MAN_PENDING_FILE_UNIQUE_ID
 
+	active_bot = sending_bot if sending_bot is not None else bot
 	x_man_bot_id = int(SharedConfig.get("x_man_bot_id", 0) or 0)
 	if x_man_bot_id <= 0:
 		print("[X_MAN] x_man_bot_id is not configured", flush=True)
-		return "na"
+		return None
 
 	async with X_MAN_REQUEST_LOCK:
 		loop = asyncio.get_running_loop()
@@ -1476,27 +1503,35 @@ async def _request_x_man(file_unique_id: str) -> str:
 		X_MAN_PENDING_REPLY = pending_reply
 		X_MAN_PENDING_FILE_UNIQUE_ID = file_unique_id
 		try:
-			request_message = await bot.send_message(x_man_bot_id, file_unique_id)
+			request_message = await active_bot.send_message(x_man_bot_id, file_unique_id)
 			X_MAN_PENDING_REQUEST_MESSAGE_ID = request_message.message_id
 			try:
-				return await asyncio.wait_for(
-					pending_reply,
-					timeout=X_MAN_REPLY_TIMEOUT_SECONDS,
-				)
+				if active_bot is bot:
+					reply_file_id = await asyncio.wait_for(
+						pending_reply,
+						timeout=X_MAN_REPLY_TIMEOUT_SECONDS,
+					)
+				else:
+					reply_file_id = await _wait_for_x_man_reply_with_bot(
+						active_bot,
+						request_message.message_id,
+						file_unique_id,
+					)
 			except TimeoutError:
 				print(
 					f"[X_MAN] reply timed out for file_unique_id={file_unique_id}",
 					flush=True,
 				)
-				return "na"
+				return None
 		except Exception as exc:
 			print(f"[X_MAN] request failed: {exc}", flush=True)
-			return "na"
+			return None
 		finally:
 			if X_MAN_PENDING_REPLY is pending_reply:
 				X_MAN_PENDING_REPLY = None
 				X_MAN_PENDING_REQUEST_MESSAGE_ID = None
 				X_MAN_PENDING_FILE_UNIQUE_ID = None
+		return reply_file_id if reply_file_id and reply_file_id != "na" else None
 
 
 async def _send_all_media(
@@ -1504,12 +1539,30 @@ async def _send_all_media(
 	data: dict[str, Any],
 	receiver_id: int | str | None = None,
 	bot_token: str | None = None,
-) -> tuple[list[Message], list[dict[str, Any]]]:
+) -> tuple[list[Message], list[dict[str, Any]], str]:
+	async def send_with(active_bot: Bot) -> tuple[list[Message], list[dict[str, Any]], str]:
+		sendingbot_username = ""
+		if active_bot is bot:
+			sendingbot_username = str(bot_name or "").strip().lstrip("@")
+		if not sendingbot_username:
+			active_bot_info = await active_bot.get_me()
+			sendingbot_username = str(active_bot_info.username or "").strip().lstrip("@")
+		if not sendingbot_username:
+			raise RuntimeError("发送媒体的机器人没有 username")
+
+		sent_messages, skipped_items = await _send_all_media_with_bot(
+			message,
+			data,
+			receiver_id,
+			active_bot,
+		)
+		return sent_messages, skipped_items, sendingbot_username
+
 	token = str(bot_token or "").strip()
 	if token and token != bot.token:
 		async with SEND_BOT_CACHE.use(token) as sending_bot:
-			return await _send_all_media_with_bot(message, data, receiver_id, sending_bot)
-	return await _send_all_media_with_bot(message, data, receiver_id, bot)
+			return await send_with(sending_bot)
+	return await send_with(bot)
 
 
 async def _send_all_media_with_bot(
@@ -1535,7 +1588,7 @@ async def _send_all_media_with_bot(
 	pending_kind: str | None = None
 	recovery_notice_sent = False
 
-	async def send_item(item: dict[str, Any]) -> None:
+	async def send_item(item: dict[str, Any], allow_recovery: bool = True) -> None:
 		nonlocal recovery_notice_sent
 		item_data = dict(data)
 		item_data.update(item)
@@ -1555,18 +1608,19 @@ async def _send_all_media_with_bot(
 			if not _is_invalid_media_reference_error(exc):
 				raise
 
+			if not allow_recovery:
+				skipped_items.append(item)
+				return
+
 			if "wrong file identifier" not in str(exc.message).casefold():
 				skipped_items.append(item)
 				return
 
 			try:
-				if backup_bot is None:
-					raise RuntimeError("backup bot is not available")
-
 				if not recovery_notice_sent:
 					recovery_notice_sent = True
 					try:
-						await sending_bot.send_message(
+						await bot.send_message(
 							chat_id=_normalize_receiver_chat_id(
 								receiver_id,
 								default_chat_id=message.from_user.id if message.from_user else None,
@@ -1578,17 +1632,83 @@ async def _send_all_media_with_bot(
 
 				print(f"{str(exc.message).casefold()}")
 
-				sent2 = await _ask_media_by_type(
-					backup_bot,
-					bot_name,
-					item_data,
-				)
+				# 先检查 telethon userbot 是否有启用
+				if os.getenv("USERBOT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+					file_id = str(item_data["file_id"])
+					records = await received_media_store.get_by_file_id(file_id)
+					print(
+						f"[USERBOT_RECOVERY] file_id records found: {len(records)}",
+						flush=True,
+					)
+					for record in records:
+						print(f"[USERBOT_RECOVERY] record={record}", flush=True)
+						storage_chat_id = record.get("storage_chat_id")
+						storage_message_id = record.get("storage_message_id")
+						if storage_chat_id is None or storage_message_id is None:
+							print(
+								"[USERBOT_RECOVERY] record has no storage location, skipped",
+								flush=True,
+							)
+							continue
+						if active_userbot is None or getattr(active_userbot, "user_id", None) is None:
+							print("[USERBOT_RECOVERY] userbot is not connected", flush=True)
+							break
 
-				if sent2:
-					await send_item(item)
-					sent_messages.append(sent2)
+						try:
+							sending_bot_info = await sending_bot.get_me()
+							sending_bot_username = str(
+								getattr(sending_bot_info, "username", "") or ""
+							).strip().lstrip("@")
+							destination = (
+								f"@{sending_bot_username}"
+								if sending_bot_username
+								else int(sending_bot_info.id)
+							)
+							forwarded_message_id = await active_userbot.forward_stored_message(
+								int(storage_chat_id),
+								int(storage_message_id),
+								destination,
+							)
+							print(
+								f"[USERBOT_RECOVERY] media forwarded to {destination}: "
+								f"message_id={forwarded_message_id}",
+								flush=True,
+							)
+							sent = await sending_bot.forward_message(
+								chat_id=_normalize_receiver_chat_id(
+									receiver_id,
+									default_chat_id=(
+										message.from_user.id if message.from_user else None
+									),
+								),
+								from_chat_id=int(active_userbot.user_id),
+								message_id=forwarded_message_id,
+								protect_content=bool(item_data.get("no_forward", False)),
+							)
+						except Exception as userbot_exc:
+							print(
+								f"[USERBOT_RECOVERY] stored media send failed: {userbot_exc}",
+								flush=True,
+							)
+							continue
+
+						print(
+							f"[USERBOT_RECOVERY] media delivered to receiver: "
+							f"message_id={sent.message_id}",
+							flush=True,
+						)
+						sent_messages.append(sent)
+						return
 				else:
-					skipped_items.append(item)
+					file_id = str(item_data["file_id"])
+
+					async with BACKUP_FORWARD_SEND_LOCK:
+						file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
+						recovered_file_id = await _request_x_man(file_unique_id, sending_bot)
+					if recovered_file_id:
+						recovered_item = {**item, "file_id": recovered_file_id}
+						await send_item(recovered_item, allow_recovery=False)
+						return
 
 			except Exception as recovery_exc:
 				skipped_items.append(item)
@@ -1600,14 +1720,11 @@ async def _send_all_media_with_bot(
 				)
 				return
 
-			print(
-				f"[MEDIA_SEND] backup bot sent item "
-				f"#{item.get('_item_index', '?')} to {receiver_id}",
-				flush=True,
-			)
-			
+			skipped_items.append(item)
 			return
+
 		sent_messages.append(sent)
+		return
 
 	async def flush_group() -> None:
 		nonlocal pending_group, pending_kind
@@ -1635,6 +1752,14 @@ async def _send_all_media_with_bot(
 						protect_content=no_forward,
 					)
 			except TelegramBadRequest as exc:
+
+				if "chat not found" in str(exc):
+					sending_bot_info = await sending_bot.get_me()
+					sending_bot_username = str(sending_bot_info.username or "")
+					print(f"[MEDIA_SEND:1616] sending bot info: {sending_bot_username}", flush=True)
+					raise RuntimeError(f"需要先启用跑道 @{sending_bot_username}")
+
+				print(f"[MEDIA_SEND:1615] media group send failed: {exc}", flush=True)
 				if not _is_invalid_media_reference_error(exc):
 					raise
 				print(
@@ -1645,6 +1770,7 @@ async def _send_all_media_with_bot(
 				for item in pending_group:
 					await send_item(item)
 			else:
+				print(f"[MEDIA_SEND:1627] media group sent successfully: {result}", flush=True)
 				sent_messages.extend(result)
 		else:
 			await send_item(pending_group[0])
@@ -1674,13 +1800,7 @@ async def _send_all_media_with_bot(
 	await flush_group()
 	return sent_messages, skipped_items
 
-async def _send_all_media_old(message: Message, data: dict[str, Any]) -> list[Message]:
-	sent_messages: list[Message] = []
-	for item in data.get("items", [{"file_id": data["file_id"], "file_type": data["file_type"]}]):
-		item_data = dict(data)
-		item_data.update(item)
-		sent_messages.append(await _send_media_by_type(message, item_data))
-	return sent_messages
+
 
 
 async def _delete_message_later(sent_message: Message, delay_seconds: int) -> None:
@@ -7315,7 +7435,20 @@ async def on_takeoff_fly(
 
 		except Exception as exc:
 			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
-			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
+			if "启用跑道" in str(exc):
+				print(f"[TAKEOFF:7291] media delivery failed: {exc}", flush=True)
+				return {
+					"ok": False,
+					"answer": {"text": f"❌ {str(exc)}", "show_alert": True, "cache_time": 0},
+				}
+			elif "Unauthorized" in str(exc):
+				print(f"[TAKEOFF:7297] media delivery failed: {exc}", flush=True)
+
+				return {
+					"ok": False,
+					"answer": {"text": "❌ 跑道未授权起飞，请先满通", "show_alert": True, "cache_time": 0},
+				}
+			print(f"[TAKEOFF:7302] media delivery failed: {exc}", flush=True)
 			return {
 				"ok": False,
 				"answer": {"text": "❌ 媒体发送失败，请稍后重试", "show_alert": True, "cache_time": 0},
@@ -7336,13 +7469,13 @@ async def on_takeoff_fly(
 				"answer": {"text": answer_text, "show_alert": True, "cache_time": 0},
 			}
 
+		sendingbot_username = str(
+			send_result.get("sendingbot_username") or bot_name or ""
+		).strip().lstrip("@")
+
 		charged_minutes = requested_minutes
 
 		try:
-			
-
-
-
 			batch_id = await _get_first_takeoff_batch_id(send_result)
 
 			skipped_qty = min(requested_qty, max(0, int(send_result.get("skipped_count", 0) or 0)))
@@ -7370,6 +7503,7 @@ async def on_takeoff_fly(
 			remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
 
 			notify_text = (
+				f"🛫 获准起飞，请到 @{sendingbot_username} 跑道开始起飞\n\n"
 				f"✅ 获取 {delivered_qty} 个资源成功，本次消耗 {requested_human_time} 的有效时间。\n"
 				f"🎫 当前飞行通行证到期时间为：{expire_text}。（ 相当于 {remaining_view_count} 个资源 ） \n\n"
 				f"🎈 每获取一个媒体需要消耗  {MEDIA_VIEW_CONSUMPTION_MINUTES} 分钟的飞行通行证有效期。"
@@ -7401,8 +7535,8 @@ async def on_takeoff_fly(
 				])
 
 			if is_admin:
-				source_chat_id = int(message.chat.id)
-				source_message_id = int(message.message_id)
+				source_chat_id = int(message.chat.id) or 0
+				source_message_id = int(message.message_id) or 0
 				uploader_text = await FormatUtils.get_user_hyperlink(
 					bot,
 					{"id": uploader_id},
@@ -7416,11 +7550,9 @@ async def on_takeoff_fly(
 						source_message_id,
 					)
 				)
-
-
 		except Exception as exc:
-			
-			print(f"6880:{exc}",flush=True)
+			print(f"[TAKEOFF]7484: admin keyboard build failed: {exc}", flush=True)
+
 
 		try:
 
@@ -7442,7 +7574,7 @@ async def on_takeoff_fly(
 
 		except Exception as exc:
 			await user_expire_cache.refund_minutes(reader_user_id, charged_minutes)
-			print(f"[TAKEOFF] media delivery failed: {exc}", flush=True)
+			print(f"[TAKEOFF:7418] media delivery failed: {exc}", flush=True)
 			return {
 				"ok": False,
 				"answer": {"text": "❌ 媒体发送失败，请稍后重试", "show_alert": True, "cache_time": 0},
@@ -7949,14 +8081,17 @@ async def extract_encode(
 
 	# print(f"extract_encode: token={token}, data={data}, receiver_id={receiver_id}, flash_seconds={flash_seconds}, marked_flash_key={marked_flash_key}", flush=True)
 	try:
-		sent_media_messages, skipped_items = await _send_all_media(
+		sent_media_messages, skipped_items, sendingbot_username = await _send_all_media(
 			message,
 			delivery_data,
 			receiver_id=receiver_id,
+			bot_token="9161318411:AAEkhWbmHXNaHF8etAQUsNUAt6dMhxvPjgY"
+			# bot_token="8203285248:AAFsBXrRO7hgDFA1eK6EOUoIYt7aDYYLdak"
 		)
 		if not sent_media_messages and skipped_items:
 			raise ValueError("所有媒体的 file_id 均无效或暂时不可用")
-	except Exception:
+	except Exception as exc:
+		print(f"[TAKEOFF:7947] media delivery failed: {exc}", flush=True)
 		if marked_flash_key:
 			USED_FLASH_NONCES.pop(marked_flash_key, None)
 		raise
@@ -7970,6 +8105,7 @@ async def extract_encode(
 		"sent_media_messages": sent_media_messages,
 		"skipped_items": skipped_items,
 		"skipped_count": len(skipped_items),
+			"sendingbot_username": sendingbot_username,
 		"marked_flash_key": marked_flash_key,
 	}
 

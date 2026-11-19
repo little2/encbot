@@ -1,8 +1,8 @@
-aiogram==3.20.0.post0
+aiogram==3.23.0
+pydantic==2.12.5
 asyncpg>=0.30,<1
 aiohttp-socks>=0.10,<0.11
 python-dotenv==1.2.2
 Pillow>=11.0,<13
 ImageHash>=4.3,<5
 Telethon>=1.36,<2
-tg-file-id==0.0.4

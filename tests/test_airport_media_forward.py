@@ -82,7 +82,9 @@ class AirportMediaForwardTests(unittest.TestCase):
 
             request_media = AsyncMock(side_effect=request)
             sending_bot = SimpleNamespace(send_message=AsyncMock())
-            received_media_store = SimpleNamespace(get_by_file_id=AsyncMock(return_value=[]))
+            received_media_store = SimpleNamespace(
+                get_by_media_identity=AsyncMock(return_value=[]),
+            )
             namespace = {
                 "Message": object, "Bot": object, "Any": object,
                 "TelegramBadRequest": BadRequest,
@@ -98,6 +100,9 @@ class AirportMediaForwardTests(unittest.TestCase):
                 "_request_x_man": request_media,
                 "received_media_store": received_media_store,
                 "active_userbot": None,
+                "media_identity": lambda file_id: {
+                    "media_type": "document", "media_id": 123,
+                },
             }
             send_all = load_function("_send_all_media_with_bot", namespace)
             items = [
@@ -118,7 +123,7 @@ class AirportMediaForwardTests(unittest.TestCase):
             self.assertEqual(skipped, [] if recovered else [expected_skipped_item])
             self.assertEqual(request_media.await_count, 0 if userbot_enabled else 1)
             self.assertEqual(
-                received_media_store.get_by_file_id.await_count,
+                received_media_store.get_by_media_identity.await_count,
                 1 if userbot_enabled else 0,
             )
             self.assertFalse(lock.locked())
@@ -151,7 +156,7 @@ class AirportMediaForwardTests(unittest.TestCase):
                 forward_stored_message=AsyncMock(return_value=333),
             )
             received_media_store = SimpleNamespace(
-                get_by_file_id=AsyncMock(return_value=[{
+                get_by_media_identity=AsyncMock(return_value=[{
                     "file_unique_id": "unique-id",
                     "storage_chat_id": -100123,
                     "storage_message_id": 222,
@@ -168,6 +173,9 @@ class AirportMediaForwardTests(unittest.TestCase):
                 "os": SimpleNamespace(getenv=lambda *args: "true"),
                 "received_media_store": received_media_store,
                 "active_userbot": active_userbot,
+                "media_identity": lambda file_id: {
+                    "media_type": "document", "media_id": 123,
+                },
             }
             send_all = load_function("_send_all_media_with_bot", namespace)
 
@@ -180,7 +188,9 @@ class AirportMediaForwardTests(unittest.TestCase):
 
             self.assertEqual(sent, [delivered_message])
             self.assertEqual(skipped, [])
-            received_media_store.get_by_file_id.assert_awaited_once_with("old-file-id")
+            received_media_store.get_by_media_identity.assert_awaited_once_with(
+                "document", 123,
+            )
             active_userbot.forward_stored_message.assert_awaited_once_with(
                 -100123, 222, "@runway_bot"
             )

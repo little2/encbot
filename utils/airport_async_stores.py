@@ -46,7 +46,9 @@ class BatchViewStore(Protocol):
 class ReceivedMediaStore(Protocol):
     async def update_storage_location(self, media_type: str, media_id: int,
                                       chat_id: int, message_id: int) -> int: ...
-    async def get_by_file_id(self, file_id: str) -> list[dict]: ...
+    async def get_by_media_identity(
+        self, media_type: str, media_id: int,
+    ) -> list[dict]: ...
     async def update_media_identity(self, file_unique_id: str, metadata: dict) -> None: ...
     async def cleanup_stale_pending(self) -> int: ...
     async def claim(
@@ -251,18 +253,20 @@ class _ClaimConflict(Exception):
 
 
 class _ReceivedMediaStore:
-    async def get_by_file_id(self, file_id: str) -> list[dict]:
-        normalized_file_id = str(file_id or "").strip()
-        if not normalized_file_id:
+    async def get_by_media_identity(
+        self, media_type: str, media_id: int,
+    ) -> list[dict]:
+        normalized_media_type = str(media_type or "").strip().lower()
+        if normalized_media_type not in {"document", "photo"}:
             return []
         async with self.database.transaction() as conn:
             rows = await conn.fetch("""
                 SELECT file_unique_id, file_id, file_type, media_type, media_id,
                        bot_id, storage_chat_id, storage_message_id
                 FROM received_media
-                WHERE file_id = $1
+                WHERE media_type = $1 AND media_id = $2
                 ORDER BY created_at DESC
-            """, normalized_file_id)
+            """, normalized_media_type, int(media_id))
         return [dict(row) for row in rows]
 
     async def update_storage_location(self, media_type: str, media_id: int,
@@ -734,6 +738,10 @@ async def _initialize_airport_schema_on_connection(conn, backend):
         "storage_chat_id": "BIGINT", "storage_message_id": "BIGINT",
     })
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_received_media_batch_id ON received_media(batch_id)")
+    await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_received_media_identity
+            ON received_media(media_type, media_id)
+        """)
     await conn.execute("""
             CREATE TABLE IF NOT EXISTS shared_invite_link (
                 link_key TEXT PRIMARY KEY, chat_id BIGINT NOT NULL,

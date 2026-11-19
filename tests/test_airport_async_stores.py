@@ -98,7 +98,7 @@ class AirportStoreContract:
         self.assertTrue(await store.release_pending("one", -100, 10))
         self.assertFalse(await store.release_pending("one", -100, 10))
 
-    async def test_get_media_record_by_file_id_includes_storage_location(self):
+    async def test_get_media_record_by_identity_includes_storage_location(self):
         store = self.stores.received_media
         await store.claim("stored", "stored-file-id", "video", 1, -100, 10)
         async with self.stores._database.transaction(write=True) as conn:
@@ -109,13 +109,13 @@ class AirportStoreContract:
                 WHERE file_unique_id=$6
             """, "document", 123, 456, 789, 1011, "stored")
 
-        records = await store.get_by_file_id("stored-file-id")
+        records = await store.get_by_media_identity("document", 123)
 
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["file_unique_id"], "stored")
         self.assertEqual(records[0]["storage_chat_id"], 789)
         self.assertEqual(records[0]["storage_message_id"], 1011)
-        self.assertEqual(await store.get_by_file_id("missing"), [])
+        self.assertEqual(await store.get_by_media_identity("document", 999), [])
 
     async def test_batch_claim_conflict_rolls_back_all_new_rows(self):
         store = self.stores.received_media

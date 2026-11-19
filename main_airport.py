@@ -68,6 +68,7 @@ from typing import Union
 from utils.control_panel import ControlPanel
 from utils.utf_utils import UtfConverter
 from utils.format_utils import FormatUtils
+from utils.media_identity import media_identity
 from utils.parse_utils import ParseUtils
 from utils.emoji_utils import EmojiUtils
 from utils.user_manager import AsyncUserManager, UserManager
@@ -1635,9 +1636,22 @@ async def _send_all_media_with_bot(
 				# 先检查 telethon userbot 是否有启用
 				if os.getenv("USERBOT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
 					file_id = str(item_data["file_id"])
-					records = await received_media_store.get_by_file_id(file_id)
+					identity = media_identity(file_id)
+					media_type = identity.get("media_type")
+					media_id = identity.get("media_id")
 					print(
-						f"[USERBOT_RECOVERY] file_id records found: {len(records)}",
+						f"[USERBOT_RECOVERY] decoded identity: "
+						f"media_type={media_type}, media_id={media_id}",
+						flush=True,
+					)
+					if media_type is None or media_id is None:
+						records = []
+					else:
+						records = await received_media_store.get_by_media_identity(
+							str(media_type), int(media_id),
+						)
+					print(
+						f"[USERBOT_RECOVERY] media identity records found: {len(records)}",
 						flush=True,
 					)
 					for record in records:

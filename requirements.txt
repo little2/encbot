@@ -4,3 +4,5 @@ aiohttp-socks>=0.10,<0.11
 python-dotenv==1.2.2
 Pillow>=11.0,<13
 ImageHash>=4.3,<5
+Telethon>=1.36,<2
+tg-file-id==0.0.4

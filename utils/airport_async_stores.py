@@ -44,6 +44,9 @@ class BatchViewStore(Protocol):
 
 @runtime_checkable
 class ReceivedMediaStore(Protocol):
+    async def update_storage_location(self, media_type: str, media_id: int,
+                                      chat_id: int, message_id: int) -> int: ...
+    async def update_media_identity(self, file_unique_id: str, metadata: dict) -> None: ...
     async def cleanup_stale_pending(self) -> int: ...
     async def claim(
         self, file_unique_id: str, file_id: str, file_type: str, user_id: int,
@@ -247,6 +250,28 @@ class _ClaimConflict(Exception):
 
 
 class _ReceivedMediaStore:
+    async def update_storage_location(self, media_type: str, media_id: int,
+                                      chat_id: int, message_id: int) -> int:
+        if media_type not in {"document", "photo"}:
+            return 0
+        async with self.database.transaction(write=True) as conn:
+            rows = await conn.fetch("""
+                UPDATE received_media SET storage_chat_id=$1, storage_message_id=$2
+                WHERE media_type=$3 AND media_id=$4
+                RETURNING file_unique_id
+            """, int(chat_id), int(message_id), media_type, int(media_id))
+            return len(rows)
+
+    async def update_media_identity(self, file_unique_id: str, metadata: dict) -> None:
+        if not metadata.get("media_type") or metadata.get("media_id") is None:
+            return
+        async with self.database.transaction(write=True) as conn:
+            await conn.execute("""
+                UPDATE received_media SET media_type=$1, media_id=$2,
+                    bot_id=COALESCE($3, bot_id) WHERE file_unique_id=$4
+            """, metadata["media_type"], metadata["media_id"],
+                 metadata.get("bot_id"), str(file_unique_id))
+
     PENDING_RETENTION_SECONDS = 24 * 60 * 60
 
     def __init__(self, database):
@@ -262,12 +287,16 @@ class _ReceivedMediaStore:
             return len(rows)
 
     async def claim(self, file_unique_id, file_id, file_type, user_id,
-                    source_chat_id, source_message_id) -> bool:
+                    source_chat_id, source_message_id, *, bot_id=None) -> bool:
         unique_id, reusable_file_id = str(file_unique_id or "").strip(), str(file_id or "").strip()
         if not unique_id:
             raise ValueError("file_unique_id is required")
         if not reusable_file_id:
             raise ValueError("file_id is required")
+        identity = {}
+        if bot_id is not None:
+            from utils.media_identity import media_identity
+            identity = media_identity(reusable_file_id, bot_id)
         async with self.database.transaction(write=True) as conn:
             row = await conn.fetchrow("""
                 INSERT INTO received_media (
@@ -280,8 +309,13 @@ class _ReceivedMediaStore:
             if row is None:
                 await conn.execute("""
                     UPDATE received_media SET file_id = $1
-                    WHERE file_unique_id = $2 AND file_id = ''
+                    WHERE file_unique_id = $2 AND file_id = '' AND status <> 'accepted'
                 """, reusable_file_id, unique_id)
+            if identity:
+                await conn.execute("""
+                    UPDATE received_media SET media_type=$1, media_id=$2, bot_id=$3
+                    WHERE file_unique_id=$4
+                """, identity["media_type"], identity["media_id"], identity["bot_id"], unique_id)
             return row is not None
 
     async def is_accepted(self, file_unique_id: str) -> bool:
@@ -308,6 +342,7 @@ class _ReceivedMediaStore:
                 str(item.get("thumb_file_unique_id", "") or "") or None,
                 str(item.get("thumb_phash", "") or "") or None, int(time.time()),
                 "pending",
+                item.get("media_type"), item.get("media_id"), item.get("bot_id"),
             ))
         return rows
 
@@ -333,14 +368,15 @@ class _ReceivedMediaStore:
                 for row in rows:
                     start = len(params) + 1
                     values.append(
-                        f"({_placeholders(start, 13)}, NULL)"
+                        f"({_placeholders(start, 16)}, NULL)"
                     )
                     params.extend(row)
                 inserted = await conn.fetch(f"""
                     INSERT INTO received_media (
                         file_unique_id, file_id, file_type, duration, first_user_id,
                         source_chat_id, source_message_id, batch_id, thumb_file_id,
-                        thumb_file_unique_id, thumb_phash, created_at, status, accepted_at
+                        thumb_file_unique_id, thumb_phash, created_at, status,
+                        media_type, media_id, bot_id, accepted_at
                     ) VALUES {', '.join(values)}
                     ON CONFLICT(file_unique_id) DO NOTHING RETURNING file_unique_id
                 """, *params)
@@ -651,6 +687,9 @@ async def _initialize_airport_schema_on_connection(conn, backend):
         "file_id": "TEXT NOT NULL DEFAULT ''", "duration": "BIGINT NOT NULL DEFAULT 0",
         "batch_id": "TEXT", "accepted_at": "BIGINT", "thumb_file_id": "TEXT",
         "thumb_file_unique_id": "TEXT", "thumb_phash": "TEXT",
+        "media_type": "TEXT CHECK (media_type IN ('document', 'photo'))",
+        "media_id": "BIGINT", "bot_id": "BIGINT",
+        "storage_chat_id": "BIGINT", "storage_message_id": "BIGINT",
     })
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_received_media_batch_id ON received_media(batch_id)")
     await conn.execute("""

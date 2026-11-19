@@ -378,10 +378,12 @@ class MediaForwardTask:
 	file_unique_id: str
 	thumb_bytes: bytes | None = None
 	thumb_phash: str | None = None
+	userbot_destination_id: int | None = None
 
 
 MEDIA_QUEUE: asyncio.Queue[tuple[Message, dict[str, Any]]] = asyncio.Queue(maxsize=100)
 MEDIA_FORWARD_QUEUE: asyncio.Queue[MediaForwardTask] = asyncio.Queue(maxsize=200)
+active_userbot: Any = None
 MEDIA_WORKER_COUNT = 3
 MEDIA_FORWARD_INTERVAL_SECONDS = 2.0
 MEDIA_FORWARD_MAX_ATTEMPTS = 3
@@ -1671,6 +1673,21 @@ def _enqueue_media_forward(task: MediaForwardTask) -> None:
 
 
 async def _forward_media_in_background(task: MediaForwardTask) -> None:
+	if getattr(task, "userbot_destination_id", None) is not None:
+		if getattr(active_userbot, "user_id", None) != task.userbot_destination_id:
+			return
+		try:
+			await _run_media_forward_operation(
+				lambda: bot.forward_message(
+					chat_id=task.userbot_destination_id,
+					from_chat_id=task.from_chat_id,
+					message_id=task.message_id,
+				),
+				f"userbot={task.userbot_destination_id} message={task.message_id}",
+			)
+		finally:
+			await asyncio.sleep(MEDIA_FORWARD_INTERVAL_SECONDS)
+		return
 	seen_destination_ids: set[int] = set()
 
 	remaining_apron_ids = list(APRON_CHANNEL_IDS)
@@ -1741,9 +1758,9 @@ async def _run_media_forward_operation(
 				f"({attempt}/{MEDIA_FORWARD_MAX_ATTEMPTS})",
 				flush=True,
 			)
+			await asyncio.sleep(wait_seconds)
 			if attempt >= MEDIA_FORWARD_MAX_ATTEMPTS:
 				break
-			await asyncio.sleep(wait_seconds)
 		except Exception as exc:
 			print(f"[MEDIA_FORWARD] {description} 失败: {exc}", flush=True)
 			if error_handler is not None:
@@ -2990,6 +3007,21 @@ async def _handle_send_encoded(
 	except Exception as exc:
 		print(f"[ENCODED_FORWARD] sending keyboard update failed: {exc}", flush=True)
 
+	# claim_batch has committed: the userbot can now find these media rows.
+	destination_id = getattr(active_userbot, "user_id", None)
+	if destination_id and owner_user_id != destination_id:
+		for item in items_snapshot:
+			if item.get("has_protected_content"):
+				continue
+			await MEDIA_FORWARD_QUEUE.put(MediaForwardTask(
+				from_chat_id=int(item["source_chat_id"]),
+				message_id=int(item["source_message_id"]),
+				file_id=str(item["file_id"]),
+				file_type=str(item["file_type"]),
+				file_unique_id=str(item["file_unique_id"]),
+				userbot_destination_id=destination_id,
+			))
+
 	task = asyncio.create_task(
 		_send_encoded_snapshot(
 			state_key=state_key,
@@ -3239,12 +3271,15 @@ async def _process_queued_media(
 		preview_info = _extract_preview_info(message, file_type, file_id)
 		preview_info["thumb_phash"] = ""
 		media_metadata = _extract_media_metadata(message, file_type)
+		from utils.media_identity import media_identity
+		media_metadata.update(media_identity(file_id, bot.id))
 		item = {
 			"file_id": file_id,
 			"file_unique_id": file_unique_id,
 			"file_type": file_type,
 			"source_chat_id": int(message.chat.id),
 			"source_message_id": int(message.message_id),
+			"has_protected_content": bool(message.has_protected_content),
 			**media_metadata,
 			**preview_info,
 		}
@@ -6448,6 +6483,9 @@ async def on_media(message: Message) -> None:
 		await message.reply(f"❌ 无法识别媒体: {exc}")
 		return
 
+	from utils.media_identity import media_identity
+	identity = media_identity(file_id, bot.id)
+	await received_media_store.update_media_identity(file_unique_id, identity)
 	if await received_media_store.is_accepted(file_unique_id):
 		batch_ids = await received_media_store.get_batch_ids([file_unique_id])
 		batch_id = batch_ids.get(file_unique_id)
@@ -8088,11 +8126,25 @@ async def _update_lobby_description() -> None:
 		print(f"[AIRPORT_LOBBY] 更新群组介绍失败: {exc}", flush=True)
 
 
+async def _on_userbot_message(event) -> None:
+	"""Immediate entry point for incoming user-account messages."""
+	from telethon_userbot import TelethonUserbot
+	identity = TelethonUserbot.get_media_identity(event)
+	if identity is None or event.chat_id is None:
+		return
+	media_type, media_id = identity
+	await received_media_store.update_storage_location(
+		media_type, media_id, event.chat_id, event.id,
+	)
+
+
 async def main() -> None:
 	global bot_name
+	global active_userbot
 	workers: list[asyncio.Task] = []
 	forward_worker = maintenance_worker = hot_worker = None
 	video_bot_task = backup_bot_task = None
+	userbot_task = None
 	try:
 		await _initialize_database()
 		try:
@@ -8105,6 +8157,18 @@ async def main() -> None:
 		except Exception as exc:
 			print(f"❌ Failed to get bot name: {exc}", flush=True)
 			return
+
+		if os.getenv("USERBOT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+			from telethon_userbot import TelethonUserbot
+			userbot = TelethonUserbot.from_env(_on_userbot_message)
+			active_userbot = userbot
+			userbot_task = asyncio.create_task(
+				userbot.run(notify_bot=f"@{bot_name}"), name="telethon_userbot"
+			)
+			def report_userbot_result(task):
+				if not task.cancelled() and task.exception() is not None:
+					print(f"[USERBOT_ERROR] {task.exception()}", flush=True)
+			userbot_task.add_done_callback(report_userbot_result)
 
 		await say_hello_to_x_man(bot_name)
 
@@ -8120,6 +8184,7 @@ async def main() -> None:
 		video_bot_enabled = str(
 			os.getenv("VIDEO_BOT_ENABLED", "false") or "false"
 		).strip().lower() in {"1", "true", "yes", "on"}
+		
 		if video_bot_enabled:
 			from video_bot import start_video_bot
 
@@ -8206,7 +8271,7 @@ async def main() -> None:
 		tasks = [*workers, *ENCODED_SEND_TASKS, *PENDING_THUMBNAIL_TASKS.values(), *(
 			task for task in (
 				forward_worker, maintenance_worker, hot_worker,
-				video_bot_task, backup_bot_task,
+				video_bot_task, backup_bot_task, userbot_task,
 			) if task is not None
 		)]
 		for task in tasks:

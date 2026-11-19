@@ -69,6 +69,18 @@ class ReceivedMediaStore:
             self.connection.execute(
                 "ALTER TABLE received_media ADD COLUMN thumb_phash TEXT"
             )
+        # Nullable additions preserve existing rows and positional insert APIs.
+        for name, definition in {
+            "media_type": "TEXT CHECK (media_type IN ('document', 'photo'))",
+            "media_id": "INTEGER",
+            "bot_id": "INTEGER",
+            "storage_chat_id": "INTEGER",
+            "storage_message_id": "INTEGER",
+        }.items():
+            if name not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE received_media ADD COLUMN {name} {definition}"
+                )
         self.connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_received_media_batch_id
             ON received_media(batch_id)

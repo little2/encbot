@@ -519,7 +519,8 @@ class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ns = dict(asyncio=asyncio, os=os, bot=SimpleNamespace(
             get_me=AsyncMock(return_value=SimpleNamespace(username="airport_test")),
             session=SimpleNamespace(close=AsyncMock())),
-            database_stores=SimpleNamespace(close=AsyncMock()), _initialize_database=AsyncMock(),
+            database_stores=SimpleNamespace(backend="sqlite", close=AsyncMock()),
+            database_keepalive_worker=AsyncMock(), _initialize_database=AsyncMock(),
             say_hello_to_x_man=AsyncMock(), reload_config=AsyncMock(),
             dp=SimpleNamespace(start_polling=AsyncMock()), BACKUP_BOT_TOKEN="", MEDIA_WORKER_COUNT=1,
             _media_worker=worker, _media_forward_worker=worker, _daily_maintenance_worker=worker,

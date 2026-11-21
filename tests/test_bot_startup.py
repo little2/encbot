@@ -90,7 +90,8 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
             ),
             "OPERATIONAL_NOTIFICATION_TASKS": set(),
             "_initialize_database": AsyncMock(),
-            "database_stores": SimpleNamespace(close=AsyncMock()),
+            "database_stores": SimpleNamespace(backend="sqlite", close=AsyncMock()),
+            "database_keepalive_worker": AsyncMock(),
             "_start_health_server": AsyncMock(return_value=(
                 SimpleNamespace(cleanup=AsyncMock()), "127.0.0.1:0",
             )),
@@ -152,7 +153,18 @@ class BotStartupTests(unittest.IsolatedAsyncioTestCase):
         await namespace["main"]()
 
         namespace["dp"].start_polling.assert_awaited_once_with(namespace["bot"])
+        namespace["database_keepalive_worker"].assert_not_awaited()
         namespace["bot"].session.close.assert_awaited_once()
+
+    async def test_main_starts_database_keepalive_for_postgres(self):
+        namespace = self._main_namespace()
+        namespace["BACKUP_BOT_TOKEN"] = ""
+        namespace["database_stores"].backend = "postgresql"
+        await namespace["main"]()
+
+        namespace["database_keepalive_worker"].assert_awaited_once_with(
+            namespace["database_stores"]
+        )
 
     async def test_main_closes_session_when_initialization_fails(self):
         namespace = self._main_namespace()

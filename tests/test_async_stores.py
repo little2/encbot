@@ -11,7 +11,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 from config import MAX_HP_CAPACITY_MINUTES
-from utils.async_stores import BlacklistStore, UserExpireStore, create_stores
+from utils.async_stores import (
+    BlacklistStore,
+    UserExpireStore,
+    create_stores,
+    database_keepalive_worker,
+)
 from utils.blacklist_utils import BlacklistStore as LegacyBlacklistStore
 from utils.user_utils import UserExpireCache
 
@@ -25,10 +30,24 @@ NOW = 1_700_000_000
 TEST_POSTGRES_DSN = os.getenv("ASYNC_STORES_TEST_POSTGRES_DSN", "")
 
 
+class DatabaseKeepaliveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pings_immediately_and_repeats_every_minute(self):
+        stores = AsyncMock()
+        with patch(
+            "utils.async_stores.asyncio.sleep",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await database_keepalive_worker(stores)
+        stores.ping.assert_awaited_once_with()
+        sleep.assert_awaited_once_with(60)
+
+
 class StoreContract:
     async def test_interfaces_and_missing_records(self):
         self.assertIsInstance(self.stores.users, UserExpireStore)
         self.assertIsInstance(self.stores.blacklist, BlacklistStore)
+        await self.stores.ping()
         self.assertIsNone(await self.stores.users.get(1))
         self.assertFalse(await self.stores.users.is_valid(1))
         self.assertEqual(await self.stores.users.count(), 0)

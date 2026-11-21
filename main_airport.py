@@ -73,7 +73,9 @@ from utils.parse_utils import ParseUtils
 from utils.emoji_utils import EmojiUtils
 from utils.user_manager import AsyncUserManager, UserManager
 from utils.blacklist_utils import BlacklistEntry
-from utils.async_stores import BlacklistStore, UserExpireStore
+from utils.async_stores import (
+	BlacklistStore, UserExpireStore, database_keepalive_worker,
+)
 from utils.airport_async_stores import (
 	AirportDatabaseStores, BatchStore, BatchViewStore, ReceivedMediaStore,
 	SharedInviteLinkStore, create_airport_stores,
@@ -8330,9 +8332,15 @@ async def main() -> None:
 	forward_worker = maintenance_worker = hot_worker = None
 	video_bot_task = backup_bot_task = None
 	userbot_task = None
+	database_keepalive_task = None
 	cache_cleanup_task = asyncio.create_task(SEND_BOT_CACHE.cleanup_worker())
 	try:
 		await _initialize_database()
+		if database_stores.backend == "postgresql":
+			database_keepalive_task = asyncio.create_task(
+				database_keepalive_worker(database_stores),
+				name="database_keepalive",
+			)
 		try:
 			me = await _telegram_call_with_retry("main bot get_me", bot.get_me)
 			bot_name = str(getattr(me, "username", "") or "").strip().lstrip("@")
@@ -8457,7 +8465,8 @@ async def main() -> None:
 		tasks = [*workers, *ENCODED_SEND_TASKS, *PENDING_THUMBNAIL_TASKS.values(), *(
 			task for task in (
 				forward_worker, maintenance_worker, hot_worker,
-				video_bot_task, backup_bot_task, userbot_task, cache_cleanup_task,
+				video_bot_task, backup_bot_task, userbot_task,
+				database_keepalive_task, cache_cleanup_task,
 			) if task is not None
 		)]
 		for task in tasks:

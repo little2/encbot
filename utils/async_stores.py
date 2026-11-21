@@ -371,6 +371,10 @@ class DatabaseStores:
     backend: str
     _database: Any
 
+    async def ping(self) -> None:
+        async with self._database.transaction() as conn:
+            await conn.fetchrow("SELECT 1")
+
     async def ban_user(self, user_id: int, reason: str, created_by: int,
                        expires_at: int = 0) -> BlacklistEntry:
         """Persist the ban and revoke the pass in one database transaction."""
@@ -427,6 +431,17 @@ class DatabaseStores:
 
     async def __aexit__(self, *exc):
         await self.close()
+
+
+async def database_keepalive_worker(stores: DatabaseStores) -> None:
+    while True:
+        try:
+            await stores.ping()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[DATABASE_KEEPALIVE] query failed: {exc}", flush=True)
+        await asyncio.sleep(60)
 
 
 async def _initialize(database):

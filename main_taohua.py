@@ -29,7 +29,9 @@ from utils.media_text_sender import MediaDelivery, MediaTextSender, RECOVERY_CAP
 from utils.parse_utils import ParseUtils
 from utils.user_manager import AsyncUserManager, UserManager
 from utils.blacklist_utils import BlacklistEntry
-from utils.async_stores import BlacklistStore, UserExpireStore
+from utils.async_stores import (
+	BlacklistStore, UserExpireStore, database_keepalive_worker,
+)
 from utils.airport_async_stores import (
 	AirportDatabaseStores,
 	BatchStore,
@@ -3757,12 +3759,18 @@ async def main() -> None:
 	global bot_name
 	backup_bot_task = None
 	maintenance_worker = None
+	database_keepalive_task = None
 	health_runner: web.AppRunner | None = None
 	try:
 		health_runner, bind_address = await _start_health_server()
 		print(f"HTTP 健康检查服务已启动：{bind_address}", flush=True)
 
 		await _initialize_database()
+		if database_stores.backend == "postgresql":
+			database_keepalive_task = asyncio.create_task(
+				database_keepalive_worker(database_stores),
+				name="database_keepalive",
+			)
 		try:
 			me = await _telegram_call_with_retry(
 				"main bot get_me", bot.get_me, retry_network_errors=True
@@ -3846,6 +3854,9 @@ async def main() -> None:
 		if maintenance_worker is not None:
 			maintenance_worker.cancel()
 			await asyncio.gather(maintenance_worker, return_exceptions=True)
+		if database_keepalive_task is not None:
+			database_keepalive_task.cancel()
+			await asyncio.gather(database_keepalive_task, return_exceptions=True)
 		if backup_bot_task is not None:
 			backup_bot_task.cancel()
 			await asyncio.gather(backup_bot_task, return_exceptions=True)

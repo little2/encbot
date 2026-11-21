@@ -3575,7 +3575,7 @@ async def _build_hot_message() -> str:
 	return "\n".join(lines)
 
 
-@dp.message(F.chat.type == "private", Command("hot"))
+@dp.message(F.chat.type == "private", Command("hotbar"))
 async def cmd_hot(message: Message) -> None:
 	await message.reply(await _build_hot_message(), parse_mode="HTML")
 
@@ -3599,7 +3599,7 @@ async def cmd_donate(message: Message) -> None:
 			inline_keyboard=[[
 				InlineKeyboardButton(
 					text="前往乐捐",
-					url="https://t.me/ztdonatebot",
+					url="https://t.me/ztTowerServiceBOT",
 				),
 			]],
 		),
@@ -8433,8 +8433,7 @@ async def main() -> None:
 		groups = (
 			("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
 			("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
-			("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
-			("AIRPORT_FLIGHT_BOARD_CHANNEL_ID", AIRPORT_FLIGHT_BOARD_CHANNEL_ID),
+			("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),			
 			*(
 				(f"APRON_CHANNEL_ID[{index}]", chat_id)
 				for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
@@ -8454,7 +8453,7 @@ async def main() -> None:
 				# BotCommand(command="start", description="开始"),
 				# BotCommand(command="about", description="关于我"),
 				BotCommand(command="me", description="查询飞行通行证"),
-				BotCommand(command="hot", description="查看七天热门资源"),
+				# BotCommand(command="hotbar", description="查看七天热门资源"),
 				BotCommand(command="donate", description="可用账号乐捐说明"),
 				# BotCommand(command="bonus", description="塔台发放 10 天时限"),
 				BotCommand(command="rule", description="查看飞行通行证规则"),

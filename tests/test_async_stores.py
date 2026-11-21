@@ -57,6 +57,20 @@ class StoreContract:
         self.assertFalse(await self.stores.blacklist.unban(1))
         self.assertEqual(await self.stores.blacklist.list_page(), ([], 0))
 
+    async def test_user_info_table_stores_bot_token_by_user_id(self):
+        user_id = 9_000_000_002
+        async with self.stores._database.transaction(write=True) as conn:
+            await conn.execute(
+                "INSERT INTO user_info (user_id, bot_token) VALUES ($1, $2)",
+                user_id, "test-token",
+            )
+        async with self.stores._database.transaction() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, bot_token FROM user_info WHERE user_id = $1",
+                user_id,
+            )
+        self.assertEqual(dict(row), {"user_id": user_id, "bot_token": "test-token"})
+
     async def test_updates_keep_group_timestamp_and_return_snapshots(self):
         users = self.stores.users
         user_id = 9_000_000_001
@@ -238,6 +252,13 @@ class SQLiteStoreTests(StoreContract, unittest.IsolatedAsyncioTestCase):
         self.path = Path(self.directory.name) / "users.sqlite3"
         self.stores = await create_stores(backend="sqlite", sqlite_path=self.path)
         self.addAsyncCleanup(self.stores.close)
+
+    async def test_user_info_schema_uses_varchar_200_and_primary_key(self):
+        columns = await self.stores._database.conn.fetch("PRAGMA table_info(user_info)")
+        by_name = {column["name"]: column for column in columns}
+        self.assertEqual(set(by_name), {"user_id", "bot_token"})
+        self.assertEqual(by_name["user_id"]["pk"], 1)
+        self.assertEqual(by_name["bot_token"]["type"], "VARCHAR(200)")
 
     async def test_reopen_preserves_data(self):
         await self.stores.users.update(1, NOW + 60, 123)

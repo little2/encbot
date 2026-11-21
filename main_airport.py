@@ -8097,12 +8097,19 @@ async def extract_encode(
 
 	# print(f"extract_encode: token={token}, data={data}, receiver_id={receiver_id}, flash_seconds={flash_seconds}, marked_flash_key={marked_flash_key}", flush=True)
 	try:
+		async with database_stores._database.transaction() as conn:
+			user_info = await conn.fetchrow(
+				"SELECT bot_token FROM user_info WHERE user_id = $1",
+				reader_user_id,
+			)
+		user_bot_token = str(user_info["bot_token"] or "").strip() if user_info else ""
+		
+
 		sent_media_messages, skipped_items, sendingbot_username = await _send_all_media(
 			message,
 			delivery_data,
 			receiver_id=receiver_id,
-			bot_token="9161318411:AAEkhWbmHXNaHF8etAQUsNUAt6dMhxvPjgY"
-			# bot_token="8203285248:AAFsBXrRO7hgDFA1eK6EOUoIYt7aDYYLdak"
+			bot_token=user_bot_token,
 		)
 		if not sent_media_messages and skipped_items:
 			raise ValueError("所有媒体的 file_id 均无效或暂时不可用")

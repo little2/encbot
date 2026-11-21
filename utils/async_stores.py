@@ -464,6 +464,11 @@ async def _initialize_schema(conn, backend):
             expires_at BIGINT NOT NULL DEFAULT 0
         )
     """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_info (
+            user_id BIGINT PRIMARY KEY, bot_token VARCHAR(200)
+        )
+    """)
     # Compatibility with the legacy SQLite schema, without changing old callers.
     for table, column in (("user_expire", "group_message_timestamp"),
                           ("user_expire", "subscription_status"),

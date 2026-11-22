@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 import base64
-from email.mime import message
+
 import hashlib
 import hmac
 
@@ -23,7 +23,7 @@ import os
 import secrets
 import sqlite3
 import tempfile
-import time as pytime
+
 from time import monotonic
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -64,11 +64,11 @@ from aiogram.types import (
 
 
 from html import escape
-from typing import Union
+
 from utils.control_panel import ControlPanel
 from utils.utf_utils import UtfConverter
 from utils.format_utils import FormatUtils
-from utils.media_identity import media_identity
+
 from utils.parse_utils import ParseUtils
 from utils.emoji_utils import EmojiUtils
 from utils.user_manager import AsyncUserManager, UserManager
@@ -371,6 +371,10 @@ X_MAN_PENDING_REPLY: asyncio.Future[str] | None = None
 X_MAN_PENDING_REQUEST_MESSAGE_ID: int | None = None
 X_MAN_PENDING_FILE_UNIQUE_ID: str | None = None
 X_MAN_REPLY_TIMEOUT_SECONDS = 30
+BACKUP_MAN_PENDING_REPLY: asyncio.Future[str] | None = None
+BACKUP_MAN_PENDING_FILE_UNIQUE_ID: str | None = None
+BACKUP_MAN_PENDING_USERBOT_ID: int | None = None
+BACKUP_MAN_REPLY_TIMEOUT_SECONDS = 30
 PAID_INVITE_LOCKS: dict[str, asyncio.Lock] = {}
 USED_PAID_INVITES: dict[str, int] = {}
 USED_INVITE_CONFIRMATIONS: dict[tuple[int, int], int] = {}
@@ -420,57 +424,59 @@ TAKEOFF_KICK_REASONS = {
 	"mixed": "同批不同系列，单品需独立上传，不同系列(弟弟)的不要混在一批上传",
 	"not_shota": "非正太资源，例如萝莉、男同、清水图等，机场不收。",
 	"clean": "纯清水图，没有色色的，没办法打飞机",
+	"off_topic": "文不对题，内容与主题无关",
 }
 PAID_INVITE_NAME_PATTERN = re.compile(
 	r"^PI1\.([0-9a-z]{1,13})\.([0-9a-z]{5})\.([A-Za-z0-9_-]{8})$"
 )
 AIRPORT_INVITE_LINK_KEY = "airport-approved"
 AIRPORT_INVITE_LINK_NAME = "airport-approved-url"
+
+
 AIRPORT_QUIZ_QUESTIONS = (
 	(
-		"关于机场内资源的使用与讨论，以下哪种做法符合“三个禁止”？",
+		"以下哪项符合机场的「三个禁止」？",
 		(
-			"利用资源营利，但不转发评论",
-			"禁止营利，但可私下转发",
-			"禁止转发，但可公开评判他人",
+			"可以营利，但不能外传",
+			"禁止营利，允许私下转发",
 			"不营利、不外传、不随意评判",
-			"小众资源不能外传，其他可分享",
-		),
-		3,
-	),
-	(
-		"关于成员参与和群内关系，以下哪种态度符合机场的“三个原则”？",
-		(
-			"塔台是主人，成员只需服从",
-			"真诚发言或分享，共同参与交流",
-			"塔台应监督消息并处理所有争议",
-			"成员只领取资源，不必参与",
-			"群内参与应以付费交易为主",
-		),
-		1,
-	),
-	(
-		"面对群内争议、系统故障或违规行为，以下哪种理解符合“三个任性”？",
-		(
-			"塔台须裁决资源归属与所有纠纷",
-			"故障时塔台须立即修复并赔偿",
-			"成员被移除后须公开完整说明",
-			"群内无需管理，也不处理违规",
-			"塔台须判定成员间一切是非",
-			"违反核心价值者可被移除且不另解释",
-		),
-		5,
-	),
-	(
-		"如果想维持飞行通行证的有效期，以下哪种做法符合机场规则？",
-		(
-			"只领取资源，不参与群内互动",
-			"付费购买通行证有效期",
-			"有效发言或上传资源保持活跃",
-			"外传群内资源换取有效期",
-			"上传非正太或萝莉资源",
+			"禁止外传，但可以批评他人",
+			"只有小众资源禁止外传",
 		),
 		2,
+	),
+	(
+		"以下哪项符合机场的「三个原则」？",
+		(
+			"成员只领取资源，无需参与",
+			"塔台负责监督所有消息",
+			"塔台是主人，成员必须服从",
+			"通过付费获得更多权限",
+			"真诚交流、积极分享、共同参与",
+		),
+		4,
+	),
+	(
+		"以下哪项符合塔台的「三个任性」？",
+		(
+			"塔台不负责裁决纠纷或立即修复故障",
+			"塔台必须处理所有成员争议",
+			"机器人故障必须立即修复",
+			"移除成员前必须公开理由",
+			"塔台完全不处理违规内容",
+		),
+		0,
+	),
+	(
+		"如何延长飞行通行证的有效期？",
+		(
+			"只领取资源，不参与交流",
+			"付费购买有效期",
+			"转发机场资源换取有效期",
+			"有效发言或上传合规资源",
+			"重复上传相同资源",
+		),
+		3,
 	),
 	(
 		"上传媒体资源时，以下哪种做法符合机场的上传规定？",
@@ -484,17 +490,19 @@ AIRPORT_QUIZ_QUESTIONS = (
 		4,
 	),
 	(
-		"关于塔台(机器人)、飞机场(频道)与航站大厅(群组)的作用，以下哪一项说明错误？",
+		"以下哪项符合机场的「小群理念」？",
 		(
-			"塔台用于分享资源及进入群组",
-			"指路牌用于指引前往机场",
-			"飞机场用于查看并获取资源",
-			"航站大厅用于交流并延长通行证",
-			"三者功能完全相同",
+			"公开招募成员，越多人越好",
+			"追求海量资源，鼓励大量水群",
+			"只看资源数量，不在乎群组氛围",
+			"保持小群规模，欢迎同好介绍朋友",
+			"禁止成员介绍任何朋友加入",
 		),
-		4,
+		3,
 	),
 )
+
+
 
 JOIN_MODE = "invite"  # 可选值: "invite" 或 "request"
 
@@ -1304,9 +1312,11 @@ def _normalize_receiver_chat_id(
 
 
 
-async def _send_media_with_bot(sending_bot, file_type, file_id, chat_id, no_forward, if_spoiler) -> Message:
+async def _send_media_with_bot(
+	sending_bot, file_type, file_id, chat_id, no_forward, if_spoiler, *, caption: str | None = None,
+) -> Message:
 	if file_type == "document":
-		return await sending_bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward)
+		return await sending_bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward, caption=caption)
 	if file_type == "photo":
 		async with ENCODED_FORWARD_SEND_LOCK:
 			return await sending_bot.send_photo(
@@ -1314,6 +1324,7 @@ async def _send_media_with_bot(sending_bot, file_type, file_id, chat_id, no_forw
 				photo=file_id,
 				protect_content=no_forward,
 				has_spoiler=if_spoiler,
+				caption=caption,
 			)
 	if file_type == "video":
 		async with ENCODED_FORWARD_SEND_LOCK:
@@ -1322,17 +1333,19 @@ async def _send_media_with_bot(sending_bot, file_type, file_id, chat_id, no_forw
 				video=file_id,
 				protect_content=no_forward,
 				has_spoiler=if_spoiler,
+				caption=caption,
 			)
 	if file_type == "audio":
-		return await sending_bot.send_audio(chat_id=chat_id, audio=file_id, protect_content=no_forward)
+		return await sending_bot.send_audio(chat_id=chat_id, audio=file_id, protect_content=no_forward, caption=caption)
 	if file_type == "voice":
-		return await sending_bot.send_voice(chat_id=chat_id, voice=file_id, protect_content=no_forward)
+		return await sending_bot.send_voice(chat_id=chat_id, voice=file_id, protect_content=no_forward, caption=caption)
 	if file_type == "animation":
 		return await sending_bot.send_animation(
 			chat_id=chat_id,
 			animation=file_id,
 			protect_content=no_forward,
 			has_spoiler=if_spoiler,
+			caption=caption,
 		)
 	if file_type == "sticker":
 		return await sending_bot.send_sticker(chat_id=chat_id, sticker=file_id, protect_content=no_forward)
@@ -1487,6 +1500,45 @@ async def _wait_for_x_man_reply_with_bot(
 			return reply_file_id if reply_file_id != "na" else None
 
 
+async def _wait_for_userbot_media_with_bot(
+	active_bot: Bot,
+	file_unique_id: str,
+	userbot_id: int,
+) -> str | None:
+	"""Poll a non-primary sending bot for the media forwarded by the userbot."""
+	loop = asyncio.get_running_loop()
+	deadline = loop.time() + BACKUP_MAN_REPLY_TIMEOUT_SECONDS
+	offset: int | None = None
+
+	while True:
+		remaining = deadline - loop.time()
+		if remaining <= 0:
+			raise TimeoutError
+		poll_timeout = max(1, min(10, int(remaining)))
+		updates = await asyncio.wait_for(
+			active_bot.get_updates(
+				offset=offset,
+				timeout=poll_timeout,
+				allowed_updates=["message"],
+				request_timeout=poll_timeout + 5,
+			),
+			timeout=remaining,
+		)
+		for update in updates:
+			offset = update.update_id + 1
+			message = update.message
+			if message is None or message.from_user is None:
+				continue
+			if int(message.from_user.id) != userbot_id:
+				continue
+			try:
+				if _extract_media_unique_id(message) != file_unique_id:
+					continue
+				return _get_x_man_reply_file_id(message)
+			except ValueError:
+				continue
+
+
 async def _request_x_man(
 	file_unique_id: str,
 	sending_bot: Bot | None = None,
@@ -1537,6 +1589,175 @@ async def _request_x_man(
 		return reply_file_id if reply_file_id and reply_file_id != "na" else None
 
 
+async def _request_backup_man(
+	item_data: dict,
+	sending_bot: Bot | None = None,
+	*,
+	allow_storage_upload: bool = True,
+) -> str | None:
+	global BACKUP_MAN_PENDING_REPLY
+	global BACKUP_MAN_PENDING_FILE_UNIQUE_ID, BACKUP_MAN_PENDING_USERBOT_ID
+
+
+	# file_id is bot-specific, but identifies the original received_media row for Bot B.
+	# Storage updates use that row's file_unique_id carried in the caption to Userbot C.
+	records = await received_media_store.get_by_file_id(item_data["file_id"])
+
+
+	# Iterate through the media identity records and attempt to forward them using the active userbot
+	for record in records:
+		print(f"[USERBOT_RECOVERY] record={record}", flush=True)
+		storage_chat_id = record.get("storage_chat_id")
+		storage_message_id = record.get("storage_message_id")
+		if storage_chat_id is None or storage_message_id is None:
+			# 若沒有 storage 紀錄
+			if active_userbot is None or getattr(active_userbot, "user_id", None) is None:
+				print("[USERBOT_RECOVERY] userbot is not connected", flush=True)
+				break
+			if not allow_storage_upload:
+				print(
+					"[USERBOT_RECOVERY] storage location was still unavailable after upload, skipped",
+					flush=True,
+				)
+				continue
+			caption_file_unique_id = str(record.get("file_unique_id") or "").strip()
+			if not caption_file_unique_id:
+				print("[USERBOT_RECOVERY] record has no file_unique_id, skipped", flush=True)
+				continue
+
+			try:
+				# Bot B 將媒體傳給 Userbot C
+				await _send_media_with_bot(
+					bot,
+					str(item_data["file_type"]),
+					str(item_data["file_id"]),
+					int(active_userbot.user_id),
+					False,
+					bool(item_data.get("if_spoiler", False)),
+					caption=caption_file_unique_id,
+				)
+			except Exception as upload_exc:
+				print(
+					f"[USERBOT_RECOVERY] 嘗試將媒體由 Bot B 上傳到 userbot C 失敗: {upload_exc}",
+					flush=True,
+				)
+				try:
+					
+					recovered_file_id = await _request_x_man(
+						caption_file_unique_id,
+						sending_bot,
+					)
+					if recovered_file_id:
+						print(
+							"[USERBOT_RECOVERY] recovered media through X-Man after userbot upload failed",
+							flush=True,
+						)
+						return recovered_file_id
+				except Exception as x_man_exc:
+					print(
+						f"[USERBOT_RECOVERY] X-Man fallback failed: {x_man_exc}",
+						flush=True,
+					)
+				# 如果失敗，則使用 _request_x_man 來取得媒體
+				continue
+
+			# 等待 C 的入站事件回填 storage_chat_id／`storage_message_id`，最多約 5 秒。
+			for _ in range(20):
+				refreshed_records = await received_media_store.get_by_file_unique_id(
+					caption_file_unique_id,
+				)
+				if any(
+					refreshed.get("storage_chat_id") is not None
+					and refreshed.get("storage_message_id") is not None
+					for refreshed in refreshed_records
+				):
+					break
+				await asyncio.sleep(0.25)
+			print(
+				"[USERBOT_RECOVERY] uploaded media to userbot; retrying storage lookup",
+				flush=True,
+			)
+			# C 從 storage 轉送媒體給 Bot D
+			return await _request_backup_man(
+				item_data,
+				sending_bot,
+				allow_storage_upload=False,
+			)
+
+		if active_userbot is None or getattr(active_userbot, "user_id", None) is None:
+			print("[USERBOT_RECOVERY] userbot is not connected", flush=True)
+			break
+
+		active_bot = sending_bot if sending_bot is not None else bot
+		pending_reply: asyncio.Future[str] | None = None
+		try:
+			file_unique_id = str(record.get("file_unique_id") or "").strip()
+			if not file_unique_id:
+				print(
+					"[USERBOT_RECOVERY] stored record has no file_unique_id, skipped",
+					flush=True,
+				)
+				continue
+			sending_bot_info = await active_bot.get_me()
+			sending_bot_username = str(
+				getattr(sending_bot_info, "username", "") or ""
+			).strip().lstrip("@")
+			destination = (
+				f"@{sending_bot_username}"
+				if sending_bot_username
+				else int(sending_bot_info.id)
+			)
+
+			if active_bot is bot:
+				# 等待 Bot D 收到 C 的媒體，擷取該訊息的新 file_id
+				pending_reply = asyncio.get_running_loop().create_future()
+				BACKUP_MAN_PENDING_REPLY = pending_reply
+				BACKUP_MAN_PENDING_FILE_UNIQUE_ID = file_unique_id
+				BACKUP_MAN_PENDING_USERBOT_ID = int(active_userbot.user_id)
+
+			forwarded_message_id = await active_userbot.forward_stored_message(
+				int(storage_chat_id),
+				int(storage_message_id),
+				destination,
+			)
+			print(
+				f"[USERBOT_RECOVERY] media forwarded to {destination}: "
+				f"message_id={forwarded_message_id}",
+				flush=True,
+			)
+
+			if pending_reply is not None:
+				recovered_file_id = await asyncio.wait_for(
+					pending_reply,
+					timeout=BACKUP_MAN_REPLY_TIMEOUT_SECONDS,
+				)
+			else:
+				recovered_file_id = await _wait_for_userbot_media_with_bot(
+					active_bot,
+					file_unique_id,
+					int(active_userbot.user_id),
+				)
+			# Bot D 用新 file_id 發送給 User E
+			return recovered_file_id if recovered_file_id != "na" else None
+
+		except TimeoutError:
+			print("[USERBOT_RECOVERY] timed out waiting for sending bot media", flush=True)
+			continue
+		except Exception as userbot_exc:
+			print(
+				f"[USERBOT_RECOVERY] stored media send failed: {userbot_exc}",
+				flush=True,
+			)
+			continue
+		finally:
+			if BACKUP_MAN_PENDING_REPLY is pending_reply:
+				BACKUP_MAN_PENDING_REPLY = None
+				BACKUP_MAN_PENDING_FILE_UNIQUE_ID = None
+				BACKUP_MAN_PENDING_USERBOT_ID = None
+
+		
+		
+		
 async def _send_all_media(
 	message: Message,
 	data: dict[str, Any],
@@ -1553,13 +1774,17 @@ async def _send_all_media(
 		if not sendingbot_username:
 			raise RuntimeError("发送媒体的机器人没有 username")
 
-		sent_messages, skipped_items = await _send_all_media_with_bot(
-			message,
-			data,
-			receiver_id,
-			active_bot,
-		)
-		return sent_messages, skipped_items, sendingbot_username
+		try:
+			sent_messages, skipped_items = await _send_all_media_with_bot(
+				message,
+				data,
+				receiver_id,
+				active_bot,
+			)
+			return sent_messages, skipped_items, sendingbot_username
+		except Exception as exc:
+			print(f"[TAKEOFF:1784] media delivery exception: {exc}", flush=True)
+			raise
 
 	token = str(bot_token or "").strip()
 	if token and token != bot.token:
@@ -1619,6 +1844,7 @@ async def _send_all_media_with_bot(
 				skipped_items.append(item)
 				return
 
+			# Runway Bot D 發送失敗且為 wrong file identifier 時進入 recovery
 			try:
 				if not recovery_notice_sent:
 					recovery_notice_sent = True
@@ -1628,7 +1854,7 @@ async def _send_all_media_with_bot(
 								receiver_id,
 								default_chat_id=message.from_user.id if message.from_user else None,
 							),
-							text="⏳ 部分资源暂时无法直接发送，正在通过备份机器人恢复，请稍候，恢复后会继续发送。",
+							text="⏳ 部分资源暂时无法直接发送，正在通过备份机器人恢复，请稍候，恢复后会继续发送。(不需要重复获取)",
 						)
 					except Exception as notice_exc:
 						print(f"[MEDIA_SEND] recovery notice failed: {notice_exc}", flush=True)
@@ -1637,85 +1863,19 @@ async def _send_all_media_with_bot(
 
 				# 先检查 telethon userbot 是否有启用
 				if os.getenv("USERBOT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
-					file_id = str(item_data["file_id"])
-					identity = media_identity(file_id)
-					media_type = identity.get("media_type")
-					media_id = identity.get("media_id")
-					print(
-						f"[USERBOT_RECOVERY] decoded identity: "
-						f"media_type={media_type}, media_id={media_id}",
-						flush=True,
-					)
-					if media_type is None or media_id is None:
-						records = []
-					else:
-						records = await received_media_store.get_by_media_identity(
-							str(media_type), int(media_id),
-						)
-					print(
-						f"[USERBOT_RECOVERY] media identity records found: {len(records)}",
-						flush=True,
-					)
-					for record in records:
-						print(f"[USERBOT_RECOVERY] record={record}", flush=True)
-						storage_chat_id = record.get("storage_chat_id")
-						storage_message_id = record.get("storage_message_id")
-						if storage_chat_id is None or storage_message_id is None:
-							print(
-								"[USERBOT_RECOVERY] record has no storage location, skipped",
-								flush=True,
-							)
-							continue
-						if active_userbot is None or getattr(active_userbot, "user_id", None) is None:
-							print("[USERBOT_RECOVERY] userbot is not connected", flush=True)
-							break
+					'''
+					要求 userbot 傳送媒體資源給跑道機器人
+					'''
 
-						try:
-							sending_bot_info = await sending_bot.get_me()
-							sending_bot_username = str(
-								getattr(sending_bot_info, "username", "") or ""
-							).strip().lstrip("@")
-							destination = (
-								f"@{sending_bot_username}"
-								if sending_bot_username
-								else int(sending_bot_info.id)
-							)
-							forwarded_message_id = await active_userbot.forward_stored_message(
-								int(storage_chat_id),
-								int(storage_message_id),
-								destination,
-							)
-							print(
-								f"[USERBOT_RECOVERY] media forwarded to {destination}: "
-								f"message_id={forwarded_message_id}",
-								flush=True,
-							)
-							sent = await sending_bot.forward_message(
-								chat_id=_normalize_receiver_chat_id(
-									receiver_id,
-									default_chat_id=(
-										message.from_user.id if message.from_user else None
-									),
-								),
-								from_chat_id=int(active_userbot.user_id),
-								message_id=forwarded_message_id,
-								protect_content=bool(item_data.get("no_forward", False)),
-							)
-						except Exception as userbot_exc:
-							print(
-								f"[USERBOT_RECOVERY] stored media send failed: {userbot_exc}",
-								flush=True,
-							)
-							continue
-
-						print(
-							f"[USERBOT_RECOVERY] media delivered to receiver: "
-							f"message_id={sent.message_id}",
-							flush=True,
-						)
-						sent_messages.append(sent)
-						return
+					async with BACKUP_FORWARD_SEND_LOCK:						
+						recovered_file_id = await _request_backup_man(item_data, sending_bot)
+					if recovered_file_id:
+						recovered_item = {**item, "file_id": recovered_file_id}
+						await send_item(recovered_item, allow_recovery=False)
+						return			
+					
 				else:
+					# 未启用跑道机器人
 					file_id = str(item_data["file_id"])
 
 					async with BACKUP_FORWARD_SEND_LOCK:
@@ -1813,7 +1973,19 @@ async def _send_all_media_with_bot(
 		pending_kind = kind
 		pending_group.append(item)
 
-	await flush_group()
+
+	try:
+		await flush_group()
+	except Exception as exc:
+		print(f"[TAKEOFF:1984] flush group exception: {exc}", flush=True)
+		if "chat not found" in str(exc):
+			sending_bot_info = await sending_bot.get_me()
+			sending_bot_username = str(sending_bot_info.username or "")
+			print(f"[MEDIA_SEND:1992] sending bot info: {sending_bot_username}", flush=True)
+			raise RuntimeError(f"需要先启用跑道 @{sending_bot_username}")
+
+	
+	
 	return sent_messages, skipped_items
 
 
@@ -1848,11 +2020,16 @@ async def _forward_media_in_background(task: MediaForwardTask) -> None:
 		if getattr(active_userbot, "user_id", None) != task.userbot_destination_id:
 			return
 		try:
+			print(f"[MEDIA_FORWARD] forwarding media with userbot={task.userbot_destination_id} file_unique_id={task.file_unique_id}", flush=True)
 			await _run_media_forward_operation(
-				lambda: bot.forward_message(
-					chat_id=task.userbot_destination_id,
-					from_chat_id=task.from_chat_id,
-					message_id=task.message_id,
+				lambda: _send_media_with_bot(
+					bot,
+					task.file_type,
+					task.file_id,
+					task.userbot_destination_id,
+					False,
+					False,
+					caption=task.file_unique_id,
 				),
 				f"userbot={task.userbot_destination_id} message={task.message_id}",
 			)
@@ -3180,9 +3357,11 @@ async def _handle_send_encoded(
 
 	# claim_batch has committed: the userbot can now find these media rows.
 	destination_id = getattr(active_userbot, "user_id", None)
+
 	if destination_id and owner_user_id != destination_id:
 		for item in items_snapshot:
-			if item.get("has_protected_content"):
+			if item.get("has_protected_content") and not item.get("has_protected_content") != "None":
+				print(f"[MEDIA_FORWARD] skipping protected content: {item['file_unique_id']}", flush=True)
 				continue
 			await MEDIA_FORWARD_QUEUE.put(MediaForwardTask(
 				from_chat_id=int(item["source_chat_id"]),
@@ -3192,7 +3371,6 @@ async def _handle_send_encoded(
 				file_unique_id=str(item["file_unique_id"]),
 				userbot_destination_id=destination_id,
 			))
-
 	task = asyncio.create_task(
 		_send_encoded_snapshot(
 			state_key=state_key,
@@ -3442,16 +3620,15 @@ async def _process_queued_media(
 		preview_info = _extract_preview_info(message, file_type, file_id)
 		preview_info["thumb_phash"] = ""
 		media_metadata = _extract_media_metadata(message, file_type)
-		from utils.media_identity import media_identity
-		media_metadata.update(media_identity(file_id, bot.id))
+		
+		
 		item = {
 			"file_id": file_id,
 			"file_unique_id": file_unique_id,
 			"file_type": file_type,
 			"source_chat_id": int(message.chat.id),
 			"source_message_id": int(message.message_id),
-			"has_protected_content": bool(message.has_protected_content),
-			**media_metadata,
+			"has_protected_content": bool(message.has_protected_content),			
 			**preview_info,
 		}
 		session["items"].append(item)
@@ -6526,75 +6703,104 @@ async def on_x_man_reply(message: Message) -> None:
 	pending_reply.set_result(_get_x_man_reply_file_id(message))
 
 
+class UserbotRecoveryMediaFilter(BaseFilter):
+	async def __call__(self, message: Message) -> bool:
+		pending_reply = BACKUP_MAN_PENDING_REPLY
+		if (
+			pending_reply is None
+			or pending_reply.done()
+			or message.from_user is None
+			or BACKUP_MAN_PENDING_USERBOT_ID is None
+			or int(message.from_user.id) != BACKUP_MAN_PENDING_USERBOT_ID
+		):
+			return False
+		try:
+			return _extract_media_unique_id(message) == BACKUP_MAN_PENDING_FILE_UNIQUE_ID
+		except ValueError:
+			return False
+
+
+@dp.message(
+	F.chat.type == "private",
+	F.document | F.photo | F.video | F.audio | F.voice | F.animation | F.sticker,
+	UserbotRecoveryMediaFilter(),
+)
+async def on_userbot_recovery_media(message: Message) -> None:
+	pending_reply = BACKUP_MAN_PENDING_REPLY
+	if pending_reply is None or pending_reply.done():
+		return
+	pending_reply.set_result(_get_x_man_reply_file_id(message))
+
+
 
 def parse_bj_tag_for_file(tag_str):
-    tag_cn_list = []
-    if tag_str:
-       # 将 tag_str 按空白符号分割
-        tag_list = tag_str.split()
-        for tag in tag_list:
-            # 移除 tag 前的 #
-            tag = tag.lstrip('#')
+	tag_cn_list = []
+	if tag_str:
+	   # 将 tag_str 按空白符号分割
+		tag_list = tag_str.split()
+		for tag in tag_list:
+			# 移除 tag 前的 #
+			tag = tag.lstrip('#')
 
-            tag_mapping = {
-                "白种人": "白人",
-                "黑种人": "黑人",
-                "露脸": "有露脸",
-                "遮挡": "带了面罩",
-                "未露脸": "没有露脸",
-                "无毛": "高年级_小五",
-                "中毛": "少年_高中",
-                "黑森林": "少年_高中",
-                "幼儿": "低年级_小二",
-                "小学": "低年级_小二",
-                "初中": "初毛",
-                "高中": "少年_高中",
-                "合法": "少年_高中",
-                "清水": "没有裸体",
-                "写真": "正太主题汇整",
-                "动画": "卡通动漫",
-                "母子": "正太与阿姨",
-                "肛交": "爆菊",
-                "口交": "口交",
-                "足交": "恋足",
-                "自撸": "撸管",
-                "射精": "射精",
-                "展示": "正太独秀",
-                "摸": "手交",
-                "偷拍": "偷拍",
-                "胖太": "胖太",
-                "TK挠痒": "瘙痒",
-                "SP打屁股": "打屁股",
-                "恋物": "恋物",
-                "猎奇重口": "猎奇",
-                "医学类": "医学",
-                "霸凌": "霸凌",
-                "监视": "监视器",
-                "直播录屏": "直播",
-                "冰淇淋": "冰淇淋",
-                "奶黄包": "奶黄包",
-                "眼镜哥": "眼镜哥系列",
-                "西边的风":"西边的风",
-                "日本全方位":"日本全方位",
-                "小孩不笨":"小孩不笨",  #
-                "网调大神":"网调大神",  #
-                "猫系列":"猫系列",
-                "雨花石":"雨花石系列",
-                "早点睡觉caodidi":"Caodidi系列",
-                "BB嵬":"BB嵬",
-                "we出品":"WE系列",
-                "堂山天草":"堂山",
-                "么么哒视频":"么么哒视频", #
-                "么么哒举牌原创":"么么哒举牌原创", #
-                "小6童模":"小六摄影",
-                "ledi二维码":"二维码系列"
-            }
+			tag_mapping = {
+				"白种人": "白人",
+				"黑种人": "黑人",
+				"露脸": "有露脸",
+				"遮挡": "带了面罩",
+				"未露脸": "没有露脸",
+				"无毛": "高年级_小五",
+				"中毛": "少年_高中",
+				"黑森林": "少年_高中",
+				"幼儿": "低年级_小二",
+				"小学": "低年级_小二",
+				"初中": "初毛",
+				"高中": "少年_高中",
+				"合法": "少年_高中",
+				"清水": "没有裸体",
+				"写真": "正太主题汇整",
+				"动画": "卡通动漫",
+				"母子": "正太与阿姨",
+				"肛交": "爆菊",
+				"口交": "口交",
+				"足交": "恋足",
+				"自撸": "撸管",
+				"射精": "射精",
+				"展示": "正太独秀",
+				"摸": "手交",
+				"偷拍": "偷拍",
+				"胖太": "胖太",
+				"TK挠痒": "瘙痒",
+				"SP打屁股": "打屁股",
+				"恋物": "恋物",
+				"猎奇重口": "猎奇",
+				"医学类": "医学",
+				"霸凌": "霸凌",
+				"监视": "监视器",
+				"直播录屏": "直播",
+				"冰淇淋": "冰淇淋",
+				"奶黄包": "奶黄包",
+				"眼镜哥": "眼镜哥系列",
+				"西边的风":"西边的风",
+				"日本全方位":"日本全方位",
+				"小孩不笨":"小孩不笨",  #
+				"网调大神":"网调大神",  #
+				"猫系列":"猫系列",
+				"雨花石":"雨花石系列",
+				"早点睡觉caodidi":"Caodidi系列",
+				"BB嵬":"BB嵬",
+				"we出品":"WE系列",
+				"堂山天草":"堂山",
+				"么么哒视频":"么么哒视频", #
+				"么么哒举牌原创":"么么哒举牌原创", #
+				"小6童模":"小六摄影",
+				"ledi二维码":"二维码系列"
+			}
 
-            # 替换标签
-            tag = tag_mapping.get(tag, tag)  # 如果 tag 不在映射中，就保留原值
-            tag_cn_list.append(tag)
+			# 替换标签
+			tag = tag_mapping.get(tag, tag)  # 如果 tag 不在映射中，就保留原值
+			tag_cn_list.append(tag)
 
-    return tag_cn_list
+	return tag_cn_list
 
 
 def _extract_caption(message: Message) -> dict:
@@ -6654,9 +6860,6 @@ async def on_media(message: Message) -> None:
 		await message.reply(f"❌ 无法识别媒体: {exc}")
 		return
 
-	from utils.media_identity import media_identity
-	identity = media_identity(file_id, bot.id)
-	await received_media_store.update_media_identity(file_unique_id, identity)
 	if await received_media_store.is_accepted(file_unique_id):
 		batch_ids = await received_media_store.get_batch_ids([file_unique_id])
 		batch_id = batch_ids.get(file_unique_id)
@@ -7451,6 +7654,7 @@ async def on_takeoff_fly(
 
 		except Exception as exc:
 			await user_expire_cache.refund_minutes(reader_user_id, requested_minutes)
+			print(f"[TAKEOFF:7289] media delivery exception: {send_result} {exc}", flush=True)
 			if "启用跑道" in str(exc):
 				print(f"[TAKEOFF:7291] media delivery failed: {exc}", flush=True)
 				return {
@@ -7946,15 +8150,13 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 			selected_tags = state.get("selected_tags", [])
 
 			is_admin = callback.from_user.id in ADMIN_USER_IDS
-			
-			if len(selected_tags) < 3 and not is_admin:
-				state["send_confirm_pending"] = False
-				pending_reason_text += "\n❌ 必须选择至少三个标签。"
-				# await callback.answer(
-				# 	"❌ 必须选择至少三个标签。",
-				# 	show_alert=True,
-				# )
-				# return
+
+			# TODO
+				
+			# if len(selected_tags) < 3 and not is_admin:
+			# 	state["send_confirm_pending"] = False
+			# 	pending_reason_text += "\n❌ 必须选择至少三个标签。"
+
 			
 
 			if pending_reason_text:
@@ -8322,6 +8524,18 @@ async def _update_lobby_description() -> None:
 
 async def _on_userbot_message(event) -> None:
 	"""Immediate entry point for incoming user-account messages."""
+	if not event.is_private:
+		return
+	print(f"_on_userbot_message message=>{event.message}",flush=True)
+	caption_file_unique_id = str(getattr(event.message, "message", "") or "").strip()
+	if caption_file_unique_id:
+		updated_count = await received_media_store.update_storage_location_by_file_unique_id(
+			caption_file_unique_id,
+			event.chat_id,
+			event.id,
+		)
+		if updated_count:
+			return
 	from telethon_userbot import TelethonUserbot
 	identity = TelethonUserbot.get_media_identity(event)
 	if identity is None or event.chat_id is None:

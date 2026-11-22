@@ -106,13 +106,13 @@ class TelethonUserbot:
             if me.bot:
                 raise ValueError("USERBOT_SESSION must belong to a user account")
             self.user_id = me.id
-            print(f"[USERBOT] Logged in: {me.id}", flush=True)
+            print(f"👦 [USERBOT] Logged in: {me.id}", flush=True)
             if notify_bot:
                 try:
                     await self.client.send_message(
-                        notify_bot, f"TelethonUserbot 已啟動並登入成功（user_id={me.id}）。"
+                        notify_bot, f"/start"
                     )
-                    print(f"[USERBOT] Startup notification sent to {notify_bot}", flush=True)
+                    print(f"👦 [USERBOT] Startup notification sent to {notify_bot}", flush=True)
                 except Exception:
                     logger.exception("Could not send userbot startup notification to %s", notify_bot)
             await self.client.run_until_disconnected()

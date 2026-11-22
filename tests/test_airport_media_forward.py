@@ -11,7 +11,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "main_airport.py"
 
 
 def load_function(name, namespace):
-    tree = ast.parse(SOURCE.read_text())
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     function = next(
         node
         for node in tree.body

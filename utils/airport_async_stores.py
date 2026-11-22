@@ -46,9 +46,17 @@ class BatchViewStore(Protocol):
 class ReceivedMediaStore(Protocol):
     async def update_storage_location(self, media_type: str, media_id: int,
                                       chat_id: int, message_id: int) -> int: ...
+    async def update_storage_location_by_file_id(
+        self, file_id: str, chat_id: int, message_id: int,
+    ) -> int: ...
+    async def update_storage_location_by_file_unique_id(
+        self, file_unique_id: str, chat_id: int, message_id: int,
+    ) -> int: ...
     async def get_by_media_identity(
         self, media_type: str, media_id: int,
     ) -> list[dict]: ...
+    async def get_by_file_id(self, file_id: str) -> list[dict]: ...
+    async def get_by_file_unique_id(self, file_unique_id: str) -> list[dict]: ...
     async def update_media_identity(self, file_unique_id: str, metadata: dict) -> None: ...
     async def cleanup_stale_pending(self) -> int: ...
     async def claim(
@@ -253,6 +261,34 @@ class _ClaimConflict(Exception):
 
 
 class _ReceivedMediaStore:
+    async def get_by_file_unique_id(self, file_unique_id: str) -> list[dict]:
+        normalized_unique_id = str(file_unique_id or "").strip()
+        if not normalized_unique_id:
+            return []
+        async with self.database.transaction() as conn:
+            rows = await conn.fetch("""
+                SELECT file_unique_id, file_id, file_type, media_type, media_id,
+                       bot_id, storage_chat_id, storage_message_id
+                FROM received_media
+                WHERE file_unique_id = $1
+                ORDER BY created_at DESC
+            """, normalized_unique_id)
+        return [dict(row) for row in rows]
+
+    async def get_by_file_id(self, file_id: str) -> list[dict]:
+        normalized_file_id = str(file_id or "").strip()
+        if not normalized_file_id:
+            return []
+        async with self.database.transaction() as conn:
+            rows = await conn.fetch("""
+                SELECT file_unique_id, file_id, file_type, media_type, media_id,
+                       bot_id, storage_chat_id, storage_message_id
+                FROM received_media
+                WHERE file_id = $1
+                ORDER BY created_at DESC
+            """, normalized_file_id)
+        return [dict(row) for row in rows]
+
     async def get_by_media_identity(
         self, media_type: str, media_id: int,
     ) -> list[dict]:
@@ -308,6 +344,56 @@ class _ReceivedMediaStore:
             )
         return updated_count
 
+    async def update_storage_location_by_file_id(
+        self, file_id: str, chat_id: int, message_id: int,
+    ) -> int:
+        normalized_file_id = str(file_id or "").strip()
+        if not normalized_file_id:
+            return 0
+        async with self.database.transaction(write=True) as conn:
+            rows = await conn.fetch("""
+                UPDATE received_media
+                SET storage_chat_id=$1, storage_message_id=$2
+                WHERE file_id=$3
+                RETURNING file_unique_id
+            """, int(chat_id), int(message_id), normalized_file_id)
+        file_unique_ids = [str(row["file_unique_id"]) for row in rows]
+        if file_unique_ids:
+            print(
+                "[USERBOT_MEDIA] storage location updated by caption: "
+                f"file_unique_ids={file_unique_ids}",
+                flush=True,
+            )
+        else:
+            print("[USERBOT_MEDIA] no matching record for caption file_id", flush=True)
+        return len(rows)
+
+    async def update_storage_location_by_file_unique_id(
+        self, file_unique_id: str, chat_id: int, message_id: int,
+    ) -> int:
+        normalized_unique_id = str(file_unique_id or "").strip()
+        if not normalized_unique_id:
+            return 0
+        async with self.database.transaction(write=True) as conn:
+            rows = await conn.fetch("""
+                UPDATE received_media
+                SET storage_chat_id=$1, storage_message_id=$2
+                WHERE file_unique_id=$3
+                RETURNING file_unique_id
+            """, int(chat_id), int(message_id), normalized_unique_id)
+        if rows:
+            print(
+                "[USERBOT_MEDIA] storage location updated by caption: "
+                f"file_unique_id={normalized_unique_id}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[USERBOT_MEDIA] no matching record for caption file_unique_id={normalized_unique_id}",
+                flush=True,
+            )
+        return len(rows)
+
     async def update_media_identity(self, file_unique_id: str, metadata: dict) -> None:
         if not metadata.get("media_type") or metadata.get("media_id") is None:
             return
@@ -339,10 +425,8 @@ class _ReceivedMediaStore:
             raise ValueError("file_unique_id is required")
         if not reusable_file_id:
             raise ValueError("file_id is required")
-        identity = {}
-        if bot_id is not None:
-            from utils.media_identity import media_identity
-            identity = media_identity(reusable_file_id, bot_id)
+        
+
         async with self.database.transaction(write=True) as conn:
             row = await conn.fetchrow("""
                 INSERT INTO received_media (
@@ -357,11 +441,7 @@ class _ReceivedMediaStore:
                     UPDATE received_media SET file_id = $1
                     WHERE file_unique_id = $2 AND file_id = '' AND status <> 'accepted'
                 """, reusable_file_id, unique_id)
-            if identity:
-                await conn.execute("""
-                    UPDATE received_media SET media_type=$1, media_id=$2, bot_id=$3
-                    WHERE file_unique_id=$4
-                """, identity["media_type"], identity["media_id"], identity["bot_id"], unique_id)
+            
             return row is not None
 
     async def is_accepted(self, file_unique_id: str) -> bool:

@@ -34,7 +34,11 @@ class FormatUtils:
 	def format_datetime_utc8(value: datetime) -> str:
 		if value.tzinfo is None:
 			value = value.replace(tzinfo=APP_TIMEZONE)
-		return value.astimezone(APP_TIMEZONE).strftime("%m 月 %d 日 %H 时 %M 分")
+		local_time = value.astimezone(APP_TIMEZONE)
+		return (
+			f"{local_time.month:02d} 月 {local_time.day:02d} 日 "
+			f"{local_time.hour:02d} 时 {local_time.minute:02d} 分"
+		)
 
 	@staticmethod
 	def format_timestamp_utc8(timestamp: int) -> str:

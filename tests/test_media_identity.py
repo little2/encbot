@@ -2,7 +2,7 @@ import base64
 import struct
 import unittest
 
-from utils.media_identity import media_identity
+from utils.bk_media_identity import media_identity
 
 
 def _rle_encode(data: bytes) -> bytes:
@@ -29,10 +29,19 @@ def _tl_bytes(value: bytes) -> bytes:
 
 
 def _file_id(type_id: int, media_id: int, *, minor: int = 61) -> str:
+    photo_fields = b""
+    if type_id in {0, 1, 2}:
+        # Pyrogram's photo file-ID layout includes a volume and thumbnail source.
+        photo_fields = (
+            struct.pack("<q", 123456789)
+            + struct.pack("<i", 0)  # ThumbnailSource.LEGACY
+            + struct.pack("<qi", 987654321, 123)
+        )
     payload = (
         struct.pack("<II", type_id | (1 << 25), 5)
         + _tl_bytes(b"new-file-reference")
         + struct.pack("<qq", media_id, 987654321)
+        + photo_fields
         + bytes((minor, 4))
     )
     return base64.urlsafe_b64encode(_rle_encode(payload)).decode().rstrip("=")

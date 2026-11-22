@@ -1859,7 +1859,7 @@ async def _send_all_media_with_bot(
 					except Exception as notice_exc:
 						print(f"[MEDIA_SEND] recovery notice failed: {notice_exc}", flush=True)
 
-				print(f"{str(exc.message).casefold()}")
+				
 
 				# 先检查 telethon userbot 是否有启用
 				if os.getenv("USERBOT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
@@ -1869,22 +1869,34 @@ async def _send_all_media_with_bot(
 
 					async with BACKUP_FORWARD_SEND_LOCK:						
 						recovered_file_id = await _request_backup_man(item_data, sending_bot)
+					
 					if recovered_file_id:
+						print(f"[USERBOT_RECOVERY] recovered file id: {recovered_file_id}", flush=True)
 						recovered_item = {**item, "file_id": recovered_file_id}
 						await send_item(recovered_item, allow_recovery=False)
-						return			
+						return		
+					else:
+						print(f"[USERBOT_RECOVERY] failed to recover file id for item: {item}", flush=True)
 					
 				else:
 					# 未启用跑道机器人
 					file_id = str(item_data["file_id"])
+					records = await received_media_store.get_by_file_id(file_id)
+					if not records:
+						file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
+					else:
+						file_unique_id = str(records[0].get("file_unique_id") or "").strip()
 
 					async with BACKUP_FORWARD_SEND_LOCK:
-						file_unique_id = TelegramFileId.file_id_to_unique_id(file_id)
+						
 						recovered_file_id = await _request_x_man(file_unique_id, sending_bot)
 					if recovered_file_id:
+						print(f"[X_MAN_RECOVERY] recovered file id: {recovered_file_id} , file_unique_id={file_unique_id}", flush=True)
 						recovered_item = {**item, "file_id": recovered_file_id}
 						await send_item(recovered_item, allow_recovery=False)
 						return
+					else:
+						print(f"[X_MAN_RECOVERY] failed to recover file id for item: {item}, file_unique_id={file_unique_id}", flush=True)
 
 			except Exception as recovery_exc:
 				skipped_items.append(item)

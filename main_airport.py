@@ -27,17 +27,19 @@ import tempfile
 from time import monotonic
 from collections import OrderedDict
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from io import BytesIO
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from utils.bot_cache import BotCache
 
 BOT_CACHE_MAX_SIZE = 5
 BOT_CACHE_IDLE_SECONDS = 1800
 SEND_BOT_CACHE = BotCache(BOT_CACHE_MAX_SIZE, BOT_CACHE_IDLE_SECONDS)
+
+
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import imagehash
@@ -139,14 +141,19 @@ from config import (
 from shared_config import SharedConfig
 SharedConfig.load(True)
 
+
+
 BACKUP_TOKEN = os.getenv("BACKUP_TOKEN", "") #用于同一个频道来做
 
 BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "")
 BACKUP_BOT_NAME = None  #用于接收
 
+
+
 SWITCHBOT_TOKEN = SharedConfig.get("switch_bot_token", "")
 X_MAN_BOT_ID = SharedConfig.get("x_man_bot_id", 0)
 KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", SharedConfig.get("my_bot_token", ""))
 
 
@@ -1589,180 +1596,126 @@ async def _request_x_man(
 		return reply_file_id if reply_file_id and reply_file_id != "na" else None
 
 
-async def _request_backup_man(
-	item_data: dict,
-	sending_bot: Bot | None = None,
-	*,
-	allow_storage_upload: bool = True,
+async def _forward_userbot_media(
+	userbot, active_bot: Bot, file_unique_id: str, chat_id: int, message_id: int,
 ) -> str | None:
 	global BACKUP_MAN_PENDING_REPLY
 	global BACKUP_MAN_PENDING_FILE_UNIQUE_ID, BACKUP_MAN_PENDING_USERBOT_ID
 
+	info = await active_bot.get_me()
+	username = str(info.username or "").strip().lstrip("@")
+	destination = f"@{username}" if username else int(info.id)
+	userbot_id = int(userbot.user_id)
+	pending_reply = None
+	if active_bot is bot:
+		pending_reply = asyncio.get_running_loop().create_future()
+		BACKUP_MAN_PENDING_REPLY = pending_reply
+		BACKUP_MAN_PENDING_FILE_UNIQUE_ID = file_unique_id
+		BACKUP_MAN_PENDING_USERBOT_ID = userbot_id
+	try:
+		source_username = bot_name if int(chat_id) == bot.id else None
+		await userbot.forward_stored_message(
+			chat_id, message_id, destination, source_username=source_username,
+		)
+		if pending_reply is None:
+			file_id = await _wait_for_userbot_media_with_bot(active_bot, file_unique_id, userbot_id)
+		else:
+			file_id = await asyncio.wait_for(pending_reply, timeout=BACKUP_MAN_REPLY_TIMEOUT_SECONDS)
+		return file_id if file_id != "na" else None
+	finally:
+		if pending_reply is not None and BACKUP_MAN_PENDING_REPLY is pending_reply:
+			BACKUP_MAN_PENDING_REPLY = None
+			BACKUP_MAN_PENDING_FILE_UNIQUE_ID = None
+			BACKUP_MAN_PENDING_USERBOT_ID = None
 
-	# file_id is bot-specific, but identifies the original received_media row for Bot B.
-	# Storage updates use that row's file_unique_id carried in the caption to Userbot C.
-	records = await received_media_store.get_by_file_id(item_data["file_id"])
 
+async def _request_backup_man(
+	item_data: dict,
+	sending_bot: Bot | None = None,
+	*,
+	report_progress: Callable[[str], Awaitable[None]] | None = None,
+) -> str | None:
+	print(f"查找 userbot C，file_id={item_data['file_id']}", flush=True)
 
-	# Iterate through the media identity records and attempt to forward them using the active userbot
+	async def report(stage: str) -> None:
+		if report_progress is not None:
+			await report_progress(stage)
+
+	await report("正在查找备份")
+	original_file_id = str(item_data["file_id"])
+	records = await received_media_store.get_by_file_id(original_file_id)
+	userbot = active_userbot
+	if userbot is None or userbot.user_id is None:
+		print(f"查找 userbot C，file_id={item_data['file_id']}，userbot 不可用", flush=True)
+		return None
+
+	active_bot = sending_bot if sending_bot is not None else bot
+	file_unique_id = str(item_data.get("file_unique_id") or "").strip()
+	forward_error = None
 	for record in records:
-		print(f"[USERBOT_RECOVERY] record={record}", flush=True)
-		storage_chat_id = record.get("storage_chat_id")
-		storage_message_id = record.get("storage_message_id")
-		if storage_chat_id is None or storage_message_id is None:
-			# 若沒有 storage 紀錄
-			if active_userbot is None or getattr(active_userbot, "user_id", None) is None:
-				print("[USERBOT_RECOVERY] userbot is not connected", flush=True)
-				break
-			if not allow_storage_upload:
-				print(
-					"[USERBOT_RECOVERY] storage location was still unavailable after upload, skipped",
-					flush=True,
-				)
-				continue
-			caption_file_unique_id = str(record.get("file_unique_id") or "").strip()
-			
-			if not caption_file_unique_id:
-				print("[USERBOT_RECOVERY] record has no file_unique_id, skipped", flush=True)
-				continue
-
-			try:
-				print(
-					f"[USERBOT_RECOVERY] userbot 沒有這筆紀綠，嘗試將媒體由 Bot B 上傳到 userbot C: file_unique_id={caption_file_unique_id}",
-					flush=True,
-				)
-				# Bot B 將媒體傳給 Userbot C
-				await _send_media_with_bot(
-					bot,
-					str(item_data["file_type"]),
-					str(item_data["file_id"]),
-					int(active_userbot.user_id),
-					False,
-					bool(item_data.get("if_spoiler", False)),
-					caption=caption_file_unique_id,
-				)
-			except Exception as upload_exc:
-				print(
-					f"[USERBOT_RECOVERY] 嘗試將媒體由 Bot B 上傳到 userbot C 失敗: {upload_exc}",
-					flush=True,
-				)
-				try:
-					
-					recovered_file_id = await _request_x_man(
-						caption_file_unique_id,
-						sending_bot,
-					)
-					if recovered_file_id:
-						print(
-							"[USERBOT_RECOVERY] recovered media through X-Man after userbot upload failed",
-							flush=True,
-						)
-						return recovered_file_id
-				except Exception as x_man_exc:
-					print(
-						f"[USERBOT_RECOVERY] X-Man fallback failed: {x_man_exc}",
-						flush=True,
-					)
-				# 如果失敗，則使用 _request_x_man 來取得媒體
-				continue
-
-			# 等待 C 的入站事件回填 storage_chat_id／`storage_message_id`，最多約 5 秒。
-			for _ in range(20):
-				refreshed_records = await received_media_store.get_by_file_unique_id(
-					caption_file_unique_id,
-				)
-				if any(
-					refreshed.get("storage_chat_id") is not None
-					and refreshed.get("storage_message_id") is not None
-					for refreshed in refreshed_records
-				):
-					break
-				await asyncio.sleep(0.25)
-			print(
-				"[USERBOT_RECOVERY] uploaded media to userbot; retrying storage lookup",
-				flush=True,
-			)
-			# C 從 storage 轉送媒體給 Bot D
-			return await _request_backup_man(
-				item_data,
-				sending_bot,
-				allow_storage_upload=False,
-			)
-
-		if active_userbot is None or getattr(active_userbot, "user_id", None) is None:
-			print("[USERBOT_RECOVERY] userbot is not connected", flush=True)
-			break
-
-		active_bot = sending_bot if sending_bot is not None else bot
-		pending_reply: asyncio.Future[str] | None = None
+		print("查找 userbot C 有值", flush=True)
+		record_id = str(record.get("file_unique_id") or "").strip()
+		if not record_id:
+			continue
+		file_unique_id = file_unique_id or record_id
+		chat_id = record.get("storage_chat_id")
+		message_id = record.get("storage_message_id")
+		if chat_id is None or message_id is None:
+			continue
 		try:
-			file_unique_id = str(record.get("file_unique_id") or "").strip()
+			print("1查找 userbot C 有值", flush=True)
+
+			await report("已找到备份，正在恢復")
+			return await _forward_userbot_media(userbot, active_bot, record_id, chat_id, message_id)
+		except FileNotFoundError:
+			# C's stored message was deleted. Try any remaining copy before refilling it.
+			continue
+		except Exception as exc:
+			forward_error = exc
+	if forward_error is not None:
+		print("2查找 userbot C 無值", flush=True)
+		raise forward_error
+
+	# Match this upload in C's private chat, even if no received_media row exists.
+	print(f"33查找 userbot C 無值，file_unique_id={file_unique_id}", flush=True)
+	await report("备份中没有可用媒体，正在本地上传")
+	caption = secrets.token_urlsafe(18)
+	send_to_userbot = partial(
+		_send_media_with_bot, bot, str(item_data["file_type"]),
+		chat_id=int(userbot.user_id), no_forward=False,
+		if_spoiler=bool(item_data.get("if_spoiler", False)), caption=caption,
+	)
+	async with userbot.observe_bot_upload(bot.id, bot_username=bot_name) as locate:
+		try:
+			sent = await send_to_userbot(original_file_id)
+		except TelegramBadRequest as exc:
+			if not _is_invalid_media_reference_error(exc) or "temporarily unavailable" in str(exc).casefold():
+				raise
 			if not file_unique_id:
-				print(
-					"[USERBOT_RECOVERY] stored record has no file_unique_id, skipped",
-					flush=True,
-				)
-				continue
-			sending_bot_info = await active_bot.get_me()
-			sending_bot_username = str(
-				getattr(sending_bot_info, "username", "") or ""
-			).strip().lstrip("@")
-			destination = (
-				f"@{sending_bot_username}"
-				if sending_bot_username
-				else int(sending_bot_info.id)
-			)
+				file_unique_id = TelegramFileId.file_id_to_unique_id(original_file_id)
+			await report("主机器人没有可用媒体，正在向本地端索取")
+			bot_file_id = await _request_x_man(file_unique_id, bot)
+			if not bot_file_id:
+				return None
+			await report("已取得媒体，正在补存")
+			sent = await send_to_userbot(bot_file_id)
 
-			if active_bot is bot:
-				# 等待 Bot D 收到 C 的媒體，擷取該訊息的新 file_id
-				pending_reply = asyncio.get_running_loop().create_future()
-				BACKUP_MAN_PENDING_REPLY = pending_reply
-				BACKUP_MAN_PENDING_FILE_UNIQUE_ID = file_unique_id
-				BACKUP_MAN_PENDING_USERBOT_ID = int(active_userbot.user_id)
+		sent_unique_id = _extract_media_unique_id(sent)
+		if file_unique_id and sent_unique_id != file_unique_id:
+			raise ValueError("Uploaded media does not match the requested file_unique_id")
+		sticker_id = TelegramFileId.parse(sent.sticker.file_id)["media_id"] if sent.sticker else None
+		await report("正在确认已收到媒体")
+		chat_id, message_id = await asyncio.wait_for(
+			locate(caption, sticker_id), timeout=BACKUP_MAN_REPLY_TIMEOUT_SECONDS,
+		)
 
-			forwarded_message_id = await active_userbot.forward_stored_message(
-				int(storage_chat_id),
-				int(storage_message_id),
-				destination,
-			)
-			print(
-				f"[USERBOT_RECOVERY] media forwarded to {destination}: "
-				f"message_id={forwarded_message_id}",
-				flush=True,
-			)
+	await received_media_store.update_storage_location_by_file_unique_id(
+		sent_unique_id, chat_id, message_id,
+	)
+	await report("备份已收到媒体，正在发送")
+	return await _forward_userbot_media(userbot, active_bot, sent_unique_id, chat_id, message_id)
 
-			if pending_reply is not None:
-				recovered_file_id = await asyncio.wait_for(
-					pending_reply,
-					timeout=BACKUP_MAN_REPLY_TIMEOUT_SECONDS,
-				)
-			else:
-				recovered_file_id = await _wait_for_userbot_media_with_bot(
-					active_bot,
-					file_unique_id,
-					int(active_userbot.user_id),
-				)
-			# Bot D 用新 file_id 發送給 User E
-			return recovered_file_id if recovered_file_id != "na" else None
 
-		except TimeoutError:
-			print("[USERBOT_RECOVERY] timed out waiting for sending bot media", flush=True)
-			continue
-		except Exception as userbot_exc:
-			print(
-				f"[USERBOT_RECOVERY] stored media send failed: {userbot_exc}",
-				flush=True,
-			)
-			continue
-		finally:
-			if BACKUP_MAN_PENDING_REPLY is pending_reply:
-				BACKUP_MAN_PENDING_REPLY = None
-				BACKUP_MAN_PENDING_FILE_UNIQUE_ID = None
-				BACKUP_MAN_PENDING_USERBOT_ID = None
-
-		
-		
-		
 async def _send_all_media(
 	message: Message,
 	data: dict[str, Any],
@@ -1820,9 +1773,33 @@ async def _send_all_media_with_bot(
 	pending_group: list[dict[str, Any]] = []
 	pending_kind: str | None = None
 	recovery_notice_sent = False
+	recovery_notice: Message | None = None
+	recovery_succeeded = 0
+	recovery_failed = 0
+	last_recovery_text = ""
+
+	async def update_recovery_notice(stage: str, item_index: int | None = None) -> None:
+		nonlocal last_recovery_text
+		if recovery_notice is None:
+			return
+		current = f"第 {item_index}/{len(items)} 个资源：{stage}" if item_index else stage
+		footer = "\n请稍候，无需重复获取。" if item_index else ""
+		icon = "⏳" if item_index else ("✅" if stage == "恢复处理结束" and not recovery_failed else "⚠️")
+		text = (
+			f"{icon} 资源恢复进度\n{current}\n"
+			f"已恢复并送出：{recovery_succeeded}；恢复失败：{recovery_failed}"
+			f"{footer}"
+		)
+		if text == last_recovery_text:
+			return
+		try:
+			await recovery_notice.edit_text(text)
+			last_recovery_text = text
+		except Exception as notice_exc:
+			print(f"[MEDIA_SEND] recovery progress update failed: {notice_exc}", flush=True)
 
 	async def send_item(item: dict[str, Any], allow_recovery: bool = True) -> None:
-		nonlocal recovery_notice_sent
+		nonlocal recovery_notice_sent, recovery_notice, recovery_succeeded, recovery_failed
 		item_data = dict(data)
 		item_data.update(item)
 		try:
@@ -1845,16 +1822,12 @@ async def _send_all_media_with_bot(
 				skipped_items.append(item)
 				return
 
-			if "wrong file identifier" not in str(exc.message).casefold():
-				skipped_items.append(item)
-				return
-
-			# Runway Bot D 發送失敗且為 wrong file identifier 時進入 recovery
+			# Invalid media references enter recovery regardless of Telegram's wording.
 			try:
 				if not recovery_notice_sent:
 					recovery_notice_sent = True
 					try:
-						await bot.send_message(
+						recovery_notice = await bot.send_message(
 							chat_id=_normalize_receiver_chat_id(
 								receiver_id,
 								default_chat_id=message.from_user.id if message.from_user else None,
@@ -1864,7 +1837,10 @@ async def _send_all_media_with_bot(
 					except Exception as notice_exc:
 						print(f"[MEDIA_SEND] recovery notice failed: {notice_exc}", flush=True)
 
-				
+				item_index = int(item["_item_index"])
+
+				async def report_progress(stage: str) -> None:
+					await update_recovery_notice(stage, item_index)
 
 				# 先检查 telethon userbot 是否有启用
 				if os.getenv("USERBOT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
@@ -1872,15 +1848,13 @@ async def _send_all_media_with_bot(
 					要求 userbot 傳送媒體資源給跑道機器人
 					'''
 
-					async with BACKUP_FORWARD_SEND_LOCK:						
-						recovered_file_id = await _request_backup_man(item_data, sending_bot)
+					await report_progress("正在等待恢复任务")
+					async with BACKUP_FORWARD_SEND_LOCK:
+						recovered_file_id = await _request_backup_man(
+							item_data, sending_bot, report_progress=report_progress,
+						)
 					
-					if recovered_file_id:
-						print(f"[USERBOT_RECOVERY] recovered file id: {recovered_file_id}", flush=True)
-						recovered_item = {**item, "file_id": recovered_file_id}
-						await send_item(recovered_item, allow_recovery=False)
-						return		
-					else:
+					if not recovered_file_id:
 						print(f"[USERBOT_RECOVERY] failed to recover file id for item: {item}", flush=True)
 					
 				else:
@@ -1892,19 +1866,30 @@ async def _send_all_media_with_bot(
 					else:
 						file_unique_id = str(records[0].get("file_unique_id") or "").strip()
 
+					await report_progress("正在等待向 X-MAN 索取媒体")
 					async with BACKUP_FORWARD_SEND_LOCK:
-						
+						await report_progress("正在向 X-MAN 索取媒体")
 						recovered_file_id = await _request_x_man(file_unique_id, sending_bot)
-					if recovered_file_id:
-						print(f"[X_MAN_RECOVERY] recovered file id: {recovered_file_id} , file_unique_id={file_unique_id}", flush=True)
-						recovered_item = {**item, "file_id": recovered_file_id}
-						await send_item(recovered_item, allow_recovery=False)
-						return
-					else:
+					if not recovered_file_id:
 						print(f"[X_MAN_RECOVERY] failed to recover file id for item: {item}, file_unique_id={file_unique_id}", flush=True)
+
+				if recovered_file_id:
+					recovered_item = {**item, "file_id": recovered_file_id}
+					await report_progress("媒体已恢复，正在发送")
+					sent_before = len(sent_messages)
+					await send_item(recovered_item, allow_recovery=False)
+					if len(sent_messages) > sent_before:
+						recovery_succeeded += 1
+						await report_progress("恢复成功，已送出")
+					else:
+						recovery_failed += 1
+						await report_progress("媒体恢复后仍无法发送")
+					return
 
 			except Exception as recovery_exc:
 				skipped_items.append(item)
+				recovery_failed += 1
+				await update_recovery_notice("恢复失败，继续处理其他资源", int(item["_item_index"]))
 				print(
 					f"\n[MEDIA_SEND:1483] backup bot could not send item "
 					f"#{item.get('_item_index', '?')} to the recipient: "
@@ -1914,6 +1899,8 @@ async def _send_all_media_with_bot(
 				return
 
 			skipped_items.append(item)
+			recovery_failed += 1
+			await update_recovery_notice("恢复失败，继续处理其他资源", int(item["_item_index"]))
 			return
 
 		sent_messages.append(sent)
@@ -1971,38 +1958,44 @@ async def _send_all_media_with_bot(
 		pending_group = []
 		pending_kind = None
 
-	for item in items:
-		kind = _album_kind(str(item["file_type"]))
-
-		# 不支持相簿的类型
-		if kind is None:
-			await flush_group()
-			await send_item(item)
-			continue
-
-		# 类型不兼容或者已经达到 10 个
-		if pending_group and (
-			kind != pending_kind
-			or len(pending_group) >= 10
-		):
-			await flush_group()
-
-		pending_kind = kind
-		pending_group.append(item)
-
-
+	delivery_finished = False
 	try:
-		await flush_group()
-	except Exception as exc:
-		print(f"[TAKEOFF:1984] flush group exception: {exc}", flush=True)
-		if "chat not found" in str(exc):
-			sending_bot_info = await sending_bot.get_me()
-			sending_bot_username = str(sending_bot_info.username or "")
-			print(f"[MEDIA_SEND:1992] sending bot info: {sending_bot_username}", flush=True)
-			raise RuntimeError(f"需要先启用跑道 @{sending_bot_username}")
+		for item in items:
+			kind = _album_kind(str(item["file_type"]))
 
-	
-	
+			# 不支持相簿的类型
+			if kind is None:
+				await flush_group()
+				await send_item(item)
+				continue
+
+			# 类型不兼容或者已经达到 10 个
+			if pending_group and (
+				kind != pending_kind
+				or len(pending_group) >= 10
+			):
+				await flush_group()
+
+			pending_kind = kind
+			pending_group.append(item)
+
+		try:
+			await flush_group()
+		except Exception as exc:
+			print(f"[TAKEOFF:1984] flush group exception: {exc}", flush=True)
+			if "chat not found" in str(exc):
+				sending_bot_info = await sending_bot.get_me()
+				sending_bot_username = str(sending_bot_info.username or "")
+				print(f"[MEDIA_SEND:1992] sending bot info: {sending_bot_username}", flush=True)
+				raise RuntimeError(f"需要先启用跑道 @{sending_bot_username}")
+		else:
+			delivery_finished = True
+	finally:
+		if recovery_notice_sent:
+			await update_recovery_notice(
+				"恢复处理结束" if delivery_finished else "发送中断，恢复处理未完成",
+			)
+
 	return sent_messages, skipped_items
 
 

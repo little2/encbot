@@ -5,10 +5,11 @@ import asyncio
 import getpass
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from telethon import TelegramClient, events, types
+from telethon import TelegramClient, errors, events, types, utils
 from telethon.sessions import StringSession
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,9 @@ class TelethonUserbot:
         if api_id <= 0 or not api_hash:
             raise ValueError("API_ID and API_HASH must be configured")
         session = os.getenv("USERBOT_SESSION", str(Path(__file__).parent / "data" / "userbot"))
-        return cls(api_id, api_hash, session, on_message, os.getenv("USERBOT_PHONE", ""))
+        userbot_phone = os.getenv("USERBOT_PHONE", "")
+        
+        return cls(api_id, api_hash, session, on_message, userbot_phone)
 
     @staticmethod
     def get_media_identity(event) -> tuple[str, int] | None:
@@ -71,20 +74,67 @@ class TelethonUserbot:
             logger.exception("Userbot message callback failed (chat=%s, message=%s)",
                              event.chat_id, event.id)
 
+    async def _resolve_chat(self, chat_id: int, username: str | None = None):
+        try:
+            return await self.client.get_input_entity(chat_id)
+        except ValueError as cache_error:
+            if username:
+                try:
+                    peer = await self.client.get_input_entity(f"@{username.lstrip('@')}")
+                except ValueError:
+                    peer = None
+                if peer is not None:
+                    if utils.get_peer_id(peer) != chat_id:
+                        raise ValueError(f"Username {username} does not match chat ID {chat_id}")
+                    return peer
+
+            async for dialog in self.client.iter_dialogs():
+                if dialog.id == chat_id:
+                    return dialog.input_entity
+            raise ValueError(
+                f"Userbot cannot resolve chat ID {chat_id} from its session or dialogs"
+            ) from cache_error
+
+    @asynccontextmanager
+    async def observe_bot_upload(self, bot_id: int, *, bot_username: str | None = None):
+        """Buffer incoming messages from B before B starts its upload."""
+        peer = await self._resolve_chat(bot_id, bot_username)
+        async with self.client.conversation(peer, exclusive=False) as conversation:
+            async def locate(caption: str, sticker_id: int | None) -> tuple[int, int]:
+                while True:
+                    # 0 selects the next incoming message since the conversation opened.
+                    message = await conversation.get_response(0)
+                    if sticker_id is not None:
+                        matches = getattr(message.sticker, "id", None) == sticker_id
+                    else:
+                        matches = message.media is not None and message.raw_text == caption
+                    if matches:
+                        return message.chat_id, message.id
+
+            yield locate
+
     async def forward_stored_message(
         self,
         source_chat_id: int,
         source_message_id: int,
         destination: int | str,
+        *,
+        source_username: str | None = None,
     ) -> int:
         """Forward one stored Telegram message and return its destination message ID."""
-        forwarded = await self.client.forward_messages(
-            entity=destination,
-            messages=int(source_message_id),
-            from_peer=int(source_chat_id),
-        )
+        source_peer = await self._resolve_chat(int(source_chat_id), source_username)
+        try:
+            forwarded = await self.client.forward_messages(
+                entity=destination,
+                messages=int(source_message_id),
+                from_peer=source_peer,
+            )
+        except (errors.MessageIdInvalidError, errors.MsgIdInvalidError) as exc:
+            raise FileNotFoundError("Stored Telegram message was deleted or is invalid") from exc
         if isinstance(forwarded, (list, tuple)):
             forwarded = forwarded[0] if forwarded else None
+        if forwarded is None:
+            raise FileNotFoundError("Stored Telegram message is missing")
         forwarded_message_id = getattr(forwarded, "id", None)
         if forwarded_message_id is None:
             raise RuntimeError("Telethon did not return the forwarded message ID")

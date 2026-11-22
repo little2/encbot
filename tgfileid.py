@@ -128,9 +128,7 @@ class TelegramFileId:
         """
         解析 Telegram Bot API file_id。
 
-        当前主要支持 document-family：
-        voice / video / document / sticker /
-        audio / animation / video_note / background
+        支持普通照片及 document-family 媒体的 file_unique_id。
         """
 
         raw = cls._base64url_decode(file_id)
@@ -212,10 +210,41 @@ class TelegramFileId:
                 cls._document_unique_id(media_id)
             )
 
+        elif type_id == 2 and not is_web_location:
+            result["file_unique_id"] = cls._photo_unique_id(buffer.read(), sub_version)
         else:
             result["file_unique_id"] = None
 
         return result
+
+    @classmethod
+    def _photo_unique_id(cls, data: bytes, sub_version: int) -> str:
+        """Rebuild TDLib's size-specific unique ID for ordinary Telegram photos."""
+        try:
+            photo_id, _ = struct.unpack_from("<qq", data)
+            offset = 16
+            if sub_version < 32:  # Earlier locations also store volume_id and local_id.
+                volume_id, = struct.unpack_from("<q", data, offset)
+                offset += 8
+            source = struct.unpack_from("<i", data, offset)[0] if sub_version >= 22 else 0
+            if source == 1:  # Thumbnail source, including the individual sizes of a photo.
+                _, size = struct.unpack_from("<ii", data, offset + 4)
+                if not 0 <= size <= 127:
+                    raise ValueError("Invalid Telegram photo size")
+                size_key = {ord("a"): 0, ord("c"): 1}.get(size, size + 5)
+                key = struct.pack("<qB", photo_id, size_key)
+            elif source == 5:  # FullLegacy source carries its own volume and local IDs.
+                volume_id, _, local_id = struct.unpack_from("<qqi", data, offset + 4)
+                key = struct.pack("<qi", volume_id, local_id)
+            elif source == 0 and sub_version < 32:
+                secret_offset = offset + 4 if sub_version >= 22 else offset
+                _, local_id = struct.unpack_from("<qi", data, secret_offset)
+                key = struct.pack("<qi", volume_id, local_id)
+            else:
+                raise ValueError("Unsupported Telegram photo location")
+        except struct.error as exc:
+            raise ValueError("Invalid Telegram photo location") from exc
+        return cls._base64url_encode(cls._rle_encode(struct.pack("<i", 1) + key))
 
     @classmethod
     def _document_unique_id(
@@ -223,7 +252,7 @@ class TelegramFileId:
         media_id: int
     ) -> str:
         unique_binary = struct.pack(
-            "<lQ",
+            "<iq",
             cls.UNIQUE_TYPE_DOCUMENT,
             media_id,
         )

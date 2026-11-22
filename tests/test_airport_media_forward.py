@@ -1,10 +1,15 @@
 import ast
 import asyncio
+import secrets
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Awaitable, Callable
 import unittest
 from unittest.mock import AsyncMock, call
+
+from tgfileid import TelegramFileId
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "main_airport.py"
@@ -83,16 +88,16 @@ class AirportMediaForwardTests(unittest.TestCase):
             request_media = AsyncMock(side_effect=request)
             sending_bot = SimpleNamespace(send_message=AsyncMock())
             received_media_store = SimpleNamespace(
-                get_by_media_identity=AsyncMock(return_value=[]),
+                get_by_file_id=AsyncMock(return_value=[]),
             )
             namespace = {
                 "Message": object, "Bot": object, "Any": object,
+                "Awaitable": Awaitable, "Callable": Callable,
                 "TelegramBadRequest": BadRequest,
                 "_send_media_with_bot": send_media,
                 "_is_invalid_media_reference_error": lambda exc: True,
                 "_normalize_receiver_chat_id": lambda value, **kwargs: value,
                 "_album_kind": lambda kind: None,
-                "backup_bot": object(),
                 "bot": SimpleNamespace(send_message=AsyncMock()),
                 "os": SimpleNamespace(getenv=lambda *args: "true" if userbot_enabled else "false"),
                 "BACKUP_FORWARD_SEND_LOCK": lock,
@@ -100,10 +105,8 @@ class AirportMediaForwardTests(unittest.TestCase):
                 "_request_x_man": request_media,
                 "received_media_store": received_media_store,
                 "active_userbot": None,
-                "media_identity": lambda file_id: {
-                    "media_type": "document", "media_id": 123,
-                },
             }
+            load_function("_request_backup_man", namespace)
             send_all = load_function("_send_all_media_with_bot", namespace)
             items = [
                 {"file_type": "sticker", "file_id": "bad-file"},
@@ -122,10 +125,7 @@ class AirportMediaForwardTests(unittest.TestCase):
             )
             self.assertEqual(skipped, [] if recovered else [expected_skipped_item])
             self.assertEqual(request_media.await_count, 0 if userbot_enabled else 1)
-            self.assertEqual(
-                received_media_store.get_by_media_identity.await_count,
-                1 if userbot_enabled else 0,
-            )
+            received_media_store.get_by_file_id.assert_awaited_once_with("bad-file")
             self.assertFalse(lock.locked())
 
             if recovery_result and not userbot_enabled:
@@ -140,68 +140,233 @@ class AirportMediaForwardTests(unittest.TestCase):
             with self.subTest(result=result, retry_fails=retry_fails, userbot_enabled=enabled):
                 asyncio.run(run_case(result, retry_fails, enabled))
 
-    def test_userbot_recovery_uses_stored_message_location(self):
+    def test_userbot_delivers_from_storage_or_refills_from_b(self):
+        class BadRequest(Exception):
+            def __init__(self, message="wrong file identifier"):
+                super().__init__(message)
+                self.message = message
+
+        async def run_case(
+            storage_state, file_type, b_has_file, x_has_file=True,
+            final_upload_fails=False, d_error_message="wrong file identifier",
+        ):
+            original_id, unique_id = {
+                "sticker": ("CAADAgADKgAPBAQ", "AgADKgAH"),
+                "photo": ("AgADAgADKgAHewAHAQADAgADeAADPQQ", "AQADKgAHfQ"),
+                "document": ("original-file-id", "unique-id"),
+            }[file_type]
+            notice = SimpleNamespace(edit_text=AsyncMock())
+            bot_b = SimpleNamespace(id=101, send_message=AsyncMock(return_value=notice))
+            bot_d = SimpleNamespace(get_me=AsyncMock(return_value=SimpleNamespace(id=77, username="runway_bot")))
+            user_e = 123
+            delivered = object()
+
+            record = {"file_unique_id": unique_id}
+            if storage_state in ("stored", "deleted"):
+                record.update(storage_chat_id=101, storage_message_id=17)
+            records = [] if storage_state == "no row" else [record]
+            storage = SimpleNamespace(
+                get_by_file_id=AsyncMock(return_value=records),
+                update_storage_location_by_file_unique_id=AsyncMock(return_value=len(records)),
+            )
+            forward = AsyncMock(return_value=333)
+            if storage_state == "deleted":
+                forward.side_effect = [FileNotFoundError(), 333]
+            locate = AsyncMock(return_value=(101, 222))
+            observing = False
+
+            @asynccontextmanager
+            async def observe(bot_id, *, bot_username):
+                nonlocal observing
+                self.assertEqual(bot_id, bot_b.id)
+                self.assertEqual(bot_username, "main_bot")
+                observing = True
+                try:
+                    yield locate
+                finally:
+                    observing = False
+
+            userbot = SimpleNamespace(user_id=55, forward_stored_message=forward, observe_bot_upload=observe)
+            request_x = AsyncMock(return_value="recovered-b-id" if x_has_file else None)
+            wait_for_d = AsyncMock(return_value="runway-file-id")
+            uploads = []
+            captions = []
+            received = SimpleNamespace(file_id=original_id, file_unique_id=unique_id)
+            upload_result = SimpleNamespace(document=None, photo=[], video=None, audio=None, voice=None,
+                                            animation=None, sticker=None)
+            if file_type == "photo":
+                upload_result.photo = [received]
+            else:
+                setattr(upload_result, file_type, received)
+
+            async def send_media(bot, kind, file_id, chat_id, no_forward, if_spoiler, *, caption=None):
+                self.assertEqual(kind, file_type)
+                if bot is bot_b:
+                    self.assertTrue(observing)
+                    self.assertEqual(chat_id, userbot.user_id)
+                    uploads.append(file_id)
+                    captions.append(caption)
+                    if file_id == original_id and not b_has_file:
+                        raise BadRequest("wrong file identifier")
+                    if final_upload_fails:
+                        raise ConnectionError("B could not send the file to C")
+                    return upload_result
+                self.assertIs(bot, bot_d)
+                self.assertEqual(chat_id, user_e)
+                if file_id == original_id:
+                    raise BadRequest(d_error_message)
+                self.assertEqual(file_id, "runway-file-id")
+                return delivered
+
+            namespace = {
+                "Message": object, "Bot": object, "Any": object, "asyncio": asyncio,
+                "Awaitable": Awaitable, "Callable": Callable,
+                "partial": partial, "secrets": secrets, "TelegramFileId": TelegramFileId,
+                "TelegramBadRequest": BadRequest, "_send_media_with_bot": send_media,
+                "_normalize_receiver_chat_id": lambda value, **kwargs: value,
+                "_album_kind": lambda kind: None, "bot": bot_b, "bot_name": "main_bot",
+                "os": SimpleNamespace(getenv=lambda *args: "true"),
+                "BACKUP_FORWARD_SEND_LOCK": asyncio.Lock(), "BACKUP_MAN_REPLY_TIMEOUT_SECONDS": 1,
+                "_request_x_man": request_x, "_wait_for_userbot_media_with_bot": wait_for_d,
+                "received_media_store": storage, "active_userbot": userbot,
+                "_is_invalid_media_reference_error": load_function(
+                    "_is_invalid_media_reference_error",
+                    {"TelegramBadRequest": BadRequest},
+                ),
+            }
+            for name in ("_extract_media_unique_id",
+                         "_forward_userbot_media", "_request_backup_man", "_send_all_media_with_bot"):
+                load_function(name, namespace)
+            sent, skipped = await namespace["_send_all_media_with_bot"](
+                SimpleNamespace(from_user=None), {"file_type": file_type, "file_id": original_id},
+                user_e, bot_d,
+            )
+            edits = [args.args[0] for args in notice.edit_text.await_args_list]
+            self.assertTrue(any("正在查找 Userbot 备份" in text for text in edits))
+            if storage_state == "stored":
+                self.assertTrue(any("已找到备份" in text for text in edits))
+            else:
+                self.assertTrue(any("正在从主机器人补存" in text for text in edits))
+                if not b_has_file:
+                    self.assertTrue(any("正在向 X-MAN 索取" in text for text in edits))
+            self.assertIn("恢复处理结束", edits[-1])
+            if b_has_file or storage_state == "stored":
+                request_x.assert_not_awaited()
+            else:
+                request_x.assert_awaited_once_with(unique_id, bot_b)
+            if storage_state == "stored":
+                self.assertEqual(uploads, [])
+                forward.assert_awaited_once_with(
+                    101, 17, "@runway_bot", source_username="main_bot",
+                )
+            elif not x_has_file or final_upload_fails:
+                expected_uploads = [original_id, "recovered-b-id"] if not b_has_file and x_has_file else [original_id]
+                self.assertEqual(uploads, expected_uploads)
+                self.assertEqual(sent, [])
+                self.assertEqual(len(skipped), 1)
+                locate.assert_not_awaited()
+                wait_for_d.assert_not_awaited()
+                return
+            else:
+                self.assertEqual(uploads, [original_id] if b_has_file else [original_id, "recovered-b-id"])
+                locate.assert_awaited_once_with(captions[-1], 42 if file_type == "sticker" else None)
+                storage.update_storage_location_by_file_unique_id.assert_awaited_once_with(unique_id, 101, 222)
+                expected = (
+                    [call(101, 17, "@runway_bot", source_username="main_bot")]
+                    if storage_state == "deleted" else []
+                )
+                self.assertEqual(
+                    forward.await_args_list,
+                    expected + [call(101, 222, "@runway_bot", source_username="main_bot")],
+                )
+            wait_for_d.assert_awaited_once_with(bot_d, unique_id, 55)
+            self.assertEqual((sent, skipped), ([delivered], []))
+
+        for case in (
+            ("stored", "document", True), ("no row", "photo", True),
+            ("deleted", "document", True), ("no row", "sticker", True),
+            ("missing location", "document", False), ("deleted", "document", False),
+            ("no row", "sticker", False), ("no row", "photo", False),
+            ("missing location", "document", False, False),
+            ("deleted", "document", True, True, True), ("no row", "sticker", False, True, True),
+            ("stored", "document", True, True, False, "MEDIA_FILE_INVALID"),
+        ):
+            with self.subTest(case=case):
+                asyncio.run(run_case(*case))
+
+    def test_recovery_notice_tracks_multiple_items_and_survives_edit_errors(self):
         class BadRequest(Exception):
             message = "wrong file identifier"
 
-        async def run_case():
-            delivered_message = SimpleNamespace(message_id=444)
-            sending_bot = SimpleNamespace(
-                get_me=AsyncMock(return_value=SimpleNamespace(id=77, username="runway_bot")),
-                send_message=AsyncMock(),
-                forward_message=AsyncMock(return_value=delivered_message),
+        async def run_case(edit_fails, interrupt=False):
+            notice = SimpleNamespace(
+                edit_text=AsyncMock(side_effect=RuntimeError("edit failed") if edit_fails else None),
             )
-            active_userbot = SimpleNamespace(
-                user_id=55,
-                forward_stored_message=AsyncMock(return_value=333),
-            )
-            received_media_store = SimpleNamespace(
-                get_by_media_identity=AsyncMock(return_value=[{
-                    "file_unique_id": "unique-id",
-                    "storage_chat_id": -100123,
-                    "storage_message_id": 222,
-                }]),
-            )
+            main_bot = SimpleNamespace(send_message=AsyncMock(return_value=notice))
+            sending_bot = object()
+            delivered = object()
+
+            async def send_media(_bot, _kind, file_id, *_args, **_kwargs):
+                if file_id == "bad-2" and interrupt:
+                    raise RuntimeError("delivery interrupted")
+                if file_id in {"bad-1", "bad-2"}:
+                    raise BadRequest()
+                self.assertEqual(file_id, "recovered-1")
+                return delivered
+
+            async def request(unique_id, active_bot):
+                self.assertIs(active_bot, sending_bot)
+                if not edit_fails:
+                    text = notice.edit_text.await_args.args[0]
+                    self.assertIn("正在向 X-MAN 索取媒体", text)
+                return "recovered-1" if unique_id == "unique-bad-1" else None
+
             namespace = {
                 "Message": object, "Bot": object, "Any": object,
                 "TelegramBadRequest": BadRequest,
-                "_send_media_with_bot": AsyncMock(side_effect=BadRequest()),
+                "_send_media_with_bot": send_media,
                 "_is_invalid_media_reference_error": lambda exc: True,
                 "_normalize_receiver_chat_id": lambda value, **kwargs: value,
                 "_album_kind": lambda kind: None,
-                "bot": SimpleNamespace(send_message=AsyncMock()),
-                "os": SimpleNamespace(getenv=lambda *args: "true"),
-                "received_media_store": received_media_store,
-                "active_userbot": active_userbot,
-                "media_identity": lambda file_id: {
-                    "media_type": "document", "media_id": 123,
-                },
+                "bot": main_bot,
+                "os": SimpleNamespace(getenv=lambda *args: "false"),
+                "BACKUP_FORWARD_SEND_LOCK": asyncio.Lock(),
+                "TelegramFileId": SimpleNamespace(
+                    file_id_to_unique_id=lambda value: f"unique-{value}",
+                ),
+                "_request_x_man": request,
+                "received_media_store": SimpleNamespace(get_by_file_id=AsyncMock(return_value=[])),
             }
             send_all = load_function("_send_all_media_with_bot", namespace)
+            items = [
+                {"file_type": "sticker", "file_id": "bad-1"},
+                {"file_type": "sticker", "file_id": "bad-2"},
+            ]
+            if interrupt:
+                with self.assertRaisesRegex(RuntimeError, "delivery interrupted"):
+                    await send_all(
+                        SimpleNamespace(from_user=None), {"items": items}, 123, sending_bot,
+                    )
+            else:
+                sent, skipped = await send_all(
+                    SimpleNamespace(from_user=None), {"items": items}, 123, sending_bot,
+                )
+                self.assertEqual(sent, [delivered])
+                self.assertEqual(skipped, [{**items[1], "_item_index": 2}])
+            main_bot.send_message.assert_awaited_once()
+            edits = [args.args[0] for args in notice.edit_text.await_args_list]
+            self.assertTrue(any("第 1/2 个资源" in text for text in edits))
+            if interrupt:
+                self.assertIn("发送中断，恢复处理未完成", edits[-1])
+            else:
+                self.assertTrue(any("第 2/2 个资源" in text for text in edits))
+                self.assertIn("恢复处理结束", edits[-1])
+                self.assertIn("已恢复并送出：1；恢复失败：1", edits[-1])
+            self.assertNotIn("请稍候", edits[-1])
 
-            sent, skipped = await send_all(
-                SimpleNamespace(from_user=None),
-                {"items": [{"file_type": "video", "file_id": "old-file-id"}]},
-                123,
-                sending_bot,
-            )
-
-            self.assertEqual(sent, [delivered_message])
-            self.assertEqual(skipped, [])
-            received_media_store.get_by_media_identity.assert_awaited_once_with(
-                "document", 123,
-            )
-            active_userbot.forward_stored_message.assert_awaited_once_with(
-                -100123, 222, "@runway_bot"
-            )
-            sending_bot.forward_message.assert_awaited_once_with(
-                chat_id=123,
-                from_chat_id=55,
-                message_id=333,
-                protect_content=False,
-            )
-
-        asyncio.run(run_case())
+        for edit_fails, interrupt in ((False, False), (True, False), (False, True)):
+            with self.subTest(edit_fails=edit_fails, interrupt=interrupt):
+                asyncio.run(run_case(edit_fails, interrupt))
 
     def test_request_x_man_requires_media_reply(self):
         async def run_case(reply, expected, custom_bot=False, send_error=False):

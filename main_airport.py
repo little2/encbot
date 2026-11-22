@@ -1621,11 +1621,16 @@ async def _request_backup_man(
 				)
 				continue
 			caption_file_unique_id = str(record.get("file_unique_id") or "").strip()
+			
 			if not caption_file_unique_id:
 				print("[USERBOT_RECOVERY] record has no file_unique_id, skipped", flush=True)
 				continue
 
 			try:
+				print(
+					f"[USERBOT_RECOVERY] userbot 沒有這筆紀綠，嘗試將媒體由 Bot B 上傳到 userbot C: file_unique_id={caption_file_unique_id}",
+					flush=True,
+				)
 				# Bot B 將媒體傳給 Userbot C
 				await _send_media_with_bot(
 					bot,
@@ -1947,7 +1952,7 @@ async def _send_all_media_with_bot(
 					print(f"[MEDIA_SEND:1616] sending bot info: {sending_bot_username}", flush=True)
 					raise RuntimeError(f"需要先启用跑道 @{sending_bot_username}")
 
-				print(f"[MEDIA_SEND:1615] media group send failed: {exc}", flush=True)
+				print(f"[MEDIA_SEND:1615] Sending Bot 傳送錯誤 : {exc}", flush=True)
 				if not _is_invalid_media_reference_error(exc):
 					raise
 				print(

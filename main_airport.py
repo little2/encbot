@@ -2544,7 +2544,11 @@ async def _prepare_batch_preview_payloads(
 			download_requests.setdefault(cache_key, preview_file_id)
 
 	downloaded = dict(await asyncio.gather(*[
-		_download_preview(cache_key, item, recipient_chat_id=recipient_chat_id)
+		_download_preview(
+			cache_key,
+			{"file_id": file_id},
+			recipient_chat_id=recipient_chat_id,
+		)
 		for cache_key, file_id in download_requests.items()
 	])) if download_requests else {}
 	jobs = [
@@ -2793,12 +2797,26 @@ async def _forward_encoded_if_whitelisted(
 					str(parsed_item.get("file_id", "")),
 				)
 				if source_item:
-					preview_file_id = str(source_item.get("preview_file_id", ""))
-					preview_unique_id = str(source_item.get("preview_unique_id", "") or preview_unique_id)
+					preview_file_id = str(
+						source_item.get("preview_file_id", "")
+						or source_item.get("thumb_file_id", "")
+					)
+					preview_unique_id = str(
+						source_item.get("preview_unique_id", "")
+						or source_item.get("thumb_file_unique_id", "")
+						or preview_unique_id
+					)
 
 				is_video = file_type == "video"
 				duration = (
-					max(0, int(parsed_item.get("duration", 0) or 0))
+					max(
+						0,
+						int(
+							parsed_item.get("duration", 0)
+							or (source_item or {}).get("duration", 0)
+							or 0
+						),
+					)
 					if is_video
 					else 0
 				)
@@ -3640,6 +3658,7 @@ async def _process_queued_media(
 			"source_message_id": int(message.message_id),
 			"has_protected_content": bool(message.has_protected_content),			
 			**preview_info,
+			**media_metadata,
 		}
 		session["items"].append(item)
 		session["processed_count"] = int(session.get("processed_count", 0)) + 1

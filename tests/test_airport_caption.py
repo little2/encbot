@@ -62,6 +62,7 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             text=None, entities=[], caption=caption, caption_entities=[], message_id=message_id,
             chat=SimpleNamespace(id=123), from_user=SimpleNamespace(id=456),
+            has_protected_content=False,
             reply=AsyncMock(return_value=SimpleNamespace(message_id=99)),
         )
 
@@ -82,6 +83,14 @@ class AirportCaptionTests(unittest.IsolatedAsyncioTestCase):
         state = await self.finish(message)
         self.assertEqual(state["batch_content"], "自动提取的内容介绍")
         self.assertFalse(state["editing_content"])
+
+    async def test_video_upload_item_keeps_duration_for_preview_badge(self):
+        message = self.message(None)
+        await self.upload(message)
+        queued_message, session = await self.ns["MEDIA_QUEUE"].get()
+        await self.ns["_process_queued_media"](queued_message, session)
+        item = session["items"][0]
+        self.assertEqual(item["duration"], 10)
 
     async def test_emoji_brackets_are_removed_from_batch_content(self):
         message = self.message("[👒🎤🚋📢🌀🕞👁️🤼‍♂️][番外篇]网调\n💽详情")

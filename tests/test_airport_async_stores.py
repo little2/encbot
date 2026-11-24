@@ -242,7 +242,9 @@ class SQLiteAirportStoreTests(AirportStoreContract, unittest.IsolatedAsyncioTest
             with patch("utils.airport_async_stores.time.time", return_value=NOW + 301):
                 self.assertIsNone(await store.reserve_backup(33, 55))
                 retry = await store.reserve_backup(33, 44)
-                self.assertEqual((retry["receipt_tag"], retry["first_attempt"]), (job["receipt_tag"], NOW))
+                self.assertEqual((retry["receipt_tag"], retry["first_attempt"]), (job["receipt_tag"], 0))
+                self.assertFalse(await store.begin_backup_send(job))
+                self.assertTrue(await store.begin_backup_send(retry))
                 await store.complete_backup(retry, 33, 99)
                 self.assertIsNone(await store.reserve_backup(33, 44))
                 self.assertEqual(await store.get_backup_locations("a", 44), [(33, 99)])

@@ -70,6 +70,10 @@ class ReceivedMediaStore(Protocol):
         backup_route: tuple[int, int] | None = None,
     ) -> list[str]: ...
     async def reserve_backup(self, tower_id: int, userbot_id: int, item: dict | None = None) -> dict | None: ...
+    async def begin_backup_send(self, job: dict) -> bool: ...
+    async def next_delivery(self, tower_id: int, userbot_id: int) -> dict | None: ...
+    async def claim_delivery(self, key: str) -> bool: ...
+    async def settle_delivery(self, key: str, outcome: str, expected: str) -> bool: ...
     async def complete_backup(self, job: dict, chat_id: int, message_id: int) -> None: ...
     async def find_backup_receipt(self, tower_id: int, userbot_id: int, caption: str, sticker_uid: str) -> dict | None: ...
     async def release_rejected_backup(self, job: dict) -> None: ...
@@ -546,23 +550,87 @@ class _ReceivedMediaStore:
                 row = await conn.fetchrow("""
                     SELECT * FROM userbot_backup_job WHERE tower_id=$1 AND userbot_id=$2 AND file_unique_id=$3
                 """, tower_id, userbot_id, item["file_unique_id"])
-                if row["first_attempt"] and row["retry_at"] > now:
+                if delivery := item.get("_delivery"):
+                    await conn.execute("""
+                        INSERT INTO userbot_delivery (delivery_id, tower_id, userbot_id, receipt_tag,
+                            runway_id, receiver_id, file_unique_id, file_type, no_forward, if_spoiler,
+                            flash_seconds, minutes, deadline, status, updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'waiting',$14)
+                        ON CONFLICT(delivery_id) DO NOTHING
+                    """, delivery["id"], tower_id, userbot_id, row["receipt_tag"], delivery["runway_id"],
+                         delivery["receiver_id"], item["file_unique_id"], item["file_type"],
+                         int(bool(item.get("no_forward"))), int(bool(item.get("if_spoiler"))),
+                         int(item.get("flash_seconds", 0)), delivery["minutes"], delivery["deadline"], now)
+                if row["retry_at"] > now:
                     return {**dict(row), "since": row["first_attempt"], "lookup_only": True}
             else:
                 row = await conn.fetchrow("""
                     SELECT * FROM userbot_backup_job WHERE tower_id=$1 AND userbot_id=$2
-                        AND retry_at <= $3 AND required=1 ORDER BY retry_at, file_unique_id LIMIT 1
+                        AND retry_at <= $3 AND (required=1 OR EXISTS (
+                            SELECT 1 FROM userbot_delivery d WHERE d.receipt_tag=userbot_backup_job.receipt_tag
+                            AND d.status='waiting')) ORDER BY retry_at, file_unique_id LIMIT 1
                 """, tower_id, userbot_id, now)
                 if row is None:
                     return None
             leased = await conn.fetchrow("""
-                UPDATE userbot_backup_job SET retry_at=$1,
-                    first_attempt=CASE WHEN first_attempt=0 THEN $2 ELSE first_attempt END
-                WHERE receipt_tag=$3 AND retry_at=$4 RETURNING receipt_tag
-            """, now + 300, now, row["receipt_tag"], row["retry_at"])
+                UPDATE userbot_backup_job SET retry_at=$1
+                WHERE receipt_tag=$2 AND retry_at=$3 RETURNING receipt_tag
+            """, now + 300, row["receipt_tag"], row["retry_at"])
             if leased is None:
+                if item is not None:
+                    return {**dict(row), "since": row["first_attempt"], "lookup_only": True}
                 return None
-            return {**dict(row), "since": row["first_attempt"] or now}
+            return {**dict(row), "since": row["first_attempt"] or now, "retry_at": now + 300,
+                    "lookup_only": bool(item is None and not row["required"] and row["first_attempt"])}
+
+    async def begin_backup_send(self, job):
+        async with self.database.transaction(write=True) as conn:
+            row = await conn.fetchrow("""
+                UPDATE userbot_backup_job SET first_attempt=CASE WHEN first_attempt=0 THEN $1 ELSE first_attempt END
+                WHERE receipt_tag=$2 AND retry_at=$3 RETURNING first_attempt
+            """, int(time.time()), job["receipt_tag"], job["retry_at"])
+            if row:
+                job["since"] = row["first_attempt"]
+            return bool(row)
+
+    async def next_delivery(self, tower_id, userbot_id):
+        now = int(time.time())
+        async with self.database.transaction() as conn:
+            row = await conn.fetchrow("""
+                SELECT d.*, c.chat_id, c.message_id FROM userbot_delivery d
+                LEFT JOIN userbot_media_copy c ON c.receipt_tag=d.receipt_tag
+                LEFT JOIN userbot_backup_job j ON j.receipt_tag=d.receipt_tag
+                WHERE d.tower_id=$1 AND d.userbot_id=$2 AND (
+                    (d.status='waiting' AND (c.chat_id IS NOT NULL OR d.deadline <= $3 OR j.receipt_tag IS NULL))
+                    OR (d.status='sending' AND d.updated_at <= $4))
+                ORDER BY d.updated_at, d.delivery_id LIMIT 1
+            """, tower_id, userbot_id, now, now - 300)
+            return dict(row) if row else None
+
+    async def claim_delivery(self, key):
+        async with self.database.transaction(write=True) as conn:
+            row = await conn.fetchrow("""
+                UPDATE userbot_delivery SET status='sending', updated_at=$1
+                WHERE delivery_id=$2 AND status='waiting' AND deadline>$1 RETURNING delivery_id
+            """, int(time.time()), key)
+            return bool(row)
+
+    async def settle_delivery(self, key, outcome, expected):
+        """Only the winning transition can release the original takeoff debit."""
+        if outcome not in {"sent", "failed", "uncertain"}:
+            raise ValueError("Invalid delivery outcome")
+        now = int(time.time())
+        async with self.database.transaction(write=True) as conn:
+            row = await conn.fetchrow("""
+                UPDATE userbot_delivery SET status=$1, updated_at=$2
+                WHERE delivery_id=$3 AND status=$4 RETURNING receiver_id, minutes
+            """, outcome, now, key, expected)
+            if row and outcome != "sent":
+                await conn.execute("""
+                    UPDATE user_expire SET expire_timestamp=expire_timestamp+$1, update_timestamp=$2
+                    WHERE user_id=$3
+                """, row["minutes"] * 60, now, row["receiver_id"])
+            return bool(row)
 
     async def find_backup_receipt(self, tower_id, userbot_id, caption, sticker_uid):
         async with self.database.transaction() as conn:
@@ -574,6 +642,9 @@ class _ReceivedMediaStore:
 
     async def release_rejected_backup(self, job):
         async with self.database.transaction(write=True) as conn:
+            await conn.execute("""
+                UPDATE userbot_delivery SET deadline=$1 WHERE receipt_tag=$2 AND status='waiting'
+            """, int(time.time()), job["receipt_tag"])
             await conn.execute("DELETE FROM userbot_backup_job WHERE receipt_tag=$1 AND required=0",
                                job["receipt_tag"])
             await conn.execute("""
@@ -945,6 +1016,17 @@ async def _initialize_airport_schema_on_connection(conn, backend):
         )
     """)
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_userbot_receipt ON userbot_media_copy(receipt_tag)")
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS userbot_delivery (
+            delivery_id TEXT PRIMARY KEY, tower_id BIGINT NOT NULL, userbot_id BIGINT NOT NULL,
+            receipt_tag TEXT NOT NULL, runway_id BIGINT NOT NULL, receiver_id BIGINT NOT NULL,
+            file_unique_id TEXT NOT NULL, file_type TEXT NOT NULL, no_forward BIGINT NOT NULL,
+            if_spoiler BIGINT NOT NULL, flash_seconds BIGINT NOT NULL, minutes BIGINT NOT NULL,
+            deadline BIGINT NOT NULL, status TEXT NOT NULL, updated_at BIGINT NOT NULL
+        )
+    """)
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_ready ON userbot_delivery(tower_id,userbot_id,status,updated_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_receipt ON userbot_delivery(receipt_tag,status)")
     await conn.execute("""
         INSERT INTO userbot_media_copy (userbot_id, file_unique_id, chat_id, message_id)
         SELECT 0, file_unique_id, storage_chat_id, storage_message_id FROM received_media

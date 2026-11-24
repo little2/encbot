@@ -145,6 +145,7 @@ class TelethonUserbot:
         destination: int | str,
         *,
         source_username: str | None = None,
+        receipt_tag: str | None = None,
     ) -> int:
         """Forward one stored Telegram message and return its destination message ID."""
         source_peer = await self._resolve_chat(int(source_chat_id), source_username)
@@ -163,6 +164,9 @@ class TelethonUserbot:
         forwarded_message_id = getattr(forwarded, "id", None)
         if forwarded_message_id is None:
             raise RuntimeError("Telethon did not return the forwarded message ID")
+        if receipt_tag:
+            # D sees the reply target in its own message-ID namespace.
+            await self.client.send_message(destination, receipt_tag, reply_to=forwarded_message_id)
         return int(forwarded_message_id)
 
     async def run(self, notify_bot: str | None = None) -> None:

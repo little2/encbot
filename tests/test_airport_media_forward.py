@@ -1,11 +1,12 @@
 import ast
 import asyncio
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Awaitable, Callable
 import unittest
-from unittest.mock import AsyncMock, call
+from unittest.mock import ANY, AsyncMock, call
 
 from tgfileid import TelegramFileId
 
@@ -14,6 +15,10 @@ SOURCE = Path(__file__).resolve().parents[1] / "main_airport.py"
 
 
 def load_function(name, namespace):
+    namespace.setdefault("TelegramFileId", TelegramFileId)
+    namespace.setdefault("secrets", secrets)
+    if name.startswith(("_wait_for_x_man", "_wait_for_userbot_media")):
+        load_function("_runway_messages", namespace)
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     function = next(
         node
@@ -80,15 +85,21 @@ class AirportMediaForwardTests(unittest.TestCase):
 
             @asynccontextmanager
             async def observe(*args):
-                if receipt_mode == "live":
-                    receipt.set_result(route)
                 yield receipt
 
             history = AsyncMock(return_value=route if receipt_mode == "history" else None)
             userbot = SimpleNamespace(observe_bot_upload=observe, find_bot_upload=history)
-            store = SimpleNamespace(complete_backup=AsyncMock(), release_rejected_backup=AsyncMock(), save_backup_file=AsyncMock(),
+            store = SimpleNamespace(complete_backup=AsyncMock(), begin_backup_send=AsyncMock(return_value=True), release_rejected_backup=AsyncMock(), save_backup_file=AsyncMock(),
                                     get_backup_receipt=AsyncMock(return_value=route if receipt_mode == "db" else None))
-            send = AsyncMock(side_effect=[first_send or sent, sent])
+            responses = iter([first_send or sent, sent])
+            async def upload_file(*args, **kwargs):
+                response = next(responses)
+                if isinstance(response, Exception):
+                    raise response
+                if receipt_mode == "live":
+                    receipt.set_result(route)
+                return response
+            send = AsyncMock(side_effect=upload_file)
             request_x = AsyncMock(return_value="replacement")
             ns = dict(asyncio=asyncio, bot=SimpleNamespace(id=101), bot_name="tower",
                       _send_media_with_bot=send, _request_x_man=request_x, _extract_media_unique_id=lambda m: m.uid,
@@ -97,7 +108,7 @@ class AirportMediaForwardTests(unittest.TestCase):
             upload = load_function("_upload_userbot_backup", ns)
             result = await upload(userbot, job, AsyncMock())
             self.assertEqual(result, None if receipt_mode == "unknown" else route)
-            self.assertEqual(send.await_count, 0 if restarted else 1 + expected_x)
+            self.assertEqual(send.await_count, 0 if restarted or receipt_mode == "db" else 1 + expected_x)
             self.assertEqual(request_x.await_count, expected_x)
             if expected_x:
                 request_x.assert_awaited_once_with("unique", ns["bot"])
@@ -240,7 +251,7 @@ class AirportMediaForwardTests(unittest.TestCase):
                 "bot": SimpleNamespace(send_message=AsyncMock()),
                 "os": SimpleNamespace(getenv=lambda *args: "true" if userbot_enabled else "false"),
                 "BACKUP_FORWARD_SEND_LOCK": lock,
-                "TelegramFileId": SimpleNamespace(file_id_to_unique_id=lambda value: "unique-id"),
+                "TelegramFileId": SimpleNamespace(sending_type=TelegramFileId.sending_type, file_id_to_unique_id=lambda value: "unique-id"),
                 "_request_x_man": request_media,
                 "received_media_store": received_media_store,
                 "active_userbot": None,
@@ -309,7 +320,7 @@ class AirportMediaForwardTests(unittest.TestCase):
                 get_by_file_id=AsyncMock(return_value=records),
                 get_backup_locations=AsyncMock(return_value=[(101, 17)] if "storage_chat_id" in record else []),
                 reserve_backup=AsyncMock(return_value=job), complete_backup=AsyncMock(), save_backup_file=AsyncMock(),
-                get_backup_receipt=AsyncMock(return_value=None), release_rejected_backup=AsyncMock(),
+                get_backup_receipt=AsyncMock(return_value=None), begin_backup_send=AsyncMock(return_value=True), release_rejected_backup=AsyncMock(),
             )
             forward = AsyncMock(return_value=333)
             if storage_state == "deleted":
@@ -402,7 +413,7 @@ class AirportMediaForwardTests(unittest.TestCase):
             if storage_state == "stored":
                 self.assertEqual(uploads, [])
                 forward.assert_awaited_once_with(
-                    101, 17, "@runway_bot", source_username="main_bot",
+                    101, 17, "@runway_bot", source_username="main_bot", receipt_tag=ANY,
                 )
             elif not x_has_file or final_upload_fails:
                 expected_uploads = [original_id, "recovered-b-id"] if not b_has_file and x_has_file else [original_id]
@@ -418,14 +429,14 @@ class AirportMediaForwardTests(unittest.TestCase):
                 self.assertEqual(captions[-1], "tag")
                 storage.complete_backup.assert_awaited_once_with(job, 101, 222)
                 expected = (
-                    [call(101, 17, "@runway_bot", source_username="main_bot")]
+                    [call(101, 17, "@runway_bot", source_username="main_bot", receipt_tag=ANY)]
                     if storage_state == "deleted" else []
                 )
                 self.assertEqual(
                     forward.await_args_list,
-                    expected + [call(101, 222, "@runway_bot", source_username="main_bot")],
+                    expected + [call(101, 222, "@runway_bot", source_username="main_bot", receipt_tag=ANY)],
                 )
-            wait_for_d.assert_awaited_once_with(bot_d, unique_id, 55)
+            wait_for_d.assert_awaited_once_with(bot_d, unique_id, 55, forward.await_args.kwargs["receipt_tag"])
             self.assertEqual((sent, skipped), ([delivered], []))
 
         for case in (
@@ -436,6 +447,7 @@ class AirportMediaForwardTests(unittest.TestCase):
             ("missing location", "document", False, False),
             ("deleted", "document", True, True, True), ("no row", "sticker", False, True, True),
             ("stored", "document", True, True, False, "MEDIA_FILE_INVALID"),
+            ("deleted", "document", True, True, False, "wrong file ID"),
         ):
             with self.subTest(case=case):
                 asyncio.run(run_case(*case))

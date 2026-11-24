@@ -628,10 +628,10 @@ def _extract_media_info(message: Message) -> tuple[str, str]:
 	从消息中提取 (file_type, file_id)。
 	若不是支持的媒体类型，抛出 ValueError。
 	"""
+	# Telegram also populates document for an animation.
+	if message.animation:
+		return "animation", message.animation.file_id
 	if message.document:
-		mime_type = str(message.document.mime_type or "").lower()
-		if mime_type == "video/mp4":
-			return "video", message.document.file_id
 		return "document", message.document.file_id
 	if message.photo:
 		# photo 为多个尺寸，取最大尺寸通常在最后一个
@@ -642,8 +642,6 @@ def _extract_media_info(message: Message) -> tuple[str, str]:
 		return "audio", message.audio.file_id
 	if message.voice:
 		return "voice", message.voice.file_id
-	if message.animation:
-		return "animation", message.animation.file_id
 	if message.sticker:
 		return "sticker", message.sticker.file_id
 
@@ -652,12 +650,11 @@ def _extract_media_info(message: Message) -> tuple[str, str]:
 
 def _extract_media_unique_id(message: Message) -> str:
 	media = (
-		message.document
+		message.animation or message.document
 		or (message.photo[-1] if message.photo else None)
 		or message.video
 		or message.audio
 		or message.voice
-		or message.animation
 		or message.sticker
 	)
 	file_unique_id = str(getattr(media, "file_unique_id", "") or "").strip()
@@ -1028,6 +1025,14 @@ TAG_TYPE_GROUPS: dict[str, list[tuple[str, str]]] = {
 }
 
 TAG_TYPE_VALUES: dict[str, list[str]] = {
+	"age": ["少年_高中", "初毛", "高年级_小五", "低年级_小二", "婴儿","成人男同"],
+	"face": ["有露脸", "没有露脸", "带了面罩"],
+	"act": ["爆菊", "口交","撸管", "手交","内射", "射精", "口爆", "颜射","亲吻","舔蛋","舔肛"],
+	"nudity": ["露出鸡鸡","打码", "诱惑但不露点", "没有裸体"],
+	"par": ["正太与叔叔", "正太独秀", "正太和正太", "群交", "正太与萝莉", "正太与阿姨"],
+	"fetish": ["打屁股","挠痒", "胖太", "恋足", "网路调教","BDSM", "人兽", "袜","制服"],
+	"att": ["性玩具","尿尿","大便","睡觉偷摸","粗暴性爱","年下攻","大屌", "霸凌", "文化习俗", "操射", "医学", "无性裸露","户外拍摄"],
+	"feedback": ["呻吟","享受", "没反应", "忙别的事", "喊痛或哭"],
 	"pro": ["AI创作", "卡通动漫", "视频通话录屏", "监视器", "偷拍", "电影或影集"],
 	"eth": ["黄种人", "棕种人", "黑人", "白人"],
 	"play": ["公众场所", "戏弄嬉闹", "恶搞"],
@@ -1316,6 +1321,7 @@ def _normalize_receiver_chat_id(
 async def _send_media_with_bot(
 	sending_bot, file_type, file_id, chat_id, no_forward, if_spoiler, *, caption: str | None = None,
 ) -> Message:
+	file_type = TelegramFileId.sending_type(file_type, file_id)
 	if file_type == "document":
 		return await sending_bot.send_document(chat_id=chat_id, document=file_id, protect_content=no_forward, caption=caption)
 	if file_type == "photo":
@@ -1448,13 +1454,43 @@ def _build_input_media(item: dict[str, Any], if_spoiler: bool = False):
 
 
 def _is_invalid_media_reference_error(exc: TelegramBadRequest) -> bool:
-	error_text = str(getattr(exc, "message", exc)).casefold()
+	error_text = " ".join(str(getattr(exc, "message", exc)).casefold().replace("_", " ").split())
 	return any(marker in error_text for marker in (
-		"media_file_invalid",
-		"wrong file identifier",
-		"wrong file_id",
+		"media file invalid",
+		"wrong file id",
+		"invalid file id",
+		"file id invalid",
+		"file reference expired",
+		"file reference invalid",
 		"file is temporarily unavailable",
 	))
+
+
+async def _runway_messages(active_bot, timeout):
+	"""Advance the shared cursor only through the updates this bot has consumed."""
+	loop = asyncio.get_running_loop()
+	deadline = loop.time() + timeout
+	offset = getattr(active_bot, "_airport_update_offset", None)
+
+	while True:
+		remaining = deadline - loop.time()
+		if remaining <= 0:
+			raise TimeoutError
+		poll_timeout = max(1, min(10, int(remaining)))
+		updates = await asyncio.wait_for(
+			active_bot.get_updates(
+				offset=offset,
+				timeout=poll_timeout,
+				allowed_updates=["message"],
+				request_timeout=poll_timeout + 5,
+			),
+			timeout=remaining,
+		)
+		for update in updates:
+			offset = update.update_id + 1
+			active_bot._airport_update_offset = offset
+			if update.message is not None:
+				yield update.message
 
 
 async def _wait_for_x_man_reply_with_bot(
@@ -1464,80 +1500,34 @@ async def _wait_for_x_man_reply_with_bot(
 ) -> str | None:
 	"""Poll a dynamically selected bot until X_MAN replies to this request."""
 	x_man_bot_id = int(SharedConfig.get("x_man_bot_id", 0) or 0)
-	loop = asyncio.get_running_loop()
-	deadline = loop.time() + X_MAN_REPLY_TIMEOUT_SECONDS
-	offset: int | None = None
-
-	while True:
-		remaining = deadline - loop.time()
-		if remaining <= 0:
-			raise TimeoutError
-		poll_timeout = max(1, min(10, int(remaining)))
-		updates = await asyncio.wait_for(
-			active_bot.get_updates(
-				offset=offset,
-				timeout=poll_timeout,
-				allowed_updates=["message"],
-				request_timeout=poll_timeout + 5,
-			),
-			timeout=remaining,
-		)
-		for update in updates:
-			offset = update.update_id + 1
-			message = update.message
-			if message is None or message.from_user is None:
-				continue
-			if int(message.from_user.id) != x_man_bot_id:
-				continue
-			replied_message = message.reply_to_message
-			if replied_message is None or replied_message.message_id != request_message_id:
-				continue
-			replied_file_unique_id = str(
-				replied_message.text or replied_message.caption or ""
-			).strip()
-			if replied_file_unique_id != file_unique_id:
-				continue
-			reply_file_id = _get_x_man_reply_file_id(message, file_unique_id)
-			if reply_file_id is None:
-				continue
-			return reply_file_id if reply_file_id != "na" else None
+	async for message in _runway_messages(active_bot, X_MAN_REPLY_TIMEOUT_SECONDS):
+		if message is None or message.from_user is None:
+			continue
+		if int(message.from_user.id) != x_man_bot_id:
+			continue
+		replied_message = message.reply_to_message
+		if replied_message is None or replied_message.message_id != request_message_id:
+			continue
+		replied_file_unique_id = str(
+			replied_message.text or replied_message.caption or ""
+		).strip()
+		if replied_file_unique_id != file_unique_id:
+			continue
+		reply_file_id = _get_x_man_reply_file_id(message, file_unique_id)
+		if reply_file_id is None:
+			continue
+		return reply_file_id if reply_file_id != "na" else None
 
 
-async def _wait_for_userbot_media_with_bot(
-	active_bot: Bot,
-	file_unique_id: str,
-	userbot_id: int,
-) -> str | None:
-	"""Poll a non-primary sending bot for the media forwarded by the userbot."""
-	loop = asyncio.get_running_loop()
-	deadline = loop.time() + BACKUP_MAN_REPLY_TIMEOUT_SECONDS
-	offset: int | None = None
-
-	while True:
-		remaining = deadline - loop.time()
-		if remaining <= 0:
-			raise TimeoutError
-		poll_timeout = max(1, min(10, int(remaining)))
-		updates = await asyncio.wait_for(
-			active_bot.get_updates(
-				offset=offset,
-				timeout=poll_timeout,
-				allowed_updates=["message"],
-				request_timeout=poll_timeout + 5,
-			),
-			timeout=remaining,
-		)
-		for update in updates:
-			offset = update.update_id + 1
-			message = update.message
-			if message is None or message.from_user is None:
-				continue
-			if int(message.from_user.id) != userbot_id:
-				continue
+async def _wait_for_userbot_media_with_bot(active_bot, file_unique_id, userbot_id, receipt_tag):
+	async for message in _runway_messages(active_bot, BACKUP_MAN_REPLY_TIMEOUT_SECONDS):
+		if not message.from_user or message.from_user.id != userbot_id or message.text != receipt_tag:
+			continue
+		media = message.reply_to_message
+		if media and media.from_user and media.from_user.id == userbot_id:
 			try:
-				if _extract_media_unique_id(message) != file_unique_id:
-					continue
-				return _get_x_man_reply_file_id(message)
+				if _extract_media_unique_id(media) == file_unique_id:
+					return _get_x_man_reply_file_id(media)
 			except ValueError:
 				continue
 
@@ -1610,11 +1600,12 @@ async def _forward_userbot_media(
 		BACKUP_MAN_PENDING_USERBOT_ID = userbot_id
 	try:
 		source_username = bot_name if int(chat_id) == bot.id else None
+		receipt_tag = secrets.token_urlsafe(18) if pending_reply is None else None
 		await userbot.forward_stored_message(
-			chat_id, message_id, destination, source_username=source_username,
+			chat_id, message_id, destination, source_username=source_username, receipt_tag=receipt_tag,
 		)
 		if pending_reply is None:
-			file_id = await _wait_for_userbot_media_with_bot(active_bot, file_unique_id, userbot_id)
+			file_id = await _wait_for_userbot_media_with_bot(active_bot, file_unique_id, userbot_id, receipt_tag)
 		else:
 			file_id = await asyncio.wait_for(pending_reply, timeout=BACKUP_MAN_REPLY_TIMEOUT_SECONDS)
 		return file_id if file_id != "na" else None
@@ -1631,13 +1622,24 @@ async def _upload_userbot_backup(userbot, job, report):
 	tag = job["receipt_tag"]
 	sticker_uid = uid if job["file_type"] == "sticker" else None
 
-	async def reconcile():
+	async def known_receipt():
+		if receipt.done():
+			return receipt.result()
 		location = await received_media_store.get_backup_receipt(tag)
-		if location:
-			return location
-		return await userbot.find_bot_upload(bot.id, bot_name, tag, sticker_uid, job["since"])
+		return receipt.result() if receipt.done() else location
+
+	async def reconcile():
+		location = await known_receipt()
+		if not location:
+			try:
+				location = await userbot.find_bot_upload(bot.id, bot_name, tag, sticker_uid, job["since"])
+			except ValueError as exc:
+				print(f"[USERBOT_BACKUP] cannot resolve previous upload: {exc}", flush=True)
+		return location or await known_receipt()
 
 	async def send(file_id):
+		if await known_receipt() or not await received_media_store.begin_backup_send(job) or receipt.done():
+			return
 		message = await asyncio.wait_for(_send_media_with_bot(
 			bot, job["file_type"], file_id, job["userbot_id"], False, False, caption=tag,
 		), timeout=30)
@@ -1656,28 +1658,28 @@ async def _upload_userbot_backup(userbot, job, report):
 			except (TelegramNetworkError, TelegramServerError):
 				raise
 			except TelegramAPIError:
-				pass  # Telegram explicitly rejected the original send.
+				pass
+		if await known_receipt():
+			return True
 		await report("塔台没有可用班机，正在飞机工厂请求支援")
 		replacement = await _request_x_man(uid, bot)
 		if not replacement:
 			return False
-		await received_media_store.save_backup_file(job["receipt_tag"], replacement)
+		await received_media_store.save_backup_file(tag, replacement)
 		await send(replacement)
 		return True
 
-	# After a crash or lost response the previous request may already be in C's history.
-	location = await reconcile() if job["first_attempt"] else None
-	if not location and job.get("lookup_only"):
-		return None
-	if not location:
-		async with userbot.observe_bot_upload(bot.id, tag, sticker_uid) as receipt:
+	async with userbot.observe_bot_upload(bot.id, tag, sticker_uid) as receipt:
+		location = await reconcile() if job["first_attempt"] else await known_receipt()
+		if not location and job.get("lookup_only"):
+			return None
+		if not location:
 			try:
 				if not await send_from_b():
 					await received_media_store.release_rejected_backup(job)
 					return None
 			except (OSError, TelegramNetworkError, TelegramServerError):
-				# A transport failure does not establish whether Telegram accepted the upload.
-				pass
+				pass  # Telegram may already have accepted the upload.
 			except TelegramAPIError:
 				await received_media_store.release_rejected_backup(job)
 				raise
@@ -1727,14 +1729,74 @@ async def _request_backup_man(
 	)
 	if job is None:
 		return None
+	delivery = item_data.get("_delivery")
+	if delivery:
+		item_data["_delivery_waiting"] = True
 	location = await asyncio.wait_for(_upload_userbot_backup(userbot, job, report), timeout=180)
 	if not location:
 		return None
 	await report("已收到班机，正在发送")
 	candidate = await _forward_userbot_media(userbot, active_bot, uid, *location)
-	if candidate and (accept_file_id is None or await accept_file_id(candidate)):
-		return candidate
-	return None
+	if not candidate:
+		return None
+	if delivery and not await received_media_store.claim_delivery(delivery["id"]):
+		return None
+	accepted = accept_file_id is None or await accept_file_id(candidate)
+	if delivery:
+		await received_media_store.settle_delivery(delivery["id"], "sent" if accepted else "failed", "sending")
+		if not accepted:
+			item_data["_delivery_refunded"] = True
+	return candidate if accepted else None
+
+
+async def _resume_userbot_delivery(userbot, row):
+	key = row["delivery_id"]
+	status = row["status"]
+	outcome = "failed"
+
+	async def deliver(runway):
+		nonlocal status, outcome
+		candidate = await _forward_userbot_media(
+			userbot, runway, row["file_unique_id"], row["chat_id"], row["message_id"],
+		)
+		if not candidate or not await received_media_store.claim_delivery(key):
+			return
+		status, outcome = "sending", "uncertain"
+		try:
+			message = await _send_media_with_bot(
+				runway, row["file_type"], candidate, row["receiver_id"],
+				bool(row["no_forward"]), bool(row["if_spoiler"]),
+			)
+		except (TelegramBadRequest, TelegramForbiddenError):
+			outcome = "failed"
+			return
+		if message:
+			outcome = "sent"
+			if row["flash_seconds"]:
+				asyncio.create_task(_delete_message_later(message, row["flash_seconds"]))
+
+	try:
+		if status == "sending":
+			outcome = "uncertain"  # A previous worker may already have sent to E.
+		elif row["chat_id"] is not None and row["deadline"] > int(app_now().timestamp()):
+			if row["runway_id"] == bot.id:
+				await deliver(bot)
+			else:
+				async with database_stores._database.transaction() as conn:
+					user = await conn.fetchrow("SELECT bot_token FROM user_info WHERE user_id=$1", row["receiver_id"])
+				token = str(user["bot_token"] or "").strip() if user else ""
+				if token and token.partition(":")[0] == str(row["runway_id"]):
+					async with SEND_BOT_CACHE.use(token) as runway:
+						await deliver(runway)
+	except Exception as exc:
+		print(f"[USERBOT_DELIVERY] {key}: {exc}", flush=True)
+	if await received_media_store.settle_delivery(key, outcome, status):
+		text = {
+			"sent": "✅ 等待恢复的资源已送达，使用原申请预留的时间。",
+			"failed": "⚠️ 资源未能送达，已退回本项预留的时间。",
+			"uncertain": "⚠️ 跑道未能确认最终送达，已退回本项预留的时间。",
+		}[outcome]
+		await bot.send_message(row["receiver_id"], text)
 
 
 async def _userbot_backup_worker(userbot):
@@ -1746,6 +1808,9 @@ async def _userbot_backup_worker(userbot):
 		try:
 			if userbot.user_id:
 				async with BACKUP_FORWARD_SEND_LOCK:
+					delivery = await received_media_store.next_delivery(bot.id, userbot.user_id)
+					if delivery:
+						await _resume_userbot_delivery(userbot, delivery)
 					job = await received_media_store.reserve_backup(bot.id, userbot.user_id)
 					if job:
 						await asyncio.wait_for(_upload_userbot_backup(userbot, job, report), timeout=180)
@@ -1800,7 +1865,7 @@ async def _send_all_media_with_bot(
 		"file_type": data["file_type"],
 	}]
 	items = [
-		{**item, "_item_index": index}
+		{**item, "file_type": TelegramFileId.sending_type(item["file_type"], item.get("file_id")), "_item_index": index}
 		for index, item in enumerate(source_items, start=1)
 	]
 
@@ -1875,6 +1940,11 @@ async def _send_all_media_with_bot(
 		delivered = False
 		try:
 			if os.getenv("USERBOT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+				if data.get("_request_id"):
+					item_data["_delivery"] = dict(
+						id=f"{data['_request_id']}.{item['_item_index']}", receiver_id=chat_id,
+						runway_id=sending_bot.id, deadline=data["_deadline"], minutes=MEDIA_VIEW_CONSUMPTION_MINUTES,
+					)
 				await report_progress("正在等待恢复任务")
 				async with BACKUP_FORWARD_SEND_LOCK:
 					delivered = bool(await _request_backup_man(
@@ -1897,6 +1967,9 @@ async def _send_all_media_with_bot(
 		if delivered:
 			recovery_succeeded += 1
 			await report_progress("恢复成功，已送出")
+		elif item_data.get("_delivery_waiting"):
+			skipped_items.append({**item, "_delivery_state": "refunded" if item_data.get("_delivery_refunded") else "waiting"})
+			await report_progress("已退回本项时间" if item_data.get("_delivery_refunded") else "等待回执，原申请将自动处理")
 		else:
 			skipped_items.append(item)
 			recovery_failed += 1
@@ -1980,7 +2053,7 @@ async def _send_all_media_with_bot(
 		await flush_group()
 		delivery_finished = True
 	except Exception as exc:
-		if not sent_messages:
+		if not sent_messages and not any(item.get("_delivery_state") for item in skipped_items):
 			if "chat not found" in str(exc):
 				info = await sending_bot.get_me()
 				raise RuntimeError(f"需要先启用跑道 @{info.username}") from exc
@@ -3354,19 +3427,6 @@ async def _handle_send_encoded(
 		return
 
 	state["send_status"] = "sending"
-	try:
-		await callback.answer("正在送出")
-	except Exception:
-		state["send_status"] = "failed"
-		await received_media_store.release_pending_batch(batch_id)
-		raise
-	try:
-		await callback.message.edit_reply_markup(
-			reply_markup=await _build_controls_keyboard(state, encoded_snapshot),
-		)
-	except Exception as exc:
-		print(f"[ENCODED_FORWARD] sending keyboard update failed: {exc}", flush=True)
-
 	task = asyncio.create_task(
 		_send_encoded_snapshot(
 			state_key=state_key,
@@ -3389,6 +3449,16 @@ async def _handle_send_encoded(
 			state.pop("send_task", None)
 
 	task.add_done_callback(_clear_send_task)
+	try:
+		await callback.answer("正在送出")
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] confirmation committed, callback reply failed: {exc}", flush=True)
+	try:
+		await callback.message.edit_reply_markup(
+			reply_markup=await _build_controls_keyboard(state, encoded_snapshot),
+		)
+	except Exception as exc:
+		print(f"[ENCODED_FORWARD] sending keyboard update failed: {exc}", flush=True)
 
 
 async def _handle_cancel_encoded(
@@ -6750,6 +6820,54 @@ def parse_bj_tag_for_file(tag_str):
 			tag_mapping = {
 				"白种人": "白人",
 				"黑种人": "黑人",
+				"露脸": "有露脸",
+				"遮挡": "带了面罩",
+				"未露脸": "没有露脸",
+				"无毛": "高年级_小五",
+				"中毛": "少年_高中",
+				"黑森林": "少年_高中",
+				"幼儿": "低年级_小二",
+				"小学": "低年级_小二",
+				"初中": "初毛",
+				"高中": "少年_高中",
+				"合法": "少年_高中",
+				"清水": "没有裸体",
+				"写真": "正太主题汇整",
+				"动画": "卡通动漫",
+				"母子": "正太与阿姨",
+				"肛交": "爆菊",
+				"口交": "口交",
+				"足交": "恋足",
+				"自撸": "撸管",
+				"射精": "射精",
+				"展示": "正太独秀",
+				"摸": "手交",
+				"偷拍": "偷拍",
+				"胖太": "胖太",
+				"TK挠痒": "瘙痒",
+				"SP打屁股": "打屁股",
+				"恋物": "恋物",
+				"猎奇重口": "猎奇",
+				"医学类": "医学",
+				"霸凌": "霸凌",
+				"监视": "监视器",
+				"直播录屏": "直播",
+				"冰淇淋": "冰淇淋",
+				"奶黄包": "奶黄包",
+				"眼镜哥": "眼镜哥系列",
+				"西边的风":"西边的风",
+				"日本全方位":"日本全方位",
+				"小孩不笨":"小孩不笨",  #
+				"网调大神":"网调大神",  #
+				"猫系列":"猫系列",
+				"雨花石":"雨花石系列",
+				"早点睡觉caodidi":"Caodidi系列",
+				"BB嵬":"BB嵬",
+				"we出品":"WE系列",
+				"堂山天草":"堂山",
+				"么么哒视频":"么么哒视频", #
+				"么么哒举牌原创":"么么哒举牌原创", #
+				"小6童模":"小六摄影",
 				"ledi二维码":"二维码系列"
 			}
 
@@ -7651,11 +7769,15 @@ async def on_takeoff_fly(
 		).strip().lstrip("@")
 
 		delivered_qty = min(requested_qty, len(send_result["sent_media_messages"]))
-		skipped_qty = requested_qty - delivered_qty
+		pending_qty = send_result.get("pending_count", 0)
+		refunded_qty = send_result.get("refunded_count", 0)
+		skipped_qty = requested_qty - delivered_qty - pending_qty - refunded_qty
 		delivered_minutes = delivered_qty * MEDIA_VIEW_CONSUMPTION_MINUTES
 		if skipped_qty:
 			await user_expire_cache.refund_minutes(reader_user_id, skipped_qty * MEDIA_VIEW_CONSUMPTION_MINUTES)
 		if not delivered_qty:
+			if pending_qty:
+				return {"ok": True, "answer": {"text": f"已保留 {pending_qty} 项申请，回执到达后将自动送出。", "show_alert": True}}
 			return {"ok": False, "answer": {"text": "❌ 媒体未送达，已退回时间", "show_alert": True}}
 
 		try:
@@ -7680,9 +7802,11 @@ async def on_takeoff_fly(
 				f"🎫 当前飞行通行证到期时间为：{expire_text}。（ 相当于 {remaining_view_count} 个资源 ） \n\n"
 				f"🎈 每获取一个媒体需要消耗  {MEDIA_VIEW_CONSUMPTION_MINUTES} 分钟的飞行通行证有效期。"
 			)
-			if skipped_qty:
+			if pending_qty:
+				notify_text += f"\n⏳ {pending_qty} 个资源等待回执，已保留本次申请。"
+			if skipped_qty or refunded_qty:
 				notify_text += (
-					f"\n⚠️ 已跳过 {skipped_qty} 个失效或暂时不可用的资源，"
+					f"\n⚠️ 已跳过 {skipped_qty + refunded_qty} 个失效或暂时不可用的资源，"
 					"未扣除对应时间。"
 				)
 
@@ -8251,6 +8375,8 @@ async def extract_encode(
 				reader_user_id,
 			)
 		user_bot_token = str(user_info["bot_token"] or "").strip() if user_info else ""
+		delivery_data["_request_id"] = secrets.token_urlsafe(18)
+		delivery_data["_deadline"] = 253402214400 if is_admin else int(valid_until_dt.timestamp())
 		
 
 		sent_media_messages, skipped_items, sendingbot_username = await _send_all_media(
@@ -8259,7 +8385,9 @@ async def extract_encode(
 			receiver_id=receiver_id,
 			bot_token=user_bot_token,
 		)
-		if not sent_media_messages:
+		pending_count = sum(item.get("_delivery_state") == "waiting" for item in skipped_items)
+		refunded_count = sum(item.get("_delivery_state") == "refunded" for item in skipped_items)
+		if not sent_media_messages and not (pending_count or refunded_count):
 			raise ValueError("没有收到任何媒体发送成功的回执")
 	except Exception as exc:
 		print(f"[TAKEOFF:7947] media delivery failed: {exc}", flush=True)
@@ -8275,8 +8403,10 @@ async def extract_encode(
 		"ok": True,
 		"sent_media_messages": sent_media_messages,
 		"skipped_items": skipped_items,
-		"skipped_count": len(skipped_items),
-			"sendingbot_username": sendingbot_username,
+		"skipped_count": len(skipped_items) - pending_count,
+		"pending_count": pending_count,
+		"refunded_count": refunded_count,
+		"sendingbot_username": sendingbot_username,
 		"marked_flash_key": marked_flash_key,
 	}
 

@@ -444,12 +444,14 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                        _wait_for_pending_thumbnails=AsyncMock(), _build_controls_keyboard=AsyncMock(),
                        _send_encoded_snapshot=AsyncMock(), ENCODED_SEND_TASKS=set())
         load_functions({"_handle_send_encoded", "_on_userbot_message"}, self.ns)
+        callback.answer.side_effect = RuntimeError("query is too old")
         with patch.dict(os.environ, USERBOT_ENABLED="true"):
             await self.ns["_handle_send_encoded"](callback, (owner, 8), state)
         await state["send_task"]
         store = self.stores.received_media
         job = await store.reserve_backup(self.bot.id, 55)
         self.assertEqual(job["file_unique_id"], "unique")
+        self.assertTrue(await store.begin_backup_send(job))
         msg = SimpleNamespace(media=object(), raw_text=job["receipt_tag"], sticker=None)
         event = SimpleNamespace(is_private=True, sender_id=self.bot.id, chat_id=self.bot.id, message=msg, id=90)
         await self.ns["_on_userbot_message"](event)

@@ -34,6 +34,17 @@ class TelegramFileId:
 
     UNIQUE_TYPE_DOCUMENT = 2
 
+    @classmethod
+    def sending_type(cls, stored_type: str, file_id: str) -> str:
+        """Repair old tokens that recorded an MP4 document or animation as video."""
+        if stored_type not in {"document", "video"} or not file_id:
+            return stored_type
+        try:
+            actual = cls.parse(file_id)["type"]
+        except (ValueError, KeyError, struct.error):
+            return stored_type
+        return actual if actual in {"document", "animation", "video"} else stored_type
+
     @staticmethod
     def _base64url_decode(value: str) -> bytes:
         padding = "=" * (-len(value) % 4)

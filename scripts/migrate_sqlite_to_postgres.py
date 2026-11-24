@@ -45,6 +45,9 @@ AIRPORT_TABLES = {
     "shared_invite_link": ("link_key", "chat_id", "invite_link", "name", "created_at", "validated_at"),
 }
 USERBOT_TABLES = {
+    "userbot_delivery": ("delivery_id", "tower_id", "userbot_id", "receipt_tag", "runway_id",
+                         "receiver_id", "file_unique_id", "file_type", "no_forward", "if_spoiler",
+                         "flash_seconds", "minutes", "deadline", "status", "updated_at"),
     "userbot_backup_job": ("tower_id", "userbot_id", "file_unique_id", "file_id", "file_type",
                            "receipt_tag", "required", "first_attempt", "retry_at"),
     "userbot_media_copy": ("userbot_id", "file_unique_id", "chat_id", "message_id", "receipt_tag"),
@@ -63,6 +66,7 @@ TEXT_COLUMNS = {
     "shared_invite_link": {"link_key", "invite_link", "name"},
     "userbot_backup_job": {"file_unique_id", "file_id", "file_type", "receipt_tag"},
     "userbot_media_copy": {"file_unique_id", "receipt_tag"},
+    "userbot_delivery": {"delivery_id", "receipt_tag", "file_unique_id", "file_type", "status"},
 }
 NULLABLE_COLUMNS = {
     "userbot_media_copy": {"receipt_tag"},
@@ -182,7 +186,7 @@ def read_sqlite(connection, *, app="taohua"):
     tables = {}
     for table, columns in columns_for(app).items():
         if table not in existing:
-            if table in USERBOT_TABLES and not existing.intersection(USERBOT_TABLES):
+            if table == "userbot_delivery" or (table in USERBOT_TABLES and not existing.intersection(USERBOT_TABLES)):
                 continue  # Older source. Leave any target-only backup queues alone.
             raise MigrationError(f"SQLite 缺少必要表 {table}，拒绝将缺表当作空表")
         actual = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}

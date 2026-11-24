@@ -242,13 +242,13 @@ class AirportMediaForwardTests(unittest.TestCase):
                 user_e, bot_d,
             )
             edits = [args.args[0] for args in notice.edit_text.await_args_list]
-            self.assertTrue(any("正在查找 Userbot 备份" in text for text in edits))
+            self.assertTrue(any("正在停机坪寻觅班机" in text for text in edits))
             if storage_state == "stored":
                 self.assertTrue(any("已找到备份" in text for text in edits))
             else:
-                self.assertTrue(any("正在从主机器人补存" in text for text in edits))
+                self.assertTrue(any("正在向塔台请求支援" in text for text in edits))
                 if not b_has_file:
-                    self.assertTrue(any("正在向 X-MAN 索取" in text for text in edits))
+                    self.assertTrue(any("正在飞机工厂请求支援" in text for text in edits))
             self.assertIn("恢复处理结束", edits[-1])
             if b_has_file or storage_state == "stored":
                 request_x.assert_not_awaited()

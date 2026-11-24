@@ -751,7 +751,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 	])
 
 
-	TAG_ROWS = ["偷拍","网路调教","监视器","享受被操","喊痛或哭","婴幼儿"]
+	TAG_ROWS = ["偷拍","网路调教","监视器","享受被操","喊痛或哭"]
 	rows = []
 	for tag in TAG_ROWS:
 		rows.append(InlineKeyboardButton(text=f"#{tag}", callback_data=f"tag:{tag}"))
@@ -1180,9 +1180,7 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 	if "偷拍" in tags_string:
 		tags_string2=tags_string2.replace("偷拍","窥桃")
 		alter = "隔墙偷看桃花影，未敢惊春一瓣红。"
-	if "婴幼儿" in tags_string:
-		alter = "桃蕾初含三月雨，未经风暖已生春。"
-		tags_string2=tags_string2.replace("婴幼儿","新芽")
+
 	if "网路调教" in tags_string:
 		tags_string2=tags_string2.replace("网路调教","驯枝")
 		alter = "隔屏传令驯花枝，千里桃香听指挥。"

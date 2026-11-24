@@ -428,8 +428,8 @@ PAID_INVITE_USED_RETENTION_SECONDS = 48 * 60 * 60
 INACTIVE_CANDIDATE_PAGE_SIZE = 20
 LOW_UPLOAD_CLEANUP_LIMIT = 15
 TAKEOFF_KICK_REASONS = {
-	"mixed": "同批不同系列，单品需独立上传，不同系列(弟弟)的不要混在一批上传",
-	"not_shota": "非正太资源，例如萝莉、男同、清水图等，机场不收。",
+	"mixed": "同批不同系列，单品需独立上传，不同系列(人物)的不要混在一批上传",
+	"not_shota": "非资源，例如萝莉、男同、清水图等，机场不收。",
 	"clean": "纯清水图，没有色色的，没办法打飞机",
 	"off_topic": "文不对题，内容与主题无关",
 }
@@ -490,7 +490,7 @@ AIRPORT_QUIZ_QUESTIONS = (
 		(
 			"不同系列混批上传且数量不限",
 			"重复上传无效或相同资源",
-			"上传清水媒体换取正太资源",
+			"上传清水媒体换取资源",
 			"可以上传萝莉或男同的内容",
 			"不同系列不可以混在一起上传，每批最多十个",
 		),
@@ -1026,14 +1026,6 @@ TAG_TYPE_GROUPS: dict[str, list[tuple[str, str]]] = {
 }
 
 TAG_TYPE_VALUES: dict[str, list[str]] = {
-	"age": ["少年_高中", "初毛", "高年级_小五", "低年级_小二", "婴儿","成人男同"],
-	"face": ["有露脸", "没有露脸", "带了面罩"],
-	"act": ["爆菊", "口交","撸管", "手交","内射", "射精", "口爆", "颜射","亲吻","舔蛋","舔肛"],
-	"nudity": ["露出鸡鸡","打码", "诱惑但不露点", "没有裸体"],
-	"par": ["正太与叔叔", "正太独秀", "正太和正太", "群交", "正太与萝莉", "正太与阿姨"],
-	"fetish": ["打屁股","挠痒", "胖太", "恋足", "网路调教","BDSM", "人兽", "袜","制服"],
-	"att": ["性玩具","尿尿","大便","睡觉偷摸","粗暴性爱","年下攻","大屌", "霸凌", "文化习俗", "操射", "医学", "无性裸露","户外拍摄"],
-	"feedback": ["呻吟","享受", "没反应", "忙别的事", "喊痛或哭"],
 	"pro": ["AI创作", "卡通动漫", "视频通话录屏", "监视器", "偷拍", "电影或影集"],
 	"eth": ["黄种人", "棕种人", "黑人", "白人"],
 	"play": ["公众场所", "戏弄嬉闹", "恶搞"],
@@ -1641,7 +1633,7 @@ async def _request_backup_man(
 		if report_progress is not None:
 			await report_progress(stage)
 
-	await report("正在查找备份")
+	await report("正在停机坪寻觅班机")
 	original_file_id = str(item_data["file_id"])
 	records = await received_media_store.get_by_file_id(original_file_id)
 	userbot = active_userbot
@@ -1653,7 +1645,7 @@ async def _request_backup_man(
 	file_unique_id = str(item_data.get("file_unique_id") or "").strip()
 	forward_error = None
 	for record in records:
-		print("查找 userbot C 有值", flush=True)
+		print("查找 userbot C 在數據庫有值", flush=True)
 		record_id = str(record.get("file_unique_id") or "").strip()
 		if not record_id:
 			continue
@@ -1663,9 +1655,9 @@ async def _request_backup_man(
 		if chat_id is None or message_id is None:
 			continue
 		try:
-			print("1查找 userbot C 有值", flush=True)
+			print("查找 userbot C 在數據庫有 chat_id, message_id 的值", flush=True)
 
-			await report("已找到备份，正在恢復")
+			await report("已找到备份班机，正在移到跑道")
 			return await _forward_userbot_media(userbot, active_bot, record_id, chat_id, message_id)
 		except FileNotFoundError:
 			# C's stored message was deleted. Try any remaining copy before refilling it.
@@ -1673,12 +1665,17 @@ async def _request_backup_man(
 		except Exception as exc:
 			forward_error = exc
 	if forward_error is not None:
-		print("2查找 userbot C 無值", flush=True)
-		raise forward_error
+		if "Userbot cannot resolve chat ID" in str(forward_error):
+			forward_error = None
+		else:
+			print(f"forward_error={forward_error},userbot 轉發失敗",flush=True)
+			raise forward_error
+	else:
+		print(f"查找 userbot C 無值，向塔台請求支援，file_unique_id={file_unique_id}", flush=True)
 
 	# Match this upload in C's private chat, even if no received_media row exists.
-	print(f"33查找 userbot C 無值，file_unique_id={file_unique_id}", flush=True)
-	await report("备份中没有可用媒体，正在本地上传")
+	
+	await report("停机坪没有可用班机，正在向塔台请求支援")
 	caption = secrets.token_urlsafe(18)
 	send_to_userbot = partial(
 		_send_media_with_bot, bot, str(item_data["file_type"]),
@@ -1693,18 +1690,18 @@ async def _request_backup_man(
 				raise
 			if not file_unique_id:
 				file_unique_id = TelegramFileId.file_id_to_unique_id(original_file_id)
-			await report("主机器人没有可用媒体，正在向本地端索取")
+			await report("塔台没有可用班机，正在飞机工厂请求支援")
 			bot_file_id = await _request_x_man(file_unique_id, bot)
 			if not bot_file_id:
 				return None
-			await report("已取得媒体，正在补存")
+			await report("已取得班机，正在等待起飞")
 			sent = await send_to_userbot(bot_file_id)
 
 		sent_unique_id = _extract_media_unique_id(sent)
 		if file_unique_id and sent_unique_id != file_unique_id:
 			raise ValueError("Uploaded media does not match the requested file_unique_id")
 		sticker_id = TelegramFileId.parse(sent.sticker.file_id)["media_id"] if sent.sticker else None
-		await report("正在确认已收到媒体")
+		await report("正在确认已收到班机")
 		chat_id, message_id = await asyncio.wait_for(
 			locate(caption, sticker_id), timeout=BACKUP_MAN_REPLY_TIMEOUT_SECONDS,
 		)
@@ -1712,7 +1709,7 @@ async def _request_backup_man(
 	await received_media_store.update_storage_location_by_file_unique_id(
 		sent_unique_id, chat_id, message_id,
 	)
-	await report("备份已收到媒体，正在发送")
+	await report("已收到班机，正在发送")
 	return await _forward_userbot_media(userbot, active_bot, sent_unique_id, chat_id, message_id)
 
 
@@ -5413,7 +5410,7 @@ async def _airport_registration_error() -> str | None:
 			"如需进入「镇泰飞机场」，请取得现有旅客提供的专属邀请连结，并通过审核后方可入场。\n"
 			"\n"
 			"<blockquote>✈️ 关于镇泰飞机场</blockquote>\n"
-			"「镇泰飞机场」为低门槛正太资源媒体交流航站，每日皆有众多旅客提供正太资源，为旅客提供便捷的起飞体验。\n"
+			"「镇泰飞机场」为低门槛资源媒体交流航站，每日皆有众多旅客提供资源，为旅客提供便捷的起飞体验。\n"
 			"\n"
 			"由于电报封锁力度，为避免旅客数量过载影响航站稳定运行，当大厅人数达到安全容量后，塔台将关闭自动入场服务，改由邀请审核机制维持航站正常运作。\n"
 			"\n"
@@ -5422,10 +5419,10 @@ async def _airport_registration_error() -> str | None:
 			"\n"
 			"<blockquote>📡 寻求入场邀请连结</blockquote>\n"
 			"有想法想进来的，四个途径：\n"
-			f"1.将你喜欢的视频资源发送给「<a href='https://t.me/{SHUTTLE_BOT_NAME}'>摆渡车机器人</a>」，获取对应密文后，再到你平时活跃的正太群中，将密文分享给群友。当你分享的资源累计有 100 人查看 后，即可通过<a href='https://t.me/{SHUTTLE_BOT_NAME}'>摆渡车机器人</a>的私信指令，获取 入群邀请链接。\n"
+			f"1.将你喜欢的视频资源发送给「<a href='https://t.me/{SHUTTLE_BOT_NAME}'>摆渡车机器人</a>」，获取对应密文后，再到你平时活跃的群中，将密文分享给群友。当你分享的资源累计有 100 人查看 后，即可通过<a href='https://t.me/{SHUTTLE_BOT_NAME}'>摆渡车机器人</a>的私信指令，获取 入群邀请链接。\n"
 			"2.要么找已经在机场群内的熟人，机场群里成员可以生成邀请链接直接入群；\n"
-			"3.要么去找你平时待的正太社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。\n"
-			"4.最后您可以前往熟悉的正太群组，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
+			"3.要么去找你平时待的社群管理对接，机场这边也已经拜托各个合作管理帮忙筛选引荐合适的伙伴。\n"
+			"4.最后您可以前往熟悉的群组，向其他群友询问：是否能协助提供「<code>飞机场入场邀请连结</code>」「<code>求镇泰飞机场邀请连结</code>」。\n"
 			"\n"
 			"\n"
 			"感谢您的理解与配合，祝您旅途愉快，顺利起飞 ✈️\n"
@@ -5851,10 +5848,10 @@ async def on_airport_access_request(callback: CallbackQuery) -> None:
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
-			"请先上传「正太」媒体视频资源 ( 给我，镇泰塔台 )，再重新申请。\n"
+			"请先上传媒体视频资源 ( 给我，镇泰塔台 )，再重新申请。\n"
 			"\n"
-			"‼️ 不同系列(弟弟)请不要在同批混在一起上传，请分批上传。\n"
-			"‼️ 不同系列(弟弟)混在同批一起上传，会被拉黑。\n"
+			"‼️ 不同系列(人物)请不要在同批混在一起上传，请分批上传。\n"
+			"‼️ 不同系列(人物)混在同批一起上传，会被拉黑。\n"
 		)
 
 		await callback.answer(
@@ -6067,7 +6064,7 @@ async def _get_join_rejection_reason(
 	if remaining_seconds <= 2 * 24 * 60 * 60:
 		text = (
 			"❌ 入场审核未通过：\n飞行通行证有效时间需要超过 2 天。\n"
-			"请先上传 10 个「正太」媒体资源 ( 给镇泰塔台机器人 )，再重新申请。\n"
+			"请先上传 10 个媒体资源 ( 给镇泰塔台机器人 )，再重新申请。\n"
 			"\n"
 			"‼️ 不同系列放在同批上传，将被拉黑，请分批上传。\n"
 		)
@@ -6774,54 +6771,6 @@ def parse_bj_tag_for_file(tag_str):
 			tag_mapping = {
 				"白种人": "白人",
 				"黑种人": "黑人",
-				"露脸": "有露脸",
-				"遮挡": "带了面罩",
-				"未露脸": "没有露脸",
-				"无毛": "高年级_小五",
-				"中毛": "少年_高中",
-				"黑森林": "少年_高中",
-				"幼儿": "低年级_小二",
-				"小学": "低年级_小二",
-				"初中": "初毛",
-				"高中": "少年_高中",
-				"合法": "少年_高中",
-				"清水": "没有裸体",
-				"写真": "正太主题汇整",
-				"动画": "卡通动漫",
-				"母子": "正太与阿姨",
-				"肛交": "爆菊",
-				"口交": "口交",
-				"足交": "恋足",
-				"自撸": "撸管",
-				"射精": "射精",
-				"展示": "正太独秀",
-				"摸": "手交",
-				"偷拍": "偷拍",
-				"胖太": "胖太",
-				"TK挠痒": "瘙痒",
-				"SP打屁股": "打屁股",
-				"恋物": "恋物",
-				"猎奇重口": "猎奇",
-				"医学类": "医学",
-				"霸凌": "霸凌",
-				"监视": "监视器",
-				"直播录屏": "直播",
-				"冰淇淋": "冰淇淋",
-				"奶黄包": "奶黄包",
-				"眼镜哥": "眼镜哥系列",
-				"西边的风":"西边的风",
-				"日本全方位":"日本全方位",
-				"小孩不笨":"小孩不笨",  #
-				"网调大神":"网调大神",  #
-				"猫系列":"猫系列",
-				"雨花石":"雨花石系列",
-				"早点睡觉caodidi":"Caodidi系列",
-				"BB嵬":"BB嵬",
-				"we出品":"WE系列",
-				"堂山天草":"堂山",
-				"么么哒视频":"么么哒视频", #
-				"么么哒举牌原创":"么么哒举牌原创", #
-				"小6童模":"小六摄影",
 				"ledi二维码":"二维码系列"
 			}
 
@@ -8212,9 +8161,9 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 
 				confirm_text = (
 					"⚠️ 飞机场不是垃圾场，请确认以下设定:\n"
-					f"🔹 不收清水图\n"
-					f"🔹 不收非正太资源\n"
-					f"🔹 本次上传皆同一系列(弟弟)\n"
+					f"🔹 不收清水\n"
+					f"🔹 不收非资源\n"
+					f"🔹 本次上传皆同一系列(同一人物)\n"
 					f"🔹 单品不可混传\n"
 					f"🔹 小众资源才用防剧透\n"
 					"\n"

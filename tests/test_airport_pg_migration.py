@@ -79,6 +79,17 @@ class AirportMigrationSourceTests(unittest.TestCase):
         self.assertEqual((diff["missing"], diff["extra"], diff["conflicting"], diff["identical"]), (1, 1, 1, 1))
         self.assertEqual(diff["conflict_fields"], {"timestamp": 1})
 
+    def test_upgraded_source_preserves_backup_jobs_and_each_message_location(self):
+        with closing(sqlite3.connect(self.source)) as conn, conn:
+            for name in migration.USERBOT_TABLES:
+                conn.execute(migration.AIRPORT_DDL[name])
+            conn.execute("INSERT INTO userbot_backup_job VALUES (1,2,'uid','file','video','tag',1,11,99)")
+            conn.execute("INSERT INTO userbot_media_copy VALUES (2,'uid',1,20,'older')")
+            conn.execute("INSERT INTO userbot_media_copy VALUES (2,'uid',1,21,'newer')")
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.tables["userbot_backup_job"][0][-3:], (1, 11, 99))
+        self.assertEqual([row[3] for row in snapshot.tables["userbot_media_copy"]], [20, 21])
+
     def test_missing_required_airport_table_is_rejected(self):
         with closing(sqlite3.connect(self.source)) as conn, conn:
             conn.execute("DROP TABLE batch_view")

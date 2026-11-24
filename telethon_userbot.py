@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 
 from telethon import TelegramClient, errors, events, types, utils
 from telethon.sessions import StringSession
+from tgfileid import TelegramFileId
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class TelethonUserbot:
         self.phone = phone
         self.user_id: int | None = None
         self.on_message = on_message
+        self._upload_peer = None
         self.client.add_event_handler(self._handle_message, events.NewMessage(incoming=True))
 
     @staticmethod
@@ -75,6 +77,8 @@ class TelethonUserbot:
                              event.chat_id, event.id)
 
     async def _resolve_chat(self, chat_id: int, username: str | None = None):
+        if getattr(self, "_upload_peer", None) and self._upload_peer[0] == chat_id:
+            return self._upload_peer[1]
         try:
             return await self.client.get_input_entity(chat_id)
         except ValueError as cache_error:
@@ -95,23 +99,44 @@ class TelethonUserbot:
                 f"Userbot cannot resolve chat ID {chat_id} from its session or dialogs"
             ) from cache_error
 
-    @asynccontextmanager
-    async def observe_bot_upload(self, bot_id: int, *, bot_username: str | None = None):
-        """Buffer incoming messages from B before B starts its upload."""
-        peer = await self._resolve_chat(bot_id, bot_username)
-        async with self.client.conversation(peer, exclusive=False) as conversation:
-            async def locate(caption: str, sticker_id: int | None) -> tuple[int, int]:
-                while True:
-                    # 0 selects the next incoming message since the conversation opened.
-                    message = await conversation.get_response(0)
-                    if sticker_id is not None:
-                        matches = getattr(message.sticker, "id", None) == sticker_id
-                    else:
-                        matches = message.media is not None and message.raw_text == caption
-                    if matches:
-                        return message.chat_id, message.id
+    @staticmethod
+    def _matches_upload(message, caption, sticker_uid):
+        if sticker_uid is not None:
+            media_id = getattr(message.sticker, "id", None)
+            return media_id is not None and TelegramFileId.document_unique_id(media_id) == sticker_uid
+        return message.media is not None and message.raw_text == caption
 
-            yield locate
+    @asynccontextmanager
+    async def observe_bot_upload(self, bot_id, caption, sticker_uid):
+        """Subscribe by sender ID without resolving B's old dialog before sending."""
+        receipt = asyncio.get_running_loop().create_future()
+
+        async def receive(event):
+            if (event.is_private and event.sender_id == bot_id and event.chat_id == bot_id
+                    and self._matches_upload(event.message, caption, sticker_uid)):
+                peer = event.input_chat
+                if peer is not None:
+                    self._upload_peer = (bot_id, peer)
+                if not receipt.done():
+                    receipt.set_result((event.chat_id, event.id))
+
+        self.client.add_event_handler(receive, events.NewMessage(incoming=True))
+        try:
+            yield receipt
+        finally:
+            self.client.remove_event_handler(receive)
+            receipt.cancel()
+
+    async def find_bot_upload(self, bot_id, username, caption, sticker_uid, since):
+        """Check incoming history back to the first send, including missed updates."""
+        peer = await self._resolve_chat(bot_id, username)
+        async for message in self.client.iter_messages(peer):
+            if message.date.timestamp() < since - 2:
+                break
+            if (not message.out and message.sender_id == bot_id
+                    and self._matches_upload(message, caption, sticker_uid)):
+                return message.chat_id, message.id
+        return None
 
     async def forward_stored_message(
         self,
@@ -168,4 +193,13 @@ class TelethonUserbot:
             await self.client.run_until_disconnected()
         finally:
             self.user_id = None
+            self._upload_peer = None
             await self.client.disconnect()
+
+    async def run_until_shutdown(self, notify_bot: str) -> None:
+        while True:
+            try:
+                await self.run(notify_bot)
+            except OSError:
+                logger.exception("Userbot connection failed")
+            await asyncio.sleep(5)

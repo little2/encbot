@@ -6,6 +6,7 @@ tables share one SQLite/PostgreSQL contract and one database lifecycle.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import secrets
 import time
 from typing import Protocol, runtime_checkable
 from asyncpg import Pool
@@ -65,8 +66,16 @@ class ReceivedMediaStore(Protocol):
     ) -> bool: ...
     async def is_accepted(self, file_unique_id: str) -> bool: ...
     async def claim_batch(
-        self, items: list[dict], user_id: int, batch_id: str,
+        self, items: list[dict], user_id: int, batch_id: str, *,
+        backup_route: tuple[int, int] | None = None,
     ) -> list[str]: ...
+    async def reserve_backup(self, tower_id: int, userbot_id: int, item: dict | None = None) -> dict | None: ...
+    async def complete_backup(self, job: dict, chat_id: int, message_id: int) -> None: ...
+    async def find_backup_receipt(self, tower_id: int, userbot_id: int, caption: str, sticker_uid: str) -> dict | None: ...
+    async def release_rejected_backup(self, job: dict) -> None: ...
+    async def get_backup_receipt(self, tag: str) -> tuple[int, int] | None: ...
+    async def save_backup_file(self, tag: str, file_id: str) -> None: ...
+    async def get_backup_locations(self, file_unique_id: str, userbot_id: int) -> list[tuple[int, int]]: ...
     async def release_pending(
         self, file_unique_id: str, source_chat_id: int, source_message_id: int,
     ) -> bool: ...
@@ -472,7 +481,7 @@ class _ReceivedMediaStore:
             ))
         return rows
 
-    async def claim_batch(self, items, user_id, batch_id):
+    async def claim_batch(self, items, user_id, batch_id, *, backup_route=None):
         batch_id = str(batch_id or "").strip()
         if not batch_id:
             raise ValueError("batch_id is required")
@@ -510,9 +519,111 @@ class _ReceivedMediaStore:
                 conflicts = [value for value in unique_ids if value not in inserted_ids]
                 if conflicts:
                     raise _ClaimConflict(conflicts)
+                if backup_route is not None:
+                    for item in items:
+                        await self._queue_backup(conn, *backup_route, item, required=True)
         except _ClaimConflict as exc:
             return exc.conflicts
         return []
+
+    async def _queue_backup(self, conn, tower_id, userbot_id, item, *, required):
+        await conn.execute("""
+            INSERT INTO userbot_backup_job
+                (tower_id, userbot_id, file_unique_id, file_id, file_type,
+                 receipt_tag, required, first_attempt, retry_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,0,0)
+            ON CONFLICT(tower_id, userbot_id, file_unique_id) DO UPDATE SET
+                required=CASE WHEN excluded.required=1 THEN 1 ELSE userbot_backup_job.required END
+        """, tower_id, userbot_id, item["file_unique_id"], item["file_id"],
+             item["file_type"], secrets.token_urlsafe(18), int(required))
+
+    async def reserve_backup(self, tower_id, userbot_id, item=None):
+        """Lease one upload. An expired lease survives a worker/process restart."""
+        now = int(time.time())
+        async with self.database.transaction(write=True) as conn:
+            if item is not None:
+                await self._queue_backup(conn, tower_id, userbot_id, item, required=False)
+                row = await conn.fetchrow("""
+                    SELECT * FROM userbot_backup_job WHERE tower_id=$1 AND userbot_id=$2 AND file_unique_id=$3
+                """, tower_id, userbot_id, item["file_unique_id"])
+                if row["first_attempt"] and row["retry_at"] > now:
+                    return {**dict(row), "since": row["first_attempt"], "lookup_only": True}
+            else:
+                row = await conn.fetchrow("""
+                    SELECT * FROM userbot_backup_job WHERE tower_id=$1 AND userbot_id=$2
+                        AND retry_at <= $3 AND required=1 ORDER BY retry_at, file_unique_id LIMIT 1
+                """, tower_id, userbot_id, now)
+                if row is None:
+                    return None
+            leased = await conn.fetchrow("""
+                UPDATE userbot_backup_job SET retry_at=$1,
+                    first_attempt=CASE WHEN first_attempt=0 THEN $2 ELSE first_attempt END
+                WHERE receipt_tag=$3 AND retry_at=$4 RETURNING receipt_tag
+            """, now + 300, now, row["receipt_tag"], row["retry_at"])
+            if leased is None:
+                return None
+            return {**dict(row), "since": row["first_attempt"] or now}
+
+    async def find_backup_receipt(self, tower_id, userbot_id, caption, sticker_uid):
+        async with self.database.transaction() as conn:
+            row = await conn.fetchrow("""
+                SELECT * FROM userbot_backup_job WHERE tower_id=$1 AND userbot_id=$2
+                    AND first_attempt>0 AND (receipt_tag=$3 OR (file_type='sticker' AND file_unique_id=$4))
+            """, tower_id, userbot_id, caption, sticker_uid)
+        return dict(row) if row else None
+
+    async def release_rejected_backup(self, job):
+        async with self.database.transaction(write=True) as conn:
+            await conn.execute("DELETE FROM userbot_backup_job WHERE receipt_tag=$1 AND required=0",
+                               job["receipt_tag"])
+            await conn.execute("""
+                UPDATE userbot_backup_job SET first_attempt=0 WHERE receipt_tag=$1 AND required=1
+            """, job["receipt_tag"])
+
+    async def get_backup_receipt(self, tag):
+        async with self.database.transaction() as conn:
+            row = await conn.fetchrow("""
+                SELECT chat_id, message_id FROM userbot_media_copy WHERE receipt_tag=$1
+            """, tag)
+        return (row["chat_id"], row["message_id"]) if row else None
+
+    async def save_backup_file(self, tag, file_id):
+        async with self.database.transaction(write=True) as conn:
+            await conn.execute("UPDATE userbot_backup_job SET file_id=$1 WHERE receipt_tag=$2", file_id, tag)
+
+    async def complete_backup(self, job, chat_id, message_id):
+        async with self.database.transaction(write=True) as conn:
+            # Preserve the previous pointer, including pre-upgrade rows.
+            await conn.execute("""
+                INSERT INTO userbot_media_copy (userbot_id, file_unique_id, chat_id, message_id)
+                SELECT COALESCE(storage_userbot_id,0), file_unique_id, storage_chat_id, storage_message_id
+                FROM received_media WHERE file_unique_id=$1
+                    AND storage_chat_id IS NOT NULL AND storage_message_id IS NOT NULL
+                ON CONFLICT DO NOTHING
+            """, job["file_unique_id"])
+            await conn.execute("""
+                INSERT INTO userbot_media_copy (userbot_id, file_unique_id, chat_id, message_id, receipt_tag)
+                VALUES ($1,$2,$3,$4,$5) ON CONFLICT(file_unique_id,userbot_id,chat_id,message_id)
+                DO UPDATE SET receipt_tag=COALESCE(excluded.receipt_tag,userbot_media_copy.receipt_tag)
+            """, job["userbot_id"], job["file_unique_id"], chat_id, message_id, job["receipt_tag"])
+            await conn.execute("""
+                UPDATE received_media SET storage_userbot_id=$1, storage_chat_id=$2,
+                    storage_message_id=$3 WHERE file_unique_id=$4
+            """, job["userbot_id"], chat_id, message_id, job["file_unique_id"])
+            await conn.execute("DELETE FROM userbot_backup_job WHERE receipt_tag=$1", job["receipt_tag"])
+
+    async def get_backup_locations(self, file_unique_id, userbot_id):
+        async with self.database.transaction() as conn:
+            rows = await conn.fetch("""
+                SELECT storage_chat_id AS chat_id, storage_message_id AS message_id
+                FROM received_media WHERE file_unique_id=$1 AND
+                    (storage_userbot_id IS NULL OR storage_userbot_id=$2)
+                    AND storage_chat_id IS NOT NULL AND storage_message_id IS NOT NULL
+                UNION ALL
+                SELECT chat_id, message_id FROM userbot_media_copy
+                WHERE file_unique_id=$1 AND userbot_id IN (0,$2)
+            """, file_unique_id, userbot_id)
+        return list(dict.fromkeys((row["chat_id"], row["message_id"]) for row in rows))
 
     async def release_pending(self, file_unique_id, source_chat_id, source_message_id):
         async with self.database.transaction(write=True) as conn:
@@ -816,7 +927,30 @@ async def _initialize_airport_schema_on_connection(conn, backend):
         "media_type": "TEXT CHECK (media_type IN ('document', 'photo'))",
         "media_id": "BIGINT", "bot_id": "BIGINT",
         "storage_chat_id": "BIGINT", "storage_message_id": "BIGINT",
+        "storage_userbot_id": "BIGINT",
     })
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS userbot_backup_job (
+            tower_id BIGINT NOT NULL, userbot_id BIGINT NOT NULL, file_unique_id TEXT NOT NULL,
+            file_id TEXT NOT NULL, file_type TEXT NOT NULL, receipt_tag TEXT NOT NULL UNIQUE,
+            required BIGINT NOT NULL, first_attempt BIGINT NOT NULL, retry_at BIGINT NOT NULL,
+            PRIMARY KEY(tower_id, userbot_id, file_unique_id)
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS userbot_media_copy (
+            userbot_id BIGINT NOT NULL, file_unique_id TEXT NOT NULL,
+            chat_id BIGINT NOT NULL, message_id BIGINT NOT NULL, receipt_tag TEXT,
+            PRIMARY KEY(file_unique_id, userbot_id, chat_id, message_id)
+        )
+    """)
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_userbot_receipt ON userbot_media_copy(receipt_tag)")
+    await conn.execute("""
+        INSERT INTO userbot_media_copy (userbot_id, file_unique_id, chat_id, message_id)
+        SELECT 0, file_unique_id, storage_chat_id, storage_message_id FROM received_media
+        WHERE storage_userbot_id IS NULL AND storage_chat_id IS NOT NULL AND storage_message_id IS NOT NULL
+        ON CONFLICT DO NOTHING
+    """)
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_received_media_batch_id ON received_media(batch_id)")
     await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_received_media_identity

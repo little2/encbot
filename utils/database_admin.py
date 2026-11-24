@@ -100,6 +100,10 @@ class DatabaseAdminCommands:
                 connection.execute("SELECT COUNT(*) FROM received_media").fetchone()[0]
             )
             batch_count = int(connection.execute("SELECT COUNT(*) FROM batch").fetchone()[0])
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("userbot_backup_job", "userbot_media_copy"):
+                if table in tables:
+                    connection.execute(f"DELETE FROM {table}")
             connection.execute("DELETE FROM received_media")
             connection.execute("DELETE FROM batch")
             connection.commit()

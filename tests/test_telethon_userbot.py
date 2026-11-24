@@ -1,7 +1,7 @@
 import asyncio
+from datetime import datetime, timezone
 import tempfile
 import unittest
-from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -70,6 +70,22 @@ class TelethonUserbotTests(unittest.TestCase):
             messages=456,
             from_peer=-100123,
         )
+
+    def test_history_reconciliation_uses_only_matching_incoming_media_since_upload(self):
+        async def run():
+            userbot = TelethonUserbot.__new__(TelethonUserbot)
+            async def history(peer):
+                self.assertEqual(peer, 101)
+                for sender, outgoing, caption, timestamp, message_id in (
+                    (101, True, "tag", 110, 6), (102, False, "tag", 109, 5),
+                    (101, False, "other", 108, 4), (101, False, "tag", 102, 3),
+                ):
+                    yield SimpleNamespace(date=datetime.fromtimestamp(timestamp, timezone.utc), out=outgoing,
+                                          sender_id=sender, raw_text=caption, media=object(), chat_id=101, id=message_id)
+            userbot.client = SimpleNamespace(get_input_entity=AsyncMock(return_value=101), iter_messages=history)
+            self.assertEqual(await userbot.find_bot_upload(101, "tower", "tag", None, 100), (101, 3))
+            self.assertIsNone(await userbot.find_bot_upload(101, "tower", "tag", None, 106))
+        asyncio.run(run())
 
 
     def test_deleted_message_is_distinct_from_forwarding_errors(self):
@@ -147,20 +163,10 @@ class TelethonUserbotTests(unittest.TestCase):
         async def run_case():
             peer = telethon_userbot.types.InputPeerUser(101, 999)
             userbot = TelethonUserbot.__new__(TelethonUserbot)
-            conversation = SimpleNamespace(get_response=AsyncMock())
-
-            @asynccontextmanager
-            async def open_conversation(entity, *, exclusive):
-                self.assertEqual(entity, peer)
-                self.assertFalse(exclusive)
-                yield conversation
-
             userbot.client = SimpleNamespace(
                 get_input_entity=AsyncMock(side_effect=[ValueError("not cached"), peer]),
-                conversation=open_conversation,
             )
-            async with userbot.observe_bot_upload(101, bot_username="example_bot"):
-                pass
+            self.assertEqual(await userbot._resolve_chat(101, "example_bot"), peer)
             self.assertEqual(
                 userbot.client.get_input_entity.await_args_list,
                 [unittest.mock.call(101), unittest.mock.call("@example_bot")],
@@ -177,8 +183,7 @@ class TelethonUserbotTests(unittest.TestCase):
                 ]),
             )
             with self.assertRaisesRegex(ValueError, "101"):
-                async with userbot.observe_bot_upload(101, bot_username="wrong_bot"):
-                    pass
+                await userbot._resolve_chat(101, "wrong_bot")
 
         asyncio.run(run_case())
 
@@ -188,21 +193,31 @@ class TelethonUserbotTests(unittest.TestCase):
             unrelated = SimpleNamespace(media=object(), raw_text="other", sticker=SimpleNamespace(id=99))
             incoming = SimpleNamespace(media=object(), raw_text="tag" if sticker_id is None else "",
                                        sticker=SimpleNamespace(id=42), chat_id=101, id=222)
-            conversation = SimpleNamespace(get_response=AsyncMock(side_effect=[unrelated, incoming]))
-
-            @asynccontextmanager
-            async def open_conversation(bot_id, *, exclusive):
-                self.assertEqual(bot_id, 101)
-                self.assertFalse(exclusive)
-                yield conversation
-
             userbot.client = SimpleNamespace(
-                get_input_entity=AsyncMock(return_value=101),
-                conversation=open_conversation,
+                add_event_handler=Mock(), remove_event_handler=Mock(),
+                get_input_entity=AsyncMock(side_effect=ValueError("unresolvable old chat")),
+                forward_messages=AsyncMock(return_value=SimpleNamespace(id=901)),
             )
-            async with userbot.observe_bot_upload(101) as locate:
-                self.assertEqual(await locate("tag", sticker_id), (101, 222))
-            self.assertEqual(conversation.get_response.await_count, 2)
+            sticker_uid = telethon_userbot.TelegramFileId.document_unique_id(sticker_id) if sticker_id else None
+            async with userbot.observe_bot_upload(101, "tag", sticker_uid) as receipt:
+                receive = userbot.client.add_event_handler.call_args.args[0]
+                event = SimpleNamespace(is_private=True, chat_id=101, sender_id=101, message=unrelated,
+                                        id=222, input_chat=telethon_userbot.types.InputPeerUser(101, 900))
+                await receive(event)
+                self.assertFalse(receipt.done())
+                event.message = incoming
+                event.sender_id = 999
+                await receive(event)
+                self.assertFalse(receipt.done())
+                event.sender_id = 101
+                await receive(event)
+                self.assertEqual(await receipt, (101, 222))
+                await userbot.forward_stored_message(101, 222, "@runway")
+                userbot.client.forward_messages.assert_awaited_once_with(
+                    entity="@runway", messages=222, from_peer=event.input_chat,
+                )
+            userbot.client.remove_event_handler.assert_called_once_with(receive)
+            userbot.client.get_input_entity.assert_not_awaited()
 
         for sticker_id in (None, 42):
             with self.subTest(sticker_id=sticker_id):

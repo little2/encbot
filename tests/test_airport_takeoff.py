@@ -43,7 +43,7 @@ class AirportTakeoffTests(unittest.IsolatedAsyncioTestCase):
             "MEDIA_VIEW_CONSUMPTION_MINUTES": 10,
             "MESSAGE_REWARD_MINUTES": 1, "MEDIA_UPLOAD_EXTEND_MINUTES": 10,
             "TAKEOFF_USER_LOCKS": {}, "user_expire_cache": self.cache,
-            "extract_encode": AsyncMock(return_value={"ok": True}),
+            "extract_encode": AsyncMock(return_value={"ok": True, "sent_media_messages": [object()]}),
             "_get_first_takeoff_batch_id": AsyncMock(return_value=None),
             "_increment_takeoff_count": AsyncMock(return_value=1),
             "bot": SimpleNamespace(send_message=AsyncMock()), "bot_name": "testbot",
@@ -138,6 +138,18 @@ class AirportTakeoffTests(unittest.IsolatedAsyncioTestCase):
         self.ns["extract_encode"].assert_awaited_once_with("code", self.message, 123)
         self.ns["_increment_takeoff_count"].assert_awaited_once_with(self.message)
         self.cache.refund_minutes.assert_not_awaited()
+
+    async def test_charge_counts_acknowledged_media_and_survives_notice_failure(self):
+        self.parsed["items"] = [{}, {}, {}]
+        self.ns["extract_encode"].return_value = {"ok": True, "sent_media_messages": [object()], "skipped_count": 0}
+        self.ns["bot"].send_message.side_effect = RuntimeError("notice failed")
+        self.assertTrue((await self.fly())["ok"])
+        self.cache.refund_minutes.assert_awaited_once_with(123, 20)
+
+    async def test_zero_acknowledgements_refund_everything(self):
+        self.ns["extract_encode"].return_value = {"ok": True, "sent_media_messages": []}
+        self.assertFalse((await self.fly())["ok"])
+        self.cache.refund_minutes.assert_awaited_once_with(123, 10)
 
     def private_message(self):
         return SimpleNamespace(

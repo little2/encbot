@@ -207,7 +207,7 @@ class TelegramFileId:
 
             result["media_id"] = media_id
             result["file_unique_id"] = (
-                cls._document_unique_id(media_id)
+                cls.document_unique_id(media_id)
             )
 
         elif type_id == 2 and not is_web_location:
@@ -247,7 +247,7 @@ class TelegramFileId:
         return cls._base64url_encode(cls._rle_encode(struct.pack("<i", 1) + key))
 
     @classmethod
-    def _document_unique_id(
+    def document_unique_id(
         cls,
         media_id: int
     ) -> str:

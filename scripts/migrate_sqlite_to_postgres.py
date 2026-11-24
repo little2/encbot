@@ -44,8 +44,16 @@ AIRPORT_TABLES = {
                        "thumb_file_id", "thumb_file_unique_id", "thumb_phash", "created_at", "accepted_at"),
     "shared_invite_link": ("link_key", "chat_id", "invite_link", "name", "created_at", "validated_at"),
 }
-KEYS = {table: (columns[0],) for table, columns in AIRPORT_TABLES.items()}
+USERBOT_TABLES = {
+    "userbot_backup_job": ("tower_id", "userbot_id", "file_unique_id", "file_id", "file_type",
+                           "receipt_tag", "required", "first_attempt", "retry_at"),
+    "userbot_media_copy": ("userbot_id", "file_unique_id", "chat_id", "message_id", "receipt_tag"),
+}
+ALL_AIRPORT_TABLES = {**AIRPORT_TABLES, **USERBOT_TABLES}
+KEYS = {table: (columns[0],) for table, columns in ALL_AIRPORT_TABLES.items()}
 KEYS["batch_view"] = ("batch_id", "user_id")
+KEYS["userbot_backup_job"] = ("tower_id", "userbot_id", "file_unique_id")
+KEYS["userbot_media_copy"] = ("file_unique_id", "userbot_id", "chat_id", "message_id")
 TEXT_COLUMNS = {
     "user_expire": set(), "user_blacklist": {"reason"},
     "batch": {"batch_id", "batch_content", "tag", "valid_until"},
@@ -53,8 +61,11 @@ TEXT_COLUMNS = {
     "received_media": {"file_unique_id", "file_id", "file_type", "status", "batch_id",
                        "thumb_file_id", "thumb_file_unique_id", "thumb_phash"},
     "shared_invite_link": {"link_key", "invite_link", "name"},
+    "userbot_backup_job": {"file_unique_id", "file_id", "file_type", "receipt_tag"},
+    "userbot_media_copy": {"file_unique_id", "receipt_tag"},
 }
 NULLABLE_COLUMNS = {
+    "userbot_media_copy": {"receipt_tag"},
     "batch": {"discussion_chat_id", "discussion_message_id", "batch_content", "tag"},
     "received_media": {"batch_id", "thumb_file_id", "thumb_file_unique_id", "thumb_phash", "accepted_at"},
 }
@@ -70,13 +81,14 @@ LEGACY_DEFAULTS = {
 }
 UNIQUE_KEYS = {table: (key,) for table, key in KEYS.items()}
 UNIQUE_KEYS["batch"] += (("channel_chat_id", "channel_message_id"),)
+UNIQUE_KEYS["userbot_backup_job"] += (("receipt_tag",),)
 
 
 def columns_for(app):
     if app == "taohua":
         return TABLES
     if app == "airport":
-        return AIRPORT_TABLES
+        return ALL_AIRPORT_TABLES
     raise MigrationError("app 必须为 taohua 或 airport")
 
 
@@ -90,7 +102,7 @@ def sql_literal(value):
 
 def table_ddl(table):
     fields = []
-    for column in AIRPORT_TABLES[table]:
+    for column in ALL_AIRPORT_TABLES[table]:
         definition = f'"{column}" ' + ("TEXT" if column in TEXT_COLUMNS[table] else "BIGINT")
         if column not in NULLABLE_COLUMNS.get(table, set()):
             definition += " NOT NULL"
@@ -110,11 +122,11 @@ def table_ddl(table):
 
 
 DDL = {table: table_ddl(table) for table in TABLES}
-AIRPORT_DDL = {table: table_ddl(table) for table in AIRPORT_TABLES}
+AIRPORT_DDL = {table: table_ddl(table) for table in ALL_AIRPORT_TABLES}
 
 
 def row_key(table, row):
-    columns = AIRPORT_TABLES[table]
+    columns = ALL_AIRPORT_TABLES[table]
     return tuple(row[columns.index(key)] for key in KEYS[table])
 
 
@@ -137,7 +149,7 @@ class Snapshot:
 
 
 def validate_rows(table, rows):
-    columns = AIRPORT_TABLES[table]
+    columns = ALL_AIRPORT_TABLES[table]
     seen = {key: set() for key in UNIQUE_KEYS[table]}
     validated = []
     for row in rows:
@@ -170,6 +182,8 @@ def read_sqlite(connection, *, app="taohua"):
     tables = {}
     for table, columns in columns_for(app).items():
         if table not in existing:
+            if table in USERBOT_TABLES and not existing.intersection(USERBOT_TABLES):
+                continue  # Older source. Leave any target-only backup queues alone.
             raise MigrationError(f"SQLite 缺少必要表 {table}，拒绝将缺表当作空表")
         actual = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
         missing = set(columns) - actual
@@ -225,14 +239,18 @@ def backup_source(source: Path, directory: Path, expected: Snapshot):
     return path
 
 
-async def read_postgres(conn, schema, *, app="taohua"):
+async def read_postgres(conn, schema, *, app="taohua", selected_tables=None):
     tables, absent = {}, []
     for table, columns in columns_for(app).items():
+        if selected_tables is not None and table not in selected_tables:
+            continue
         metadata = await conn.fetch("""
             SELECT column_name, udt_name FROM information_schema.columns
             WHERE table_schema = $1 AND table_name = $2
         """, schema, table)
         if not metadata:
+            if table in USERBOT_TABLES and selected_tables is None:
+                continue
             absent.append(table)
             tables[table] = ()
             continue
@@ -282,7 +300,7 @@ def compare(source: Snapshot, target: Snapshot):
             "extra": len(right.keys() - left.keys()),
             "conflict_fields": {
                 column: sum(left[key][index] != right[key][index] for key in shared)
-                for index, column in enumerate(AIRPORT_TABLES[table])
+                for index, column in enumerate(ALL_AIRPORT_TABLES[table])
                 if any(left[key][index] != right[key][index] for key in shared)
             },
         }
@@ -306,7 +324,7 @@ async def migrate(source: Path, dsn: str, *, schema="public", mode="preview",
         # Preserve the existing two-argument Taohua helper/test contract.
         if app == "taohua":
             return await read_postgres(conn, schema)
-        return await read_postgres(conn, schema, app=app)
+        return await read_postgres(conn, schema, app=app, selected_tables=tables)
 
     if mode not in {"preview", "apply", "verify"}:
         raise MigrationError("mode 必须为 preview、apply 或 verify")
@@ -321,6 +339,7 @@ async def migrate(source: Path, dsn: str, *, schema="public", mode="preview",
               "created_at_utc": datetime.now(timezone.utc).isoformat()}
     with open_source(source, freeze=mode == "apply") as sqlite_conn:
         snapshot = read_sqlite(sqlite_conn, app=app)
+        tables = {name: tables[name] for name in snapshot.tables}
         report["source"] = snapshot.summary()
         conn = await asyncpg.connect(dsn, timeout=15, command_timeout=60,
                                      server_settings={"search_path": f'"{schema}"'})
@@ -335,10 +354,10 @@ async def migrate(source: Path, dsn: str, *, schema="public", mode="preview",
                     await conn.execute("SELECT pg_advisory_xact_lock(hashtext(current_database()), hashtext($1::text))",
                                        "encbot-sqlite-migration:" + schema)
                     # Table creation, inserts and verification share one transaction.
-                    for table, ddl in ddl_statements.items():
+                    for table in tables:
                         exists = await conn.fetchval("SELECT to_regclass($1)", f'"{schema}"."{table}"')
                         if exists is None:
-                            await conn.execute(ddl)
+                            await conn.execute(ddl_statements[table])
                     names = ", ".join(f'"{schema}"."{table}"' for table in tables)
                     await conn.execute(f"LOCK TABLE {names} IN ACCESS EXCLUSIVE MODE")
                 target, absent = await read_target(conn)
@@ -378,7 +397,7 @@ async def migrate(source: Path, dsn: str, *, schema="public", mode="preview",
                         removed_keys = [key for key in existing if key not in source_rows]
                         # Batch's second unique key may change owners or be swapped.
                         # Remove changed batch rows first to avoid transient uniqueness violations.
-                        if table == "batch":
+                        if table in ("batch", "userbot_backup_job"):
                             removed_keys += [key for key in existing if key in source_rows
                                              and existing[key] != source_rows[key]]
                         where = " AND ".join(f'"{key}" = ${i}' for i, key in enumerate(KEYS[table], 1))

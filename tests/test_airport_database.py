@@ -431,8 +431,30 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                                                     parse_file_token=lambda value: parsed),
                        _get_first_takeoff_batch_id=AsyncMock(return_value=None),
                        _increment_takeoff_count=AsyncMock(return_value=0), MEDIA_UPLOAD_EXTEND_MINUTES=60)
-        load_functions({"on_takeoff"}, self.ns)
+        load_functions({"on_takeoff", "on_takeoff_fly"}, self.ns)
         return callback
+
+    async def test_confirmation_creates_recoverable_job_and_late_c_receipt_completes_it(self):
+        owner = 7
+        item = dict(file_unique_id="unique", file_id="file", file_type="document",
+                    source_chat_id=owner, source_message_id=8)
+        callback = SimpleNamespace(answer=AsyncMock(), message=AsyncMock())
+        state = dict(owner_user_id=owner, items=[item], batch_id="batch", encoded="token")
+        self.ns.update(active_userbot=SimpleNamespace(user_id=55, get_media_identity=lambda e: ("document", 123)),
+                       _wait_for_pending_thumbnails=AsyncMock(), _build_controls_keyboard=AsyncMock(),
+                       _send_encoded_snapshot=AsyncMock(), ENCODED_SEND_TASKS=set())
+        load_functions({"_handle_send_encoded", "_on_userbot_message"}, self.ns)
+        with patch.dict(os.environ, USERBOT_ENABLED="true"):
+            await self.ns["_handle_send_encoded"](callback, (owner, 8), state)
+        await state["send_task"]
+        store = self.stores.received_media
+        job = await store.reserve_backup(self.bot.id, 55)
+        self.assertEqual(job["file_unique_id"], "unique")
+        msg = SimpleNamespace(media=object(), raw_text=job["receipt_tag"], sticker=None)
+        event = SimpleNamespace(is_private=True, sender_id=self.bot.id, chat_id=self.bot.id, message=msg, id=90)
+        await self.ns["_on_userbot_message"](event)
+        self.assertEqual(await store.get_backup_receipt(job["receipt_tag"]), (self.bot.id, 90))
+        self.assertIsNone(await store.reserve_backup(self.bot.id, 55))
 
     async def test_failed_delivery_refunds_without_overwriting_new_rewards(self):
         callback = await self.prepare_takeoff()
@@ -456,14 +478,14 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_refund_followed_by_notice_failure_does_not_refund_twice(self):
         callback = await self.prepare_takeoff()
-        self.ns["extract_encode"] = AsyncMock(return_value=dict(ok=True, skipped_count=1))
+        self.ns["extract_encode"] = AsyncMock(return_value=dict(ok=True, sent_media_messages=[object()]))
         self.bot.send_message.side_effect = RuntimeError("notice failed")
         await self.ns["on_takeoff"](callback)
-        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 36000)
+        self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 32400)
 
     async def test_partial_delivery_charges_only_delivered_media(self):
         callback = await self.prepare_takeoff()
-        self.ns["extract_encode"] = AsyncMock(return_value=dict(ok=True, skipped_count=1))
+        self.ns["extract_encode"] = AsyncMock(return_value=dict(ok=True, sent_media_messages=[object()]))
         await self.ns["on_takeoff"](callback)
         self.assertEqual((await self.stores.users.get(1)).expire_timestamp, NOW + 32400)
         self.bot.send_message.assert_awaited_once()
@@ -512,6 +534,11 @@ class AirportConfigurationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        setting = patch.dict(os.environ, USERBOT_ENABLED="false")
+        setting.start()
+        self.addCleanup(setting.stop)
+
     def namespace(self):
         async def worker(*args):
             await asyncio.Event().wait()
@@ -521,6 +548,7 @@ class AirportLifecycleTests(unittest.IsolatedAsyncioTestCase):
             session=SimpleNamespace(close=AsyncMock())),
             database_stores=SimpleNamespace(backend="sqlite", close=AsyncMock()),
             database_keepalive_worker=AsyncMock(), _initialize_database=AsyncMock(),
+            SEND_BOT_CACHE=SimpleNamespace(cleanup_worker=worker, close=AsyncMock()),
             say_hello_to_x_man=AsyncMock(), reload_config=AsyncMock(),
             dp=SimpleNamespace(start_polling=AsyncMock()), BACKUP_BOT_TOKEN="", MEDIA_WORKER_COUNT=1,
             _media_worker=worker, _media_forward_worker=worker, _daily_maintenance_worker=worker,

@@ -193,6 +193,24 @@ class AirportStoreContract:
         self.assertTrue(await links.delete("airport"))
         self.assertFalse(await links.delete("airport"))
 
+    async def test_backup_claim_is_atomic_and_receipts_preserve_all_locations(self):
+        store = self.stores.received_media
+        item = media("a", 12)
+        await store.claim_batch([item], 7, "old")
+        self.assertEqual(await store.claim_batch([media("b", 3), item], 7, "new", backup_route=(33, 44)), ["a"])
+        self.assertIsNone(await store.reserve_backup(33, 44))
+        async with self.stores._database.transaction(write=True) as conn:
+            await conn.execute("UPDATE received_media SET storage_chat_id=33, storage_message_id=9")
+        job = await store.reserve_backup(33, 44, item)
+        self.assertTrue((await store.reserve_backup(33, 44, item))["lookup_only"])
+        await store.complete_backup(job, 33, 12)
+        self.assertEqual(await store.get_backup_receipt(job["receipt_tag"]), (33, 12))
+        second = await store.reserve_backup(33, 44, item)
+        await store.complete_backup(second, 33, 22)
+        await store.complete_backup(second, 33, 22)
+        self.assertEqual(set(await store.get_backup_locations("a", 44)), {(33, 9), (33, 12), (33, 22)})
+        self.assertNotIn((33, 22), await store.get_backup_locations("a", 55))
+
     async def test_closed_bundle_rejects_every_store(self):
         await self.stores.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
@@ -211,6 +229,23 @@ class SQLiteAirportStoreTests(AirportStoreContract, unittest.IsolatedAsyncioTest
         self.path = Path(self.directory.name) / "airport.sqlite3"
         self.stores = await create_airport_stores(backend="sqlite", sqlite_path=self.path)
         self.addAsyncCleanup(self.stores.close)
+
+    async def test_confirmed_backup_survives_restart_and_expired_lease(self):
+        store = self.stores.received_media
+        await store.claim_batch([media("a", 12)], 7, "batch", backup_route=(33, 44))
+        await store.accept_batch(["a"], "batch")
+        job = await store.reserve_backup(33, 44)
+        await self.stores.close()
+        async with await create_airport_stores(backend="sqlite", sqlite_path=self.path) as reopened:
+            store = reopened.received_media
+            self.assertIsNone(await store.reserve_backup(33, 44))
+            with patch("utils.airport_async_stores.time.time", return_value=NOW + 301):
+                self.assertIsNone(await store.reserve_backup(33, 55))
+                retry = await store.reserve_backup(33, 44)
+                self.assertEqual((retry["receipt_tag"], retry["first_attempt"]), (job["receipt_tag"], NOW))
+                await store.complete_backup(retry, 33, 99)
+                self.assertIsNone(await store.reserve_backup(33, 44))
+                self.assertEqual(await store.get_backup_locations("a", 44), [(33, 99)])
 
     async def test_reopens_legacy_airport_schema_and_adds_optional_columns(self):
         await self.stores.close()

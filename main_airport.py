@@ -2931,15 +2931,23 @@ async def _forward_encoded_if_whitelisted(
 				try:
 					preview_batch_settings2 = preview_batch_settings
 					preview_batch_settings2["chat_id"] = TERMINAL_CHANNEL_ID_2
+					print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
 					await _send_encoded_preview_message(preview_batch_settings2)
+					print(f"Sent preview to secondary channel: success", flush=True)
 				except Exception as exc:
 					print(f"Failed to send preview to secondary channel: {exc}")
-				
+			else:
+				print(f"No secondary channel configured, TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
+
+			print(f"Sending preview to first channel: {preview_batch_settings}", flush=True)
 			published_message = await _send_encoded_preview_message(
 				preview_batch_settings,
 			)
+			print(f"Sent preview to first channel: success", flush=True)
 			return success_result(published_message, "preview")
 		elif preview_show:
+
+			print(f"No preview payloads to show, sending text fallback", flush=True)
 
 			fallback_message = await _telegram_call_with_retry(
 				"send text fallback",
@@ -2976,6 +2984,10 @@ async def _forward_encoded_if_whitelisted(
 					if published_message.photo
 					else None
 				)
+
+
+
+
 			else:
 				published_message = await _telegram_call_with_retry(
 					"send cached default cover",
@@ -2988,6 +3000,28 @@ async def _forward_encoded_if_whitelisted(
 						parse_mode="HTML" if caption else None,
 					),
 				)
+
+
+			if TERMINAL_CHANNEL_ID_2 != 0:
+				try:
+					print(f"3007::Sending default cover to secondary channel: TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
+					published_message2 = await _telegram_call_with_retry(
+						"send default cover to secondary channel",
+						lambda: bot.send_photo(
+							chat_id=TERMINAL_CHANNEL_ID_2,
+							message_thread_id=thread_id,
+							photo=DEFAULT_COVER_FILE_ID,
+							caption=caption,
+							reply_markup=display_keyboard if caption else None,
+							parse_mode="HTML" if caption else None,
+						),
+					)						
+				except Exception as exc:
+					print(f"Failed to send preview to secondary channel: {exc}")
+			else:
+				print(f"No secondary channel configured, TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
+
+
 
 			if caption is None:
 				published_message = await _telegram_call_with_retry(

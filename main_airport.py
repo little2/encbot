@@ -2938,7 +2938,7 @@ async def _forward_encoded_if_whitelisted(
 
 			if TERMINAL_CHANNEL_ID_2 != 0:
 				try:
-					preview_batch_settings2 = preview_batch_settings
+					preview_batch_settings2 = preview_batch_settings.copy()
 					preview_batch_settings2["chat_id"] = TERMINAL_CHANNEL_ID_2
 					print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
 					await _send_encoded_preview_message(preview_batch_settings2)

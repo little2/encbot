@@ -184,6 +184,7 @@ TERMINAL_CHANNEL_ID = int(os.getenv("TERMINAL_CHANNEL_ID", str(zttower_terminal_
 TERMINAL_CHANNEL_ID = int(TERMINAL_CHANNEL_ID or 0)
 TERMINAL_CHANNEL_THREAD_ID = int(zttower_terminal_channel.get("thread_id", 0) or 0)
 
+TERMINAL_CHANNEL_ID_2 = int(os.getenv("TERMINAL_CHANNEL_ID_2", 0))
 
 zttower_airport_lobby_group = _get_shared_chat_config("zttower_airport_lobby_group")
 AIRPORT_LOBBY_GROUP_ID = int(os.getenv("AIRPORT_LOBBY_GROUP_ID", str(zttower_airport_lobby_group.get("chat_id", 0))))
@@ -2923,9 +2924,18 @@ async def _forward_encoded_if_whitelisted(
 				"preview_payloads": preview_payloads,
 				"display_text": display_text,
 				"display_keyboard": display_keyboard,
+				"chat_id": TERMINAL_CHANNEL_ID,
 				"thread_id": thread_id,
 				"if_spoiler": if_spoiler,
 			}
+			if TERMINAL_CHANNEL_ID_2 != 0:
+				try:
+					preview_batch_settings2 = preview_batch_settings
+					preview_batch_settings2["chat_id"] = TERMINAL_CHANNEL_ID_2
+					await _send_encoded_preview_message(preview_batch_settings2)
+				except Exception as exc:
+					print(f"Failed to send preview to secondary channel: {exc}")
+				
 			published_message = await _send_encoded_preview_message(
 				preview_batch_settings,
 			)

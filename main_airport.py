@@ -147,7 +147,6 @@ SharedConfig.load(True)
 
 
 BACKUP_TOKEN = os.getenv("BACKUP_TOKEN", "") #用于同一个频道来做
-
 BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "")
 BACKUP_BOT_NAME = None  #用于接收
 
@@ -159,7 +158,7 @@ KEY_MAN_ID = SharedConfig.get("key_man_id", 0)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", SharedConfig.get("my_bot_token", ""))
 
-
+RUNWAY_BOT_TOKEN = SharedConfig.get("runway_bot_token", "")
 
 
 ADMIN_USER_IDS = ParseUtils.parse_user_ids(SharedConfig.get("whitelist_user_ids") or [])
@@ -8384,7 +8383,7 @@ async def extract_encode(
 				"SELECT bot_token FROM user_info WHERE user_id = $1",
 				reader_user_id,
 			)
-		user_bot_token = str(user_info["bot_token"] or "").strip() if user_info else ""
+		user_bot_token = str(user_info["bot_token"] or "").strip() if user_info else RUNWAY_BOT_TOKEN
 		delivery_data["_request_id"] = secrets.token_urlsafe(18)
 		delivery_data["_deadline"] = 253402214400 if is_admin else int(valid_until_dt.timestamp())
 		

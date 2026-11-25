@@ -927,13 +927,13 @@ def _build_keyboard(encoded: str|None = None) -> InlineKeyboardMarkup:
 	# 	InlineKeyboardButton(text="🈲 立即停飞", callback_data="takeoff:ban"),
 	# ]
 	buttons = []
-	if tower_bot_name:
-		buttons.append(
-			InlineKeyboardButton(
-				text="🗼 塔台",
-				url=f"https://t.me/{tower_bot_name}",
-			)
-		)
+	# if tower_bot_name:
+	# 	buttons.append(
+	# 		InlineKeyboardButton(
+	# 			text="🗼 塔台",
+	# 			url=f"https://t.me/{tower_bot_name}",
+	# 		)
+	# 	)
 
 
 		

@@ -131,6 +131,7 @@ async def on_media(
     upload_count = await batch_store.count_by_uploader(message.from_user.id)
     tower = "zttower9bot" if upload_count >= 50 else "zttatai5bot"
 
+
     text = f'''
 📢 各位旅客请注意：
 

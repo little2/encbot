@@ -2927,23 +2927,28 @@ async def _forward_encoded_if_whitelisted(
 				"thread_id": thread_id,
 				"if_spoiler": if_spoiler,
 			}
-			if TERMINAL_CHANNEL_ID_2 != 0:
-				try:
-					preview_batch_settings2 = preview_batch_settings
-					preview_batch_settings2["chat_id"] = TERMINAL_CHANNEL_ID_2
-					print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
-					await _send_encoded_preview_message(preview_batch_settings2)
-					print(f"Sent preview to secondary channel: success", flush=True)
-				except Exception as exc:
-					print(f"Failed to send preview to secondary channel: {exc}")
-			else:
-				print(f"No secondary channel configured, TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
+
 
 			print(f"Sending preview to first channel: {preview_batch_settings}", flush=True)
 			published_message = await _send_encoded_preview_message(
 				preview_batch_settings,
 			)
 			print(f"Sent preview to first channel: success", flush=True)
+
+
+			if TERMINAL_CHANNEL_ID_2 != 0:
+				try:
+					preview_batch_settings2 = preview_batch_settings
+					preview_batch_settings2["chat_id"] = TERMINAL_CHANNEL_ID_2
+					print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
+					await _send_encoded_preview_message(preview_batch_settings2)
+					print(f"Sent preview to secondary channel: success,TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
+				except Exception as exc:
+					print(f"Failed to send preview to secondary channel: {exc}")
+			else:
+				print(f"No secondary channel configured, TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
+
+
 			return success_result(published_message, "preview")
 		elif preview_show:
 

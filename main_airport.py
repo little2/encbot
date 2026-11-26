@@ -518,6 +518,7 @@ JOIN_MODE = "invite"  # 可选值: "invite" 或 "request"
 BACKUP_FORWARD_SEND_LOCK = asyncio.Lock()
 ENCODED_FORWARD_SEND_LOCK = asyncio.Lock()
 INACTIVE_CLEANUP_LOCK = asyncio.Lock()
+GROUP_MEMBER_SYNC_LOCK = asyncio.Lock()
 async def _telegram_call_with_retry(
 	label: str,
 	operation,
@@ -3920,6 +3921,7 @@ async def cmd_admin(message: Message, command: CommandObject) -> None:
 		"/inactive_candidate [页码] — 查看不活跃候选用户",
 		"/inactive_cleanup — 清理长期不活跃用户",
 		"/low_upload_cleanup — 移除上传批次少于 30 且通行证仍有效或过期不超过一天的用户",
+		"/sync_group_members — 使用人型机器人将航站大厅成员同步到 user_expire",
 		"/backup — 将 SQLite 数据库备份发送给指定管理员",
 		"/clear_media — 备份数据库后清空 received_media 与 batch",
 		"/restore — 回复 SQLite 备份文件以恢复数据库",
@@ -4529,6 +4531,13 @@ async def _is_inactive_candidate(user_id: int, now_timestamp: int) -> bool:
 	bot_user_id = int(getattr(bot, "id", 0) or 0)
 	if bot_user_id and user_id == bot_user_id:
 		return False
+	userbot_user_id = int(
+		getattr(active_userbot, "user_id", 0)
+		or getattr(active_userbot, "account_user_id", 0)
+		or 0
+	)
+	if userbot_user_id and user_id == userbot_user_id:
+		return False
 	user_expire = await user_expire_cache.get(user_id)
 	return bool(
 		user_expire
@@ -4654,6 +4663,92 @@ async def cmd_inactive_cleanup(message: Message) -> None:
 	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
 		return
 	await _execute_inactive_cleanup(message)
+
+
+@dp.message(Command("sync_group_members"))
+async def cmd_sync_group_members(message: Message) -> None:
+	if not UserManager._is_admin_message(message, ADMIN_USER_IDS):
+		return
+
+	if AIRPORT_LOBBY_GROUP_ID == 0:
+		await message.reply("❌ 航站大厅尚未配置，无法同步成员")
+		return
+	if active_userbot is None or not getattr(active_userbot, "user_id", None):
+		await message.reply("❌ 人型机器人尚未连接，无法读取群成员")
+		return
+	if GROUP_MEMBER_SYNC_LOCK.locked():
+		await message.reply("⏳ 群成员同步正在执行，请稍后再试")
+		return
+
+	async with GROUP_MEMBER_SYNC_LOCK:
+		status_message = await message.reply("⏳ 正在确认人型机器人状态并读取航站大厅成员……")
+		try:
+			joined_lobby = await _ensure_userbot_in_lobby(active_userbot)
+			member_ids = await active_userbot.get_group_member_ids(
+				AIRPORT_LOBBY_GROUP_ID,
+			)
+			created, updated = await user_expire_cache.sync_members(
+				member_ids,
+				int(app_now().timestamp()),
+			)
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			print(
+				f"[GROUP_MEMBER_SYNC] chat_id={AIRPORT_LOBBY_GROUP_ID} failed: {exc}",
+				flush=True,
+			)
+			await status_message.edit_text(
+				f"❌ 群成员同步失败：{type(exc).__name__}: {exc}"
+			)
+			return
+
+		await status_message.edit_text(
+			"✅ 航站大厅成员同步完成\n\n"
+			f"人型机器人：{'已通过临时邀请加入大厅' if joined_lobby else '原本已在大厅'}\n"
+			f"读取有效成员：{len(member_ids)} 人\n"
+			f"新增记录：{created} 人\n"
+			f"更新记录：{updated} 人\n\n"
+			"新增记录的 expire_timestamp 与 update_timestamp 已设为当前时间；"
+			"既有记录保留 expire_timestamp，仅刷新 update_timestamp。"
+		)
+
+
+async def _ensure_userbot_in_lobby(userbot) -> bool:
+	"""Ensure the user account is in the lobby; return whether it joined now."""
+	userbot_id = int(getattr(userbot, "user_id", 0) or 0)
+	if userbot_id <= 0:
+		raise RuntimeError("人型机器人尚未连接")
+
+	member = await bot.get_chat_member(
+		chat_id=AIRPORT_LOBBY_GROUP_ID,
+		user_id=userbot_id,
+	)
+	if _is_current_chat_member(member):
+		return False
+
+	invite = await bot.create_chat_invite_link(
+		chat_id=AIRPORT_LOBBY_GROUP_ID,
+		name=f"userbot-sync-{userbot_id}",
+		expire_date=app_now() + timedelta(minutes=10),
+		member_limit=1,
+		creates_join_request=False,
+	)
+	invite_link = str(invite.invite_link)
+	try:
+		await userbot.join_chat(invite_link)
+	finally:
+		try:
+			await bot.revoke_chat_invite_link(
+				chat_id=AIRPORT_LOBBY_GROUP_ID,
+				invite_link=invite_link,
+			)
+		except Exception as exc:
+			print(
+				f"[GROUP_MEMBER_SYNC] temporary invite revoke failed: {exc}",
+				flush=True,
+			)
+	return True
 
 
 @dp.message(Command("low_upload_cleanup"))
@@ -4883,7 +4978,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 								"系统已将你移出原先所在的「镇泰飞机场」「航站大厅」或「免税店」，"
 								"并清除相关通行证数据。\n\n"
 								"这不是黑名单封禁，之后仍可按照届时的入场规则重新申请加入。"
-								"https://t.me/+ek6YrGU0Rsg4YmZl"
+								"https://t.me/jczlpbot"
 							),
 							# text=(
 							# 	"🛫 机场通知\n\n"
@@ -4913,6 +5008,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 								"现已从「镇泰飞机场」「航站大厅」与「免税店」移出。\n\n"
 								"本次属于不活跃成员整理，不是黑名单封禁，"
 								"之后仍可按照届时的入场规则重新申请加入。"
+								"https://t.me/jczlpbot"
 							),
 							parse_mode="HTML",
 						),

@@ -4,7 +4,7 @@ import ast
 import asyncio
 import copy
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 import os
 import secrets
@@ -65,6 +65,7 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                        received_media_store=self.stores.received_media,
                        shared_invite_link_store=self.stores.shared_invite_links,
                        bot=self.bot, bot_name="airport_test", ADMIN_USER_IDS={99},
+                       active_userbot=None,
                        MESSAGE_REWARD_LOCKS={}, TAKEOFF_USER_LOCKS={},
                        MESSAGE_REWARD_MINUTES=60, MEDIA_VIEW_CONSUMPTION_MINUTES=60,
                        IGNORED_TEXT_SUBSTRINGS=[], FormatUtils=FormatUtils, escape=escape)
@@ -139,13 +140,17 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user.expire_timestamp, NOW + 3600)
         self.assertEqual(user.group_message_timestamp, NOW)
 
-    async def test_inactive_snapshot_excludes_admin_bot_and_blacklist(self):
+    async def test_inactive_snapshot_excludes_admin_bots_and_blacklist(self):
         self.ns["INACTIVE_EXPIRE_DAYS"] = 0
+        self.ns["active_userbot"] = SimpleNamespace(
+            user_id=None,
+            account_user_id=2,
+        )
         load_functions({"_inactive_cutoff_timestamp", "_is_inactive_candidate", "_get_inactive_candidates"}, self.ns)
         for user_id in (1, 2, 3, 99, 999):
             await self.stores.users.update(user_id, NOW - user_id)
         await self.stores.blacklist.ban(3, "blocked", 99)
-        self.assertEqual([uid for uid, _ in await self.ns["_get_inactive_candidates"](NOW)], [2, 1])
+        self.assertEqual([uid for uid, _ in await self.ns["_get_inactive_candidates"](NOW)], [1])
 
     async def test_low_upload_snapshot_filters_expiry_upload_count_and_exempt_users(self):
         self.ns["LOW_UPLOAD_CLEANUP_LIMIT"] = 30
@@ -168,6 +173,74 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(user_id, count) for user_id, _, count in candidates],
             [(2, 0), (1, 0)],
+        )
+
+    async def test_admin_can_sync_lobby_members_through_userbot_from_private_chat(self):
+        status = SimpleNamespace(edit_text=AsyncMock())
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=99),
+            chat=SimpleNamespace(id=99, type="private"),
+            reply=AsyncMock(return_value=status),
+        )
+        active_userbot = SimpleNamespace(
+            user_id=777,
+            get_group_member_ids=AsyncMock(return_value=[1, 2]),
+        )
+        user_store = SimpleNamespace(sync_members=AsyncMock(return_value=(1, 1)))
+        self.ns.update(
+            active_userbot=active_userbot,
+            user_expire_cache=user_store,
+            GROUP_MEMBER_SYNC_LOCK=asyncio.Lock(),
+            AIRPORT_LOBBY_GROUP_ID=-100999,
+            _ensure_userbot_in_lobby=AsyncMock(return_value=True),
+            UserManager=SimpleNamespace(
+                _is_admin_message=lambda current, admin_ids: current.from_user.id in admin_ids,
+            ),
+        )
+        load_functions({"cmd_sync_group_members"}, self.ns)
+
+        await self.ns["cmd_sync_group_members"](message)
+
+        active_userbot.get_group_member_ids.assert_awaited_once_with(
+            -100999,
+        )
+        self.ns["_ensure_userbot_in_lobby"].assert_awaited_once_with(active_userbot)
+        user_store.sync_members.assert_awaited_once_with([1, 2], NOW)
+        result = status.edit_text.await_args.args[0]
+        self.assertIn("已通过临时邀请加入大厅", result)
+        self.assertIn("新增记录：1 人", result)
+        self.assertIn("更新记录：1 人", result)
+
+    async def test_sync_creates_one_use_invite_when_userbot_is_not_in_lobby(self):
+        self.bot.get_chat_member = AsyncMock(
+            return_value=SimpleNamespace(status="left"),
+        )
+        self.bot.create_chat_invite_link = AsyncMock(
+            return_value=SimpleNamespace(invite_link="https://t.me/+temporary"),
+        )
+        self.bot.revoke_chat_invite_link = AsyncMock()
+        userbot = SimpleNamespace(user_id=777, join_chat=AsyncMock())
+        self.ns.update(
+            AIRPORT_LOBBY_GROUP_ID=-100999,
+            _is_current_chat_member=lambda member: member.status in {"member", "administrator", "creator"},
+            timedelta=timedelta,
+        )
+        load_functions({"_ensure_userbot_in_lobby"}, self.ns)
+
+        self.assertTrue(await self.ns["_ensure_userbot_in_lobby"](userbot))
+
+        self.bot.get_chat_member.assert_awaited_once_with(
+            chat_id=-100999,
+            user_id=777,
+        )
+        invite_kwargs = self.bot.create_chat_invite_link.await_args.kwargs
+        self.assertEqual(invite_kwargs["chat_id"], -100999)
+        self.assertEqual(invite_kwargs["member_limit"], 1)
+        self.assertFalse(invite_kwargs["creates_join_request"])
+        userbot.join_chat.assert_awaited_once_with("https://t.me/+temporary")
+        self.bot.revoke_chat_invite_link.assert_awaited_once_with(
+            chat_id=-100999,
+            invite_link="https://t.me/+temporary",
         )
 
     async def test_low_upload_cleanup_removes_candidates_and_reports_counts(self):

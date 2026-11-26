@@ -34,6 +34,7 @@ class UserExpireStore(Protocol):
     async def is_valid(self, user_id: int) -> bool: ...
     async def count(self) -> int: ...
     async def list_users(self) -> dict[int, UserExpire]: ...
+    async def sync_members(self, user_ids: list[int], timestamp: int) -> tuple[int, int]: ...
     async def extend_minutes(self, user_id: int, minutes: int,
                              group_message_timestamp: int | None = None) -> UserExpire: ...
     async def consume_minutes(self, user_id: int, minutes: int) -> UserExpire | None: ...
@@ -98,6 +99,16 @@ class _SQLiteConnection:
 
     async def execute(self, sql, *params):
         return await self._query(sql, params, False)
+
+    async def executemany(self, sql, params):
+        sql = re.sub(r"\$(\d+)", r"?\1", sql)
+        rows = list(params)
+
+        def work():
+            cursor = self.connection.executemany(sql, rows)
+            cursor.close()
+
+        await self._run(work)
 
     async def fetch(self, sql, *params):
         return await self._query(sql, params, True)
@@ -241,6 +252,33 @@ class _UserExpireStore:
         async with self.database.transaction() as conn:
             rows = await conn.fetch("SELECT * FROM user_expire ORDER BY user_id")
             return {int(row["user_id"]): _user(row) for row in rows}
+
+    async def sync_members(self, user_ids: list[int], timestamp: int) -> tuple[int, int]:
+        """Insert missing members and refresh existing members without changing expiry."""
+        normalized_user_ids = sorted({int(user_id) for user_id in user_ids if int(user_id) > 0})
+        if not normalized_user_ids:
+            return 0, 0
+
+        now = int(timestamp)
+        async with self.database.transaction(write=True) as conn:
+            rows = await conn.fetch("SELECT user_id FROM user_expire")
+            existing_user_ids = {
+                int(row["user_id"])
+                for row in rows
+                if int(row["user_id"]) in normalized_user_ids
+            }
+            await conn.executemany("""
+                INSERT INTO user_expire (
+                    user_id, expire_timestamp, update_timestamp,
+                    group_message_timestamp, subscription_status
+                )
+                VALUES ($1, $2, $2, 0, 0)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    update_timestamp = excluded.update_timestamp
+            """, [(user_id, now) for user_id in normalized_user_ids])
+
+        updated = len(existing_user_ids)
+        return len(normalized_user_ids) - updated, updated
 
     async def extend_minutes(self, user_id: int, minutes: int,
                              group_message_timestamp: int | None = None) -> UserExpire:

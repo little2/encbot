@@ -51,6 +51,7 @@ class TelethonUserbotTests(unittest.TestCase):
 
         self.assertEqual(observed_user_id, 123)
         self.assertIsNone(userbot.user_id)
+        self.assertEqual(userbot.account_user_id, 123)
         userbot.client.disconnect.assert_awaited_once_with()
 
     def test_forward_stored_message_returns_destination_message_id(self):
@@ -70,6 +71,49 @@ class TelethonUserbotTests(unittest.TestCase):
             messages=456,
             from_peer=-100123,
         )
+
+    def test_group_member_ids_exclude_bots_deleted_accounts_and_duplicates(self):
+        async def run_case():
+            userbot = TelethonUserbot.__new__(TelethonUserbot)
+            userbot.user_id = 3
+
+            async def participants(peer):
+                self.assertEqual(peer, "resolved-group")
+                for participant in (
+                    SimpleNamespace(id=3, bot=False, deleted=False),
+                    SimpleNamespace(id=1, bot=False, deleted=False),
+                    SimpleNamespace(id=3, bot=False, deleted=False),
+                    SimpleNamespace(id=4, bot=True, deleted=False),
+                    SimpleNamespace(id=5, bot=False, deleted=True),
+                ):
+                    yield participant
+
+            userbot._resolve_chat = AsyncMock(return_value="resolved-group")
+            userbot.client = SimpleNamespace(iter_participants=participants)
+
+            self.assertEqual(
+                await userbot.get_group_member_ids(-100123, "test_group"),
+                [1],
+            )
+            userbot._resolve_chat.assert_awaited_once_with(-100123, "test_group")
+
+        asyncio.run(run_case())
+
+    def test_join_chat_imports_generated_private_invite(self):
+        async def run_case():
+            userbot = TelethonUserbot.__new__(TelethonUserbot)
+            userbot.client = AsyncMock()
+
+            await userbot.join_chat("https://t.me/+temporary-hash")
+
+            request = userbot.client.await_args.args[0]
+            self.assertIsInstance(
+                request,
+                telethon_userbot.functions.messages.ImportChatInviteRequest,
+            )
+            self.assertEqual(request.hash, "temporary-hash")
+
+        asyncio.run(run_case())
 
     def test_history_reconciliation_uses_only_matching_incoming_media_since_upload(self):
         async def run():

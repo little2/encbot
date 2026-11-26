@@ -104,6 +104,25 @@ class StoreContract:
                 await users.set_subscription_status(1, value)
         self.assertEqual((await users.get(1)).subscription_status, 0)
 
+    async def test_sync_members_inserts_missing_users_and_preserves_existing_expiry(self):
+        users = self.stores.users
+        await users.update(1, NOW + 600, group_message_timestamp=123)
+        await users.set_subscription_status(1, 1)
+
+        created, updated = await users.sync_members([2, 1, 2, 0, -1], NOW + 30)
+
+        self.assertEqual((created, updated), (1, 1))
+        existing = await users.get(1)
+        self.assertEqual(existing.expire_timestamp, NOW + 600)
+        self.assertEqual(existing.update_timestamp, NOW + 30)
+        self.assertEqual(existing.group_message_timestamp, 123)
+        self.assertEqual(existing.subscription_status, 1)
+        inserted = await users.get(2)
+        self.assertEqual(inserted.expire_timestamp, NOW + 30)
+        self.assertEqual(inserted.update_timestamp, NOW + 30)
+        self.assertEqual(inserted.group_message_timestamp, 0)
+        self.assertEqual(inserted.subscription_status, 0)
+
     async def test_remove_if_expired_preserves_renewed_users(self):
         users = self.stores.users
         cutoff = NOW - 86400

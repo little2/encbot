@@ -8559,15 +8559,26 @@ async def on_text(message: Message) -> None:
 
 		try:
 			print(f"[ENCODED_TEXT] text={text}", flush=True)
-			parse_text = text
-			START = "⟦["
-			END = "]⟧"
-			pattern = re.escape(START) + r"(.*?)" + re.escape(END)
-			matches = re.findall(pattern, text, flags=re.S)
+
+
+			# 如果文字信息(entity)包含 url ,且 url 是以 https://b.oy/ 开头，把去除开头的 url 作为 parse_text 
+
+
+
+			parse_text = _extract_takeoff_code(message)
+			if not parse_text:
+				parse_text = text
+				START = "⟦["
+				END = "]⟧"
+				pattern = re.escape(START) + r"(.*?)" + re.escape(END)
+				matches = re.findall(pattern, text, flags=re.S)
+				for item in matches:
+					parse_text = item.strip()
+					break
 			reader_user_id = int(message.from_user.id)
-			for item in matches:
-				parse_text = item.strip()
-				break
+
+
+
 
 			result = await on_takeoff_fly(reader_user_id, parse_text, message=message)
 			if not result["ok"]:

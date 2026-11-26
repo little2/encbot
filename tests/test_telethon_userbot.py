@@ -10,6 +10,7 @@ from telethon import errors, functions, types
 
 import telethon_userbot
 from telethon_userbot import TelethonUserbot
+from utils.chat_membership import BotKickedError
 
 
 class TelethonUserbotTests(unittest.TestCase):
@@ -42,18 +43,18 @@ class TelethonUserbotTests(unittest.TestCase):
             disconnect=AsyncMock(),
         )
 
-        observed_user_id = None
+        login_state = []
 
         async def observe():
-            nonlocal observed_user_id
-            observed_user_id = userbot.user_id
+            login_state.append((userbot.user_id, userbot.client.send_message.await_count))
 
         ready = AsyncMock(side_effect=observe)
         asyncio.run(userbot.run(notify_bot="@example_bot", on_ready=ready))
 
         ready.assert_awaited_once_with()
+        userbot.client.send_message.assert_awaited_once_with("@example_bot", "/start")
         userbot.client.run_until_disconnected.assert_awaited_once_with()
-        self.assertEqual(observed_user_id, 123)
+        self.assertEqual(login_state, [(123, 0)])
         self.assertIsNone(userbot.user_id)
         self.assertEqual(userbot.account_user_id, 123)
         userbot.client.disconnect.assert_awaited_once_with()
@@ -182,6 +183,32 @@ class TelethonUserbotTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             asyncio.run(userbot.ensure_bot_admin(-1000000000042, 101, "example_bot"))
         client.assert_not_awaited()
+
+    def test_userbot_stops_when_membership_or_invitation_reports_a_ban(self):
+        chat = types.InputPeerChannel(42, 77)
+        bot = types.InputPeerUser(101, 99)
+        banned = types.ChannelParticipantBanned(
+            peer=types.PeerUser(bot.user_id), kicked_by=1, date=datetime.now(timezone.utc),
+            banned_rights=types.ChatBannedRights(until_date=None, view_messages=True),
+        )
+        for ban_visible in (True, False):
+            with self.subTest(ban_visible=ban_visible):
+                userbot = TelethonUserbot.__new__(TelethonUserbot)
+                userbot._resolve_chat = AsyncMock(side_effect=[chat, bot])
+                client = userbot.client = AsyncMock()
+                if ban_visible:
+                    client.get_permissions.return_value = SimpleNamespace(is_admin=False, participant=banned)
+                else:
+                    client.get_permissions.side_effect = errors.UserNotParticipantError(None)
+                    client.get_entity.return_value = SimpleNamespace(creator=True, admin_rights=None, broadcast=False)
+                    client.side_effect = errors.UserKickedError(None)
+                with self.assertRaisesRegex(BotKickedError, "機器人已被封鎖，需要更換機器人"):
+                    asyncio.run(userbot.ensure_bot_admin(-1000000000042, 101, "example_bot"))
+                if ban_visible:
+                    client.assert_not_awaited()
+                else:
+                    client.assert_awaited_once()
+                    self.assertIsInstance(client.await_args.args[0], functions.channels.InviteToChannelRequest)
 
     def test_history_reconciliation_uses_only_matching_incoming_media_since_upload(self):
         async def run():

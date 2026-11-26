@@ -12,6 +12,7 @@ from typing import Awaitable, Callable
 from telethon import TelegramClient, errors, events, functions, types, utils
 from telethon.sessions import StringSession
 from tgfileid import TelegramFileId
+from utils.chat_membership import BotKickedError
 
 logger = logging.getLogger(__name__)
 
@@ -204,12 +205,21 @@ class TelethonUserbot:
             raise ValueError(f"{chat_id} is not a group or channel")
         bot_peer = await self._resolve_chat(bot_id, bot_name)
         try:
+            await self._promote_bot(chat, bot_peer)
+        except errors.UserKickedError as exc:
+            raise BotKickedError() from exc
+
+    async def _promote_bot(self, chat, bot_peer) -> None:
+        try:
             member = await self.client.get_permissions(chat, bot_peer)
         except errors.UserNotParticipantError:
             needs_invite = True
         else:
             if member.is_admin:
                 return
+            if (isinstance(member.participant, types.ChannelParticipantBanned)
+                    and member.participant.banned_rights.view_messages):
+                raise BotKickedError()
             needs_invite = member.has_left or getattr(member.participant, "left", False)
 
         if isinstance(chat, types.InputPeerChat):
@@ -261,6 +271,11 @@ class TelethonUserbot:
             self.user_id = me.id
             self.account_user_id = me.id
             print(f"👦 [USERBOT] Logged in: {me.id}", flush=True)
+            if on_ready is not None:
+                try:
+                    await on_ready()
+                except Exception:
+                    logger.exception("Userbot startup callback failed")
             if notify_bot:
                 try:
                     await self.client.send_message(
@@ -269,11 +284,6 @@ class TelethonUserbot:
                     print(f"👦 [USERBOT] Startup notification sent to {notify_bot}", flush=True)
                 except Exception:
                     logger.exception("Could not send userbot startup notification to %s", notify_bot)
-            if on_ready is not None:
-                try:
-                    await on_ready()
-                except Exception:
-                    logger.exception("Userbot startup callback failed")
             await self.client.run_until_disconnected()
         finally:
             self.user_id = None

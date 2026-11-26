@@ -88,3 +88,16 @@ class ControlPanelTests(unittest.IsolatedAsyncioTestCase):
 		self.assertEqual(result.count("群组检查成功"), 2)
 		self.assertIn("cannot promote", result)
 		self.assertIn("群组权限不足", result)
+
+	async def test_report_prompts_replacement_without_repairing_kicked_bot(self):
+		error = TelegramForbiddenError(GetChatMember(chat_id=-10, user_id=123), "bot was kicked from the supergroup chat")
+		bot = SimpleNamespace(id=123, get_chat_member=AsyncMock(side_effect=[error, SimpleNamespace(status="kicked")]))
+		repair = AsyncMock()
+		result = await ControlPanel({}).check_bot_group_admin_permissions(
+			bot, "example_bot", [("LOBBY", -10), ("TERMINAL", -20)], AsyncMock(), repair,
+		)
+		repair.assert_not_awaited()
+		self.assertEqual(result.splitlines()[1:], [
+			"LOBBY=-10：機器人已被封鎖，需要更換機器人。",
+			"TERMINAL=-20：機器人已被封鎖，需要更換機器人。",
+		])

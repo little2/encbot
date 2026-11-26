@@ -5,6 +5,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from utils.chat_membership import BotKickedError, get_chat_member
 
 
 class ControlPanel:
@@ -27,7 +28,7 @@ class ControlPanel:
 
 		async def get_bot_status(chat_id: int):
 			try:
-				member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+				member = await get_chat_member(bot, chat_id, bot.id)
 			except (TelegramBadRequest, TelegramForbiddenError):
 				# Telegram can hide a private chat from a bot that has not joined.
 				if ensure_admin is None:
@@ -37,7 +38,7 @@ class ControlPanel:
 					return member
 
 			await ensure_admin(chat_id, bot.id, bot_name)
-			return await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+			return await get_chat_member(bot, chat_id, bot.id)
 
 		for setting_name, chat_id in groups:
 			if chat_id == 0:
@@ -49,6 +50,9 @@ class ControlPanel:
 
 			try:
 				bot_status = await get_bot_status(chat_id)
+			except BotKickedError as exc:
+				notice_text += f"{setting_name}={chat_id}：{exc}\n"
+				continue
 			except TelegramBadRequest as exc:
 				if "chat not found" in str(exc).lower():
 					notice_text += (

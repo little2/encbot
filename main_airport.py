@@ -70,6 +70,7 @@ from aiogram.types import (
 
 from html import escape
 
+from utils.chat_membership import BotKickedError, get_chat_member
 from utils.control_panel import ControlPanel
 from utils.utf_utils import UtfConverter
 from utils.format_utils import FormatUtils
@@ -5972,10 +5973,16 @@ async def cmd_airport_access_request(message: Message) -> None:
 		return
 
 	user_id = int(message.from_user.id)
-	if not await _is_member_of_chat(
-		AIRPORT_LOBBY_GROUP_ID,
-		user_id,
-	):
+	try:
+		in_lobby = await _is_member_of_chat(AIRPORT_LOBBY_GROUP_ID, user_id)
+	except BotKickedError as exc:
+		await message.reply(str(exc))
+		return
+	except TelegramAPIError as exc:
+		print(f"[AIRPORT_ACCESS] lobby membership check failed (chat={AIRPORT_LOBBY_GROUP_ID}): {exc}", flush=True)
+		await message.reply("暂时无法核实航站大厅成员身份，请稍后重试。")
+		return
+	if not in_lobby:
 		try:
 			member_count = await bot.get_chat_member_count(
 				chat_id=AIRPORT_LOBBY_GROUP_ID,
@@ -6304,17 +6311,7 @@ def _build_join_context(join_request: ChatJoinRequest) -> AirportJoinContext:
 
 
 async def _is_member_of_chat(chat_id: int, user_id: int) -> bool:
-	try:
-		status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-	except TelegramBadRequest as exc:
-		if "chat not found" in str(exc).lower():
-			print(
-				f"[群組查詢失敗] 找不到群組 {chat_id}，請檢查啟動時的群組權限提示。",
-				flush=True,
-			)
-			return False
-		raise
-
+	status = await get_chat_member(bot, chat_id, user_id)
 	return _is_current_chat_member(status)
 
 
@@ -6406,11 +6403,11 @@ async def _reject_join_request(
 		print(f"[AIRPORT_ACCESS] join rejection failed: {exc}", flush=True)
 
 
-async def _notify_join_retry(context: AirportJoinContext) -> None:
+async def _notify_join_retry(context: AirportJoinContext, text: str = "Telegram 暂时无法完成入场审核，请稍后使用原连结重试。") -> None:
 	try:
 		await bot.send_message(
 			chat_id=context.request.user_chat_id,
-			text="Telegram 暂时无法完成入场审核，请稍后使用原连结重试。",
+			text=text,
 		)
 	except Exception as exc:
 		print(f"[AIRPORT_ACCESS] retry notice failed: {exc}", flush=True)
@@ -6609,6 +6606,9 @@ async def _process_join_request(context: AirportJoinContext) -> None:
 
 	try:
 		rejection = await _get_join_rejection_reason(context)
+	except BotKickedError as exc:
+		await _notify_join_retry(context, str(exc))
+		return
 	except Exception as exc:
 		print(
 			f"[AIRPORT_ACCESS] eligibility check failed for user "

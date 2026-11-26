@@ -6554,28 +6554,29 @@ async def _after_join_approved(context: AirportJoinContext) -> None:
 
 	if context.chat_id == AIRPORT_LOBBY_GROUP_ID:
 		PENDING_AIRPORT_JOIN_INVITES.pop(context.user_id, None)
-		try:
-			await _send_airport_join_request_invite(
-				context.user_id,
-				request_plant_channel=1,
-			)
-		except Exception as exc:
-			print(
-				f"[AIRPORT_ACCESS] next-stage invite failed for user "
-				f"{context.user_id}: {exc}",
-				flush=True,
-			)
-			try:
-				await bot.send_message(
-					chat_id=context.request.user_chat_id,
-					text=(
-						"✅ 已通过审核并加入航站大厅。\n"
-						"暂时无法建立机场频道邀请，请稍后重新申请进入机场。"
-					),
-				)
-			except Exception:
-				pass
-		return
+		# TODO: 不再提供機場群連結
+		# try:
+		# 	await _send_airport_join_request_invite(
+		# 		context.user_id,
+		# 		request_plant_channel=1,
+		# 	)
+		# except Exception as exc:
+		# 	print(
+		# 		f"[AIRPORT_ACCESS] next-stage invite failed for user "
+		# 		f"{context.user_id}: {exc}",
+		# 		flush=True,
+		# 	)
+		# 	try:
+		# 		await bot.send_message(
+		# 			chat_id=context.request.user_chat_id,
+		# 			text=(
+		# 				"✅ 已通过审核并加入航站大厅。\n"
+		# 				"暂时无法建立机场频道邀请，请稍后重新申请进入机场。"
+		# 			),
+		# 		)
+		# 	except Exception:
+		# 		pass
+		# return
 
 	if context.chat_id == TERMINAL_CHANNEL_ID:
 		AIRPORT_QUIZ_PASSED_UNTIL.pop(context.user_id, None)

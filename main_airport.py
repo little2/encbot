@@ -4867,15 +4867,14 @@ async def _execute_low_upload_cleanup(message: Message) -> bool:
 
 
 async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
-	async def notify(text: str) -> None:
+	async def notify(text: str):
 		if message is not None:
-			await message.reply(text)
-			return
+			return await message.reply(text)
 		if KEY_MAN_ID <= 0:
 			print(f"[INACTIVE_CLEANUP] {text}", flush=True)
-			return
+			return None
 		try:
-			await _telegram_call_with_retry(
+			return await _telegram_call_with_retry(
 				"send scheduled inactive cleanup status",
 				lambda: bot.send_message(
 					chat_id=KEY_MAN_ID,
@@ -4884,6 +4883,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			)
 		except Exception as exc:
 			print(f"[INACTIVE_CLEANUP] scheduled status failed: {exc}", flush=True)
+			return None
 
 	if INACTIVE_CLEANUP_LOCK.locked():
 		await notify("⏳ 不活跃用户清理正在执行，本次任务不重复执行")
@@ -4901,17 +4901,65 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			)
 			return True
 
-		await notify(f"🧹 开始检查并清理 {len(candidates)} 名候选用户")
 		removed_user_ids: list[int] = []
 		skipped_user_ids: list[int] = []
 		failed_results: list[str] = []
 		broadcast_failed_results: list[str] = []
 		participant_record_deleted_user_ids: list[int] = []
+		progress_message = await notify(
+			f"🧹 不活跃用户清理进行中\n\n"
+			f"进度：0/{len(candidates)}（0%）\n"
+			"阶段：准备开始"
+		)
+		last_progress_at = 0.0
 
-		for user_id, _ in candidates:
+		async def update_progress(
+			processed: int,
+			current_user_id: int | None,
+			stage: str,
+			*,
+			force: bool = False,
+		) -> None:
+			nonlocal last_progress_at
+			now = asyncio.get_running_loop().time()
+			if not force and now - last_progress_at < 2.0:
+				return
+			last_progress_at = now
+			percentage = processed * 100 // len(candidates)
+			lines = [
+				"🧹 不活跃用户清理进行中",
+				"",
+				f"进度：{processed}/{len(candidates)}（{percentage}%）",
+				f"成功：{len(removed_user_ids)}｜跳过：{len(skipped_user_ids)}｜失败：{len(failed_results)}",
+			]
+			if current_user_id is not None:
+				lines.append(f"当前用户：{current_user_id}")
+			lines.append(f"阶段：{stage}")
+			progress_text = "\n".join(lines)
+			if progress_message is None:
+				print(f"[INACTIVE_CLEANUP] {progress_text}", flush=True)
+				return
+			try:
+				await progress_message.edit_text(progress_text)
+			except Exception as exc:
+				print(f"[INACTIVE_CLEANUP] progress update failed: {exc}", flush=True)
+
+		for candidate_index, (user_id, _) in enumerate(candidates, start=1):
+			await update_progress(
+				candidate_index - 1,
+				user_id,
+				"重新确认清理资格",
+				force=candidate_index == 1,
+			)
 			check_timestamp = int(app_now().timestamp())
 			if not await _is_inactive_candidate(user_id, check_timestamp):
 				skipped_user_ids.append(user_id)
+				await update_progress(
+					candidate_index,
+					user_id,
+					"资格已变化，跳过",
+					force=candidate_index == len(candidates),
+				)
 				continue
 
 			user_expire = await user_expire_cache.get(user_id)
@@ -4922,8 +4970,15 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 
 			if not await _is_inactive_candidate(user_id, int(app_now().timestamp())):
 				skipped_user_ids.append(user_id)
+				await update_progress(
+					candidate_index,
+					user_id,
+					"资格已变化，跳过",
+					force=candidate_index == len(candidates),
+				)
 				continue
 
+			await update_progress(candidate_index - 1, user_id, "检查飞机场成员状态")
 			airport_ok, airport_result, airport_participant_error = (
 				await _remove_inactive_user_from_chat(
 					TERMINAL_CHANNEL_ID,
@@ -4933,6 +4988,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			)
 			airport_ok = airport_ok or airport_participant_error
 
+			await update_progress(candidate_index - 1, user_id, "检查航站大厅成员状态")
 			lobby_ok, lobby_result, lobby_participant_error = (
 				await _remove_inactive_user_from_chat(
 					AIRPORT_LOBBY_GROUP_ID,
@@ -4946,6 +5002,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 			duty_free_participant_error = False
 			duty_free_result = "免税店未配置"
 			if AIRPORT_DUTY_FREE_GROUP_ID != 0:
+				await update_progress(candidate_index - 1, user_id, "检查免税店成员状态")
 				duty_free_ok, duty_free_result, duty_free_participant_error = (
 					await _remove_inactive_user_from_chat(
 						AIRPORT_DUTY_FREE_GROUP_ID,
@@ -4959,6 +5016,12 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				failed_results.append(
 					f"{user_id}：{airport_result}；{lobby_result}；{duty_free_result}"
 				)
+				await update_progress(
+					candidate_index,
+					user_id,
+					"群组处理失败",
+					force=candidate_index == len(candidates),
+				)
 				continue
 
 			actually_removed = any(
@@ -4966,6 +5029,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				for result in (airport_result, lobby_result, duty_free_result)
 			)
 			if actually_removed:
+				await update_progress(candidate_index - 1, user_id, "通知被清理用户")
 				try:
 					await _telegram_call_with_retry(
 						f"notify inactive member {user_id}",
@@ -4996,6 +5060,7 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 					)
 
 			if actually_removed:
+				await update_progress(candidate_index - 1, user_id, "发送航站大厅清理广播")
 				try:
 					await _telegram_call_with_retry(
 						f"broadcast inactive cleanup for {user_id}",
@@ -5021,10 +5086,17 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 						flush=True,
 					)
 
+			await update_progress(candidate_index - 1, user_id, "删除用户资料")
 			try:
 				await _delete_inactive_user_data(user_id)
 			except Exception as exc:
 				failed_results.append(f"{user_id}：数据库删除失败：{exc}")
+				await update_progress(
+					candidate_index,
+					user_id,
+					"数据库删除失败",
+					force=candidate_index == len(candidates),
+				)
 				continue
 
 			if airport_participant_error or lobby_participant_error or duty_free_participant_error:
@@ -5035,6 +5107,19 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 				f"{airport_result}; {lobby_result}; {duty_free_result}; database deleted",
 				flush=True,
 			)
+			await update_progress(
+				candidate_index,
+				user_id,
+				"处理完成",
+				force=candidate_index == len(candidates),
+			)
+
+		await update_progress(
+			len(candidates),
+			None,
+			"全部处理完成，正在发送汇总",
+			force=True,
+		)
 
 		summary_lines = [
 			"✅ 不活跃用户清理完成",

@@ -308,6 +308,7 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                         '_is_inactive_candidate', '_get_inactive_candidates'}, self.ns)
         message = SimpleNamespace(reply=AsyncMock())
         await self.ns['_execute_inactive_cleanup'](message)
+        self.last_cleanup_message = message
         return calls, message.reply.await_args.args[0]
 
     async def test_cleanup_checks_all_chats_before_deletion_despite_participant_errors(self):
@@ -346,6 +347,20 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self.stores.users.get(1))
         self.assertIn('失败：1 人', summary)
         self.assertIn('成功：0 人', summary)
+
+    async def test_cleanup_edits_progress_message_while_processing(self):
+        await self.run_cleanup_with_results([(True, '已移出', False)] * 3)
+
+        progress_message = self.last_cleanup_message.reply.return_value
+        self.assertGreaterEqual(progress_message.edit_text.await_count, 3)
+        progress_updates = [
+            call.args[0]
+            for call in progress_message.edit_text.await_args_list
+        ]
+        self.assertIn('进度：0/1（0%）', progress_updates[0])
+        self.assertTrue(any('当前用户：1' in text for text in progress_updates))
+        self.assertIn('进度：1/1（100%）', progress_updates[-1])
+        self.assertIn('全部处理完成', progress_updates[-1])
 
     async def test_hot_command_reads_current_stores(self):
         await self.stores.batches.upsert_channel_location("batch", -100, 1, "A&B")

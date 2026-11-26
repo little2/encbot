@@ -197,7 +197,53 @@ class TelethonUserbot:
         except errors.UserAlreadyParticipantError:
             return
 
-    async def run(self, notify_bot: str | None = None) -> None:
+    async def ensure_bot_admin(self, chat_id: int, bot_id: int, bot_name: str) -> None:
+        """Invite the application bot if needed and promote it in this chat."""
+        chat = await self._resolve_chat(chat_id)
+        if not isinstance(chat, (types.InputPeerChat, types.InputPeerChannel)):
+            raise ValueError(f"{chat_id} is not a group or channel")
+        bot_peer = await self._resolve_chat(bot_id, bot_name)
+        try:
+            member = await self.client.get_permissions(chat, bot_peer)
+        except errors.UserNotParticipantError:
+            needs_invite = True
+        else:
+            if member.is_admin:
+                return
+            needs_invite = member.has_left or getattr(member.participant, "left", False)
+
+        if isinstance(chat, types.InputPeerChat):
+            if needs_invite:
+                try:
+                    await self.client(functions.messages.AddChatUserRequest(chat.chat_id, bot_peer, fwd_limit=0))
+                except errors.UserAlreadyParticipantError:
+                    pass
+            await self.client.edit_admin(chat, bot_peer, is_admin=True)
+            return
+
+        channel = await self.client.get_entity(chat)
+        granted = channel.admin_rights
+        if not channel.creator and not (granted and granted.add_admins):
+            raise PermissionError("userbot 没有添加管理员的权限")
+        # Broadcast channels accept bots directly as admins. Supergroups also allow a member invite.
+        if needs_invite and not channel.broadcast:
+            try:
+                await self.client(functions.channels.InviteToChannelRequest(chat, [bot_peer]))
+            except errors.UserAlreadyParticipantError:
+                pass
+
+        rights = types.ChatAdminRights(
+            other=True,
+            change_info=channel.creator or granted.change_info,
+            delete_messages=channel.creator or granted.delete_messages,
+            ban_users=channel.creator or granted.ban_users,
+            invite_users=channel.creator or granted.invite_users,
+            post_messages=channel.broadcast and (channel.creator or granted.post_messages),
+        )
+        await self.client(functions.channels.EditAdminRequest(chat, bot_peer, rights, rank=""))
+
+    async def run(self, notify_bot: str | None = None, *,
+                  on_ready: Callable[[], Awaitable[None]] | None = None) -> None:
         async def phone():
             return self.phone or await asyncio.to_thread(input, "Userbot phone: ")
 
@@ -223,16 +269,22 @@ class TelethonUserbot:
                     print(f"👦 [USERBOT] Startup notification sent to {notify_bot}", flush=True)
                 except Exception:
                     logger.exception("Could not send userbot startup notification to %s", notify_bot)
+            if on_ready is not None:
+                try:
+                    await on_ready()
+                except Exception:
+                    logger.exception("Userbot startup callback failed")
             await self.client.run_until_disconnected()
         finally:
             self.user_id = None
             self._upload_peer = None
             await self.client.disconnect()
 
-    async def run_until_shutdown(self, notify_bot: str) -> None:
+    async def run_until_shutdown(self, notify_bot: str, *,
+                                 on_ready: Callable[[], Awaitable[None]] | None = None) -> None:
         while True:
             try:
-                await self.run(notify_bot)
+                await self.run(notify_bot, on_ready=on_ready)
             except OSError:
                 logger.exception("Userbot connection failed")
             await asyncio.sleep(5)

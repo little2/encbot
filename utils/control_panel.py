@@ -4,7 +4,7 @@ from typing import Any
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 
 class ControlPanel:
@@ -20,9 +20,24 @@ class ControlPanel:
 			[str, Callable[[], Awaitable[Any]]],
 			Awaitable[Any],
 		],
+		ensure_admin: Callable[[int, int, str], Awaitable[None]] | None = None,
 	) -> str:
 		control_panel_chat_id = self.config.get("control_channel")
 		notice_text = f"🔔 机器人名称: @{bot_name}\n"
+
+		async def get_bot_status(chat_id: int):
+			try:
+				member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+			except (TelegramBadRequest, TelegramForbiddenError):
+				# Telegram can hide a private chat from a bot that has not joined.
+				if ensure_admin is None:
+					raise
+			else:
+				if ensure_admin is None or member.status in ("administrator", "creator"):
+					return member
+
+			await ensure_admin(chat_id, bot.id, bot_name)
+			return await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
 
 		for setting_name, chat_id in groups:
 			if chat_id == 0:
@@ -33,10 +48,7 @@ class ControlPanel:
 				continue
 
 			try:
-				bot_status = await bot.get_chat_member(
-					chat_id=chat_id,
-					user_id=bot.id,
-				)
+				bot_status = await get_bot_status(chat_id)
 			except TelegramBadRequest as exc:
 				if "chat not found" in str(exc).lower():
 					notice_text += (

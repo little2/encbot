@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from telethon import errors, functions, types
+
 import telethon_userbot
 from telethon_userbot import TelethonUserbot
 
@@ -46,9 +48,11 @@ class TelethonUserbotTests(unittest.TestCase):
             nonlocal observed_user_id
             observed_user_id = userbot.user_id
 
-        userbot.client.run_until_disconnected.side_effect = observe
-        asyncio.run(userbot.run(notify_bot="@example_bot"))
+        ready = AsyncMock(side_effect=observe)
+        asyncio.run(userbot.run(notify_bot="@example_bot", on_ready=ready))
 
+        ready.assert_awaited_once_with()
+        userbot.client.run_until_disconnected.assert_awaited_once_with()
         self.assertEqual(observed_user_id, 123)
         self.assertIsNone(userbot.user_id)
         self.assertEqual(userbot.account_user_id, 123)
@@ -114,6 +118,70 @@ class TelethonUserbotTests(unittest.TestCase):
             self.assertEqual(request.hash, "temporary-hash")
 
         asyncio.run(run_case())
+
+    def test_bot_promotion_in_groups_and_channels(self):
+        bot = types.InputPeerUser(101, 99)
+        basic_group = types.InputPeerChat(42)
+        channel = types.InputPeerChannel(42, 77)
+        cases = (
+            (basic_group, False, "missing", functions.messages.AddChatUserRequest),
+            (channel, False, "missing", functions.channels.InviteToChannelRequest),
+            (channel, False, "member", None),
+            (channel, True, "missing", None),
+            (channel, False, "admin", None),
+        )
+        for chat, broadcast, status, invite_type in cases:
+            with self.subTest(chat=type(chat).__name__, broadcast=broadcast, status=status):
+                userbot = TelethonUserbot.__new__(TelethonUserbot)
+                userbot._resolve_chat = AsyncMock(side_effect=[chat, bot])
+                client = userbot.client = AsyncMock()
+                if status == "missing":
+                    client.get_permissions.side_effect = errors.UserNotParticipantError(None)
+                else:
+                    client.get_permissions.return_value = SimpleNamespace(
+                        is_admin=status == "admin", has_left=False, participant=None,
+                    )
+                client.get_entity.return_value = SimpleNamespace(
+                    creator=False, broadcast=broadcast,
+                    admin_rights=types.ChatAdminRights(add_admins=True, invite_users=True, post_messages=True),
+                )
+
+                asyncio.run(userbot.ensure_bot_admin(-42, 101, "example_bot"))
+
+                requests = [call.args[0] for call in client.await_args_list]
+                if invite_type is not None:
+                    invite = requests.pop(0)
+                    self.assertIsInstance(invite, invite_type)
+                    if isinstance(chat, types.InputPeerChat):
+                        self.assertEqual((invite.chat_id, invite.user_id), (chat.chat_id, bot))
+                    else:
+                        self.assertEqual((invite.channel, invite.users), (chat, [bot]))
+                if status == "admin":
+                    self.assertFalse(requests)
+                    client.edit_admin.assert_not_awaited()
+                elif isinstance(chat, types.InputPeerChat):
+                    self.assertFalse(requests)
+                    client.edit_admin.assert_awaited_once_with(chat, bot, is_admin=True)
+                else:
+                    promote, = requests
+                    self.assertIsInstance(promote, functions.channels.EditAdminRequest)
+                    self.assertEqual((promote.channel, promote.user_id), (chat, bot))
+                    self.assertEqual(bool(promote.admin_rights.post_messages), broadcast)
+                    self.assertTrue(promote.admin_rights.invite_users)
+                    self.assertFalse(promote.admin_rights.add_admins)
+                    self.assertFalse(promote.admin_rights.ban_users)
+
+    def test_userbot_without_promotion_rights_reports_failure(self):
+        userbot = TelethonUserbot.__new__(TelethonUserbot)
+        userbot._resolve_chat = AsyncMock(side_effect=[
+            types.InputPeerChannel(42, 77), types.InputPeerUser(101, 99),
+        ])
+        client = userbot.client = AsyncMock()
+        client.get_permissions.side_effect = errors.UserNotParticipantError(None)
+        client.get_entity.return_value = SimpleNamespace(creator=False, admin_rights=None)
+        with self.assertRaises(PermissionError):
+            asyncio.run(userbot.ensure_bot_admin(-1000000000042, 101, "example_bot"))
+        client.assert_not_awaited()
 
     def test_history_reconciliation_uses_only_matching_incoming_media_since_upload(self):
         async def run():

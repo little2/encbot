@@ -829,7 +829,8 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 
 	
 	batch_id = data.get('batch_id', '')
-	board_code = f"{bot_name}_{batch_id}"
+	# board_code = f"{bot_name}_{batch_id}"
+	board_code = f"ztTowerBot_{batch_id}"
 
 	# print(f"data={data} board_code={board_code} valid_until_display={valid_until_display} bot_name={bot_name}")
 
@@ -2930,7 +2931,7 @@ async def _forward_encoded_if_whitelisted(
 			}
 
 
-			print(f"Sending preview to first channel: {preview_batch_settings}", flush=True)
+			# print(f"Sending preview to first channel: {preview_batch_settings}", flush=True)
 			published_message = await _send_encoded_preview_message(
 				preview_batch_settings,
 			)
@@ -2941,7 +2942,7 @@ async def _forward_encoded_if_whitelisted(
 				try:
 					preview_batch_settings2 = preview_batch_settings.copy()
 					preview_batch_settings2["chat_id"] = TERMINAL_CHANNEL_ID_2
-					print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
+					# print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
 					await _send_encoded_preview_message(preview_batch_settings2)
 					print(f"Sent preview to secondary channel: success,TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
 				except Exception as exc:
@@ -7812,7 +7813,8 @@ async def on_takeoff_batch_id(callback: CallbackQuery) -> None:
 		await callback.answer("此飞行申请已失效", show_alert=True, cache_time=0)
 		return
 
-	tower_bot = f"{bot_name}" if bot_name else "ztTowerRobot"
+	# tower_bot = f"{bot_name}" if bot_name else "ztTowerRobot"
+	tower_bot = "ztTowerBot"
 	text = f"""
 🎫 <code>{tower_bot}_{batch_id}</code>
 
@@ -8660,7 +8662,7 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 		return None
 	first_line = normalized_text.splitlines()[0]
 	match = re.fullmatch(
-		r"(?:zttower|afu|zttatai)\d+bot_([A-Za-z0-9_-]{16})",
+		r"(?:zttower\d*|(?:afu|zttatai)\d+)bot_([A-Za-z0-9_-]{16})",
 		first_line.strip(),
 		flags=re.IGNORECASE,
 	)
@@ -8808,6 +8810,25 @@ def _report_backup_bot_exit(task: asyncio.Task) -> None:
 		)
 
 
+async def _check_bot_group_admin_permissions() -> str:
+	groups = (
+		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
+		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
+		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+		*(
+			(f"APRON_CHANNEL_ID[{index}]", chat_id)
+			for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
+		),
+	)
+	return await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
+		bot=bot,
+		bot_name=bot_name,
+		groups=groups,
+		telegram_call=_telegram_call_with_retry,
+		ensure_admin=active_userbot.ensure_bot_admin if active_userbot and active_userbot.user_id else None,
+	)
+
+
 async def _update_lobby_description() -> None:
 	if AIRPORT_LOBBY_GROUP_ID == 0:
 		print("[AIRPORT_LOBBY] 群组未配置，无法更新群组介绍", flush=True)
@@ -8836,6 +8857,11 @@ async def _update_lobby_description() -> None:
 		)
 	except Exception as exc:
 		print(f"[AIRPORT_LOBBY] 更新群组介绍失败: {exc}", flush=True)
+
+
+async def _prepare_airport_groups() -> None:
+	await _check_bot_group_admin_permissions()
+	await _update_lobby_description()
 
 
 async def _on_userbot_message(event) -> None:
@@ -8898,9 +8924,18 @@ async def main() -> None:
 			from telethon_userbot import TelethonUserbot
 			userbot = TelethonUserbot.from_env(_on_userbot_message)
 			active_userbot = userbot
-			userbot_task = asyncio.create_task(
-				userbot.run_until_shutdown(notify_bot=f"@{bot_name}"), name="telethon_userbot"
-			)
+
+			async def run_userbot() -> None:
+				try:
+					await userbot.run_until_shutdown(
+						notify_bot=f"@{bot_name}", on_ready=_prepare_airport_groups,
+					)
+				except Exception:
+					if userbot.account_user_id is None:
+						await _prepare_airport_groups()
+					raise
+
+			userbot_task = asyncio.create_task(run_userbot(), name="telethon_userbot")
 			def report_userbot_result(task):
 				if not task.cancelled() and task.exception() is not None:
 					print(f"[USERBOT_ERROR] {task.exception()}", flush=True)
@@ -8966,24 +9001,6 @@ async def main() -> None:
 			backup_bot_task.add_done_callback(_report_backup_bot_exit)
 
 
-		groups = (
-			("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
-			("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
-			("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),			
-			*(
-				(f"APRON_CHANNEL_ID[{index}]", chat_id)
-				for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
-			),
-		)
-
-		await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
-			bot=bot,
-			bot_name=bot_name,
-			groups=groups,
-			telegram_call=_telegram_call_with_retry,
-		)	
-
-
 		await bot.set_my_commands(
 			[
 				# BotCommand(command="start", description="开始"),
@@ -8999,7 +9016,8 @@ async def main() -> None:
 			scope=BotCommandScopeAllPrivateChats(),
 		)
 
-		await _update_lobby_description()
+		if userbot_task is None:
+			await _prepare_airport_groups()
 
 		await reload_config()
 		await dp.start_polling(bot)

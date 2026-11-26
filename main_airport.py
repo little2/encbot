@@ -931,7 +931,7 @@ def _build_keyboard(encoded: str|None = None) -> InlineKeyboardMarkup:
 		buttons.append(
 			InlineKeyboardButton(
 				text="🪧 指路牌",
-				url=f"https://t.me/ztzlp",
+				url=f"https://t.me/jczlpbot",
 			)
 		)
 
@@ -6520,7 +6520,7 @@ async def _send_lobby_welcome(user: User) -> None:
 			first_row,
 			[
 				InlineKeyboardButton(text="🗼 塔台", url=tower_url),
-				InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztzlp"),
+				InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/jczlpbot"),
 			],
 		],
 	)

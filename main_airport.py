@@ -3143,7 +3143,7 @@ async def _notify_duty_free_new_batch(
 	else:
 		tag_text = ""
 
-	tower_bot_name = str(bot_name or "ztTowerRobot").strip().lstrip("@")
+	tower_bot_name = str(bot_name or "jczlpbot").strip().lstrip("@")
 	# new_flight_keyboard = InlineKeyboardMarkup(
 	# 	inline_keyboard=[[
 	# 		InlineKeyboardButton(
@@ -5979,7 +5979,7 @@ async def cmd_airport_access_request(message: Message) -> None:
 		await message.reply(str(exc))
 		return
 	except TelegramAPIError as exc:
-		print(f"[AIRPORT_ACCESS] lobby membership check failed (chat={AIRPORT_LOBBY_GROUP_ID}): {exc}", flush=True)
+		print(f"❌ [AIRPORT_ACCESS] lobby membership check failed (chat={AIRPORT_LOBBY_GROUP_ID}): {exc}", flush=True)
 		await message.reply("暂时无法核实航站大厅成员身份，请稍后重试。")
 		return
 	if not in_lobby:
@@ -6677,7 +6677,7 @@ async def _send_lobby_welcome(user: User) -> None:
 	tower_url = (
 		f"https://t.me/{bot_name}"
 		if bot_name
-		else "https://t.me/ztTowerRobot"
+		else "https://t.me/jczlpbot"
 	)
 	# first_row = [InlineKeyboardButton(text="🛫 飞机场", url=airport_url)]
 	first_row = []
@@ -7813,8 +7813,8 @@ async def on_takeoff_batch_id(callback: CallbackQuery) -> None:
 		await callback.answer("此飞行申请已失效", show_alert=True, cache_time=0)
 		return
 
-	# tower_bot = f"{bot_name}" if bot_name else "ztTowerRobot"
-	tower_bot = "ztTowerBot"
+	# tower_bot = f"{bot_name}" if bot_name else "jczlpbot"
+	tower_bot = "jczlpbot"
 	text = f"""
 🎫 <code>{tower_bot}_{batch_id}</code>
 
@@ -8447,16 +8447,16 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				# 	show_alert=True,
 				# )
 				# return
-			# todo 标签一定要选择,至少选3个标签
+			# 标签一定要选择,至少选3个标签
 			selected_tags = state.get("selected_tags", [])
 
 			is_admin = callback.from_user.id in ADMIN_USER_IDS
 
-			# TODO
+			
 				
-			# if len(selected_tags) < 3 and not is_admin:
-			# 	state["send_confirm_pending"] = False
-			# 	pending_reason_text += "\n❌ 必须选择至少三个标签。"
+			if len(selected_tags) < 3 and not is_admin:
+				state["send_confirm_pending"] = False
+				pending_reason_text += "\n❌ 必须选择至少三个标签。"
 
 			
 
@@ -8662,7 +8662,7 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 		return None
 	first_line = normalized_text.splitlines()[0]
 	match = re.fullmatch(
-		r"(?:zttower\d*|(?:afu|zttatai)\d+)bot_([A-Za-z0-9_-]{16})",
+		r"(?:jczlp\d*|(?:afu|zttower|zttatai)\d+)bot_([A-Za-z0-9_-]{16})",
 		first_line.strip(),
 		flags=re.IGNORECASE,
 	)

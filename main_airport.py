@@ -927,13 +927,13 @@ def _build_keyboard(encoded: str|None = None) -> InlineKeyboardMarkup:
 	# 	InlineKeyboardButton(text="🈲 立即停飞", callback_data="takeoff:ban"),
 	# ]
 	buttons = []
-	# if tower_bot_name:
-	# 	buttons.append(
-	# 		InlineKeyboardButton(
-	# 			text="🗼 塔台",
-	# 			url=f"https://t.me/{tower_bot_name}",
-	# 		)
-	# 	)
+	if tower_bot_name:
+		buttons.append(
+			InlineKeyboardButton(
+				text="🪧 指路牌",
+				url=f"https://t.me/ztzlp",
+			)
+		)
 
 
 		
@@ -2757,7 +2757,7 @@ async def _get_batch_preview_message_settings(
 		"thread_id": None,
 		"preview_payloads": preview_payloads,
 		"display_text": await _build_display(parsed, encoded),
-		"display_keyboard": _build_keyboard(),
+		"display_keyboard": _build_keyboard(encoded=encoded),
 		"if_spoiler": bool(batch_record.get("if_spoiler", False)),
 	}
 
@@ -6520,7 +6520,7 @@ async def _send_lobby_welcome(user: User) -> None:
 			first_row,
 			[
 				InlineKeyboardButton(text="🗼 塔台", url=tower_url),
-				InlineKeyboardButton(text="🪧 指路牌", url="https://telegra.ph/zfly-10-27"),
+				InlineKeyboardButton(text="🪧 指路牌", url="https://t.me/ztzlp"),
 			],
 		],
 	)

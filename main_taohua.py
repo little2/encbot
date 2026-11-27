@@ -1199,7 +1199,7 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		alter = "菊畔风急花含泪，几声啼露诉春寒。"
 
 	mars_text = to_mars(html.escape(text, quote=True))
-	mars_url = f"https://bo.y/{mars_text}"
+	mars_url = f"https://peach.boy/{mars_text}"
 	print(f"mars_url={mars_url}", flush=True)
 
 	post_text = f'🌼<a href="{html.escape(mars_url, quote=True)}">ㅤ</a>{alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a>'
@@ -2129,12 +2129,12 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 	)
 
 	'''
-	会有两个 url, 若是 https://bo.y/ 开头的，则设为 mars_text , 其他的设为 url
+	会有两个 url, 若是 https://peach.boy/ 开头的，则设为 mars_text , 其他的设为 url
 	'''
-	mars_text = next((e.url for e in entities if e.type == "text_link" and e.url.startswith("https://bo.y/")), "")
+	mars_text = next((e.url for e in entities if e.type == "text_link" and e.url.startswith("https://peach.boy/")), "")
 	if mars_text:
-		mars_text = mars_text.replace("https://bo.y/", "")
-	url = next((e.url for e in entities if e.type == "text_link" and not e.url.startswith("https://bo.y/")), "")
+		mars_text = mars_text.replace("https://peach.boy/", "")
+	url = next((e.url for e in entities if e.type == "text_link" and not e.url.startswith("https://peach.boy/")), "")
 
 	
 	# print(f"message=>{message}")

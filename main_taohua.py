@@ -61,8 +61,10 @@ from utils.emoji_utils import EmojiUtils
 
 from utils.number_cipher_utils import NumberCipher
 
+from utils.cnchar_convert import to_mars, from_mars
+
 cipher = NumberCipher(
-    key=8947499974
+	key=8947499974
 )
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -337,9 +339,9 @@ PER_PAGE_SIZE = 10
 from utils.speech_censor_utils import SpeechCensor
 
 censor = SpeechCensor({
-    "delete": (),
-    "ban": ("ZTFX8", "ai_919198_bot","中央架控","陈紫铭"),
-    "ignored": IGNORED_TEXT_SUBSTRINGS,
+	"delete": (),
+	"ban": ("ZTFX8", "ai_919198_bot","中央架控","陈紫铭"),
+	"ignored": IGNORED_TEXT_SUBSTRINGS,
 })
 
 
@@ -349,42 +351,42 @@ class IntroStates(StatesGroup):
 
 
 async def _start_health_server() -> tuple[web.AppRunner, str]:
-    """启动用于 Render 端口探测的轻量 HTTP 服务。"""
-    host = os.getenv("HOST", "0.0.0.0").strip() or "0.0.0.0"
-    configured_port = os.getenv("PORT", "").strip()
-    initial_port = int(configured_port or 10000)
-    candidate_ports = (
-        (initial_port,)
-        if configured_port
-        else tuple(range(initial_port, initial_port + 10))
-    )
+	"""启动用于 Render 端口探测的轻量 HTTP 服务。"""
+	host = os.getenv("HOST", "0.0.0.0").strip() or "0.0.0.0"
+	configured_port = os.getenv("PORT", "").strip()
+	initial_port = int(configured_port or 10000)
+	candidate_ports = (
+		(initial_port,)
+		if configured_port
+		else tuple(range(initial_port, initial_port + 10))
+	)
 
-    app = web.Application()
+	app = web.Application()
 
-    async def health(_request: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "service": "peach"})
+	async def health(_request: web.Request) -> web.Response:
+		return web.json_response({"ok": True, "service": "peach"})
 
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+	app.router.add_get("/", health)
+	app.router.add_get("/health", health)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    last_error: OSError | None = None
-    for port in candidate_ports:
-        site = web.TCPSite(runner, host=host, port=port)
-        try:
-            await site.start()
-        except OSError as exc:
-            last_error = exc
-            if exc.errno != errno.EADDRINUSE or configured_port:
-                await runner.cleanup()
-                raise
-            print(f"⚠️ 健康检查端口 {port} 已被占用，尝试下一个端口。", flush=True)
-            continue
-        return runner, f"http://{host}:{port}"
+	runner = web.AppRunner(app)
+	await runner.setup()
+	last_error: OSError | None = None
+	for port in candidate_ports:
+		site = web.TCPSite(runner, host=host, port=port)
+		try:
+			await site.start()
+		except OSError as exc:
+			last_error = exc
+			if exc.errno != errno.EADDRINUSE or configured_port:
+				await runner.cleanup()
+				raise
+			print(f"⚠️ 健康检查端口 {port} 已被占用，尝试下一个端口。", flush=True)
+			continue
+		return runner, f"http://{host}:{port}"
 
-    await runner.cleanup()
-    raise RuntimeError("找不到可用的健康检查端口（已尝试 10000–10009）") from last_error
+	await runner.cleanup()
+	raise RuntimeError("找不到可用的健康检查端口（已尝试 10000–10009）") from last_error
 
 
 async def _ask_intro(message: Message, state: FSMContext, text: str) -> None:
@@ -751,7 +753,7 @@ async def on_media(message: Message, state: FSMContext) -> None:
 	])
 
 
-    TAG_ROWS = ["偷拍","网路调教","监视器","享受被操","喊痛或哭","婴幼儿"]
+	TAG_ROWS = ["偷拍","网路调教","监视器","享受被操","喊痛或哭","婴幼儿"]
 	rows = []
 	for tag in TAG_ROWS:
 		rows.append(InlineKeyboardButton(text=f"#{tag}", callback_data=f"tag:{tag}"))
@@ -1195,8 +1197,10 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 	if "喊痛或哭" in tags_string:
 		tags_string2=tags_string2.replace("喊痛或哭","泣花")
 		alter = "菊畔风急花含泪，几声啼露诉春寒。"
-		
-	post_text = f'🌼 {alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a> '
+
+	mars_text = to_mars(html.escape(text, quote=True))
+
+	post_text = f'🌼 {alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a> <a href="https://bo.y/{mars_text}">ㅤ</a>'
 	if tags_string2:	
 		post_text = f"{post_text}\n{html.escape(tags_string2)}"
 
@@ -2121,9 +2125,17 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 		getattr(message, "caption_entities", None) or []
 	)
 
+	'''
+	会有两个 url, 若是 https://bo.y/ 开头的，则设为 mars_text , 其他的设为 url
+	'''
+	mars_text = next((e.url for e in entities if e.type == "text_link" and e.url.startswith("https://bo.y/")), "")
+	if mars_text:
+		mars_text = mars_text.replace("https://bo.y/", "")
+	url = next((e.url for e in entities if e.type == "text_link" and not e.url.startswith("https://bo.y/")), "")
+
 	
 	# print(f"message=>{message}")
-	url = next((e.url for e in entities if e.type == "text_link" and e.url), "")
+	# url = next((e.url for e in entities if e.type == "text_link" and e.url), "")
 	if not url:
 		await callback.answer("找不到链接", show_alert=True)
 		return
@@ -2222,7 +2234,12 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 		remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
 
 		cover_text = callback.message.text or callback.message.caption
-		cover_text = f'{cover_text} <a href="{url}">ㅤ</a>'
+		# cover_text = f'{cover_text} <a href="{url}">ㅤ</a>'
+		cover_text = f'{from_mars(mars_text)} <a href="{url}">ㅤ</a>'
+
+		
+
+		# print(from_mars(mars_text))
 
 		
 

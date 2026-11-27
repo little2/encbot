@@ -7973,7 +7973,7 @@ async def on_takeoff_fly(
 
 				return {
 					"ok": False,
-					"answer": {"text": "❌ 跑道未授权起飞，请先满通", "show_alert": True, "cache_time": 0},
+					"answer": {"text": "❌ 跑道未授权起飞，请先私信跑道机器人后，重新尝试", "show_alert": True, "cache_time": 0},
 				}
 			print(f"[TAKEOFF:7302] media delivery failed: {exc}", flush=True)
 			return {

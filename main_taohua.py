@@ -1200,8 +1200,10 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 
 	mars_text = to_mars(html.escape(text, quote=True))
 	mars_url = f"https://bo.y/{mars_text}"
+	print(f"mars_url={mars_url}", flush=True)
 
 	post_text = f'🌼<a href="{html.escape(mars_url, quote=True)}">ㅤ</a>{alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a>'
+	print(f"post_text={post_text}", flush=True)
 	if tags_string2:	
 		post_text = f"{post_text}\n{html.escape(tags_string2)}"
 

@@ -70,6 +70,7 @@ from aiogram.types import (
 
 from html import escape
 
+from utils.chat_membership import BotKickedError, get_chat_member
 from utils.control_panel import ControlPanel
 from utils.utf_utils import UtfConverter
 from utils.format_utils import FormatUtils
@@ -829,7 +830,8 @@ async def _build_display(data: dict[str, Any], encoded: str) -> str:
 
 	
 	batch_id = data.get('batch_id', '')
-	board_code = f"{bot_name}_{batch_id}"
+	# board_code = f"{bot_name}_{batch_id}"
+	board_code = f"ztTowerBot_{batch_id}"
 
 	# print(f"data={data} board_code={board_code} valid_until_display={valid_until_display} bot_name={bot_name}")
 
@@ -2930,7 +2932,7 @@ async def _forward_encoded_if_whitelisted(
 			}
 
 
-			print(f"Sending preview to first channel: {preview_batch_settings}", flush=True)
+			# print(f"Sending preview to first channel: {preview_batch_settings}", flush=True)
 			published_message = await _send_encoded_preview_message(
 				preview_batch_settings,
 			)
@@ -2941,7 +2943,7 @@ async def _forward_encoded_if_whitelisted(
 				try:
 					preview_batch_settings2 = preview_batch_settings.copy()
 					preview_batch_settings2["chat_id"] = TERMINAL_CHANNEL_ID_2
-					print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
+					# print(f"Sending preview to secondary channel: {preview_batch_settings2}", flush=True)
 					await _send_encoded_preview_message(preview_batch_settings2)
 					print(f"Sent preview to secondary channel: success,TERMINAL_CHANNEL_ID_2={TERMINAL_CHANNEL_ID_2}", flush=True)
 				except Exception as exc:
@@ -3141,7 +3143,7 @@ async def _notify_duty_free_new_batch(
 	else:
 		tag_text = ""
 
-	tower_bot_name = str(bot_name or "ztTowerRobot").strip().lstrip("@")
+	tower_bot_name = str(bot_name or "jczlpbot").strip().lstrip("@")
 	# new_flight_keyboard = InlineKeyboardMarkup(
 	# 	inline_keyboard=[[
 	# 		InlineKeyboardButton(
@@ -5971,10 +5973,16 @@ async def cmd_airport_access_request(message: Message) -> None:
 		return
 
 	user_id = int(message.from_user.id)
-	if not await _is_member_of_chat(
-		AIRPORT_LOBBY_GROUP_ID,
-		user_id,
-	):
+	try:
+		in_lobby = await _is_member_of_chat(AIRPORT_LOBBY_GROUP_ID, user_id)
+	except BotKickedError as exc:
+		await message.reply(str(exc))
+		return
+	except TelegramAPIError as exc:
+		print(f"❌ [AIRPORT_ACCESS] lobby membership check failed (chat={AIRPORT_LOBBY_GROUP_ID}): {exc}", flush=True)
+		await message.reply("暂时无法核实航站大厅成员身份，请稍后重试。")
+		return
+	if not in_lobby:
 		try:
 			member_count = await bot.get_chat_member_count(
 				chat_id=AIRPORT_LOBBY_GROUP_ID,
@@ -6303,17 +6311,7 @@ def _build_join_context(join_request: ChatJoinRequest) -> AirportJoinContext:
 
 
 async def _is_member_of_chat(chat_id: int, user_id: int) -> bool:
-	try:
-		status = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-	except TelegramBadRequest as exc:
-		if "chat not found" in str(exc).lower():
-			print(
-				f"[群組查詢失敗] 找不到群組 {chat_id}，請檢查啟動時的群組權限提示。",
-				flush=True,
-			)
-			return False
-		raise
-
+	status = await get_chat_member(bot, chat_id, user_id)
 	return _is_current_chat_member(status)
 
 
@@ -6405,11 +6403,11 @@ async def _reject_join_request(
 		print(f"[AIRPORT_ACCESS] join rejection failed: {exc}", flush=True)
 
 
-async def _notify_join_retry(context: AirportJoinContext) -> None:
+async def _notify_join_retry(context: AirportJoinContext, text: str = "Telegram 暂时无法完成入场审核，请稍后使用原连结重试。") -> None:
 	try:
 		await bot.send_message(
 			chat_id=context.request.user_chat_id,
-			text="Telegram 暂时无法完成入场审核，请稍后使用原连结重试。",
+			text=text,
 		)
 	except Exception as exc:
 		print(f"[AIRPORT_ACCESS] retry notice failed: {exc}", flush=True)
@@ -6556,28 +6554,29 @@ async def _after_join_approved(context: AirportJoinContext) -> None:
 
 	if context.chat_id == AIRPORT_LOBBY_GROUP_ID:
 		PENDING_AIRPORT_JOIN_INVITES.pop(context.user_id, None)
-		try:
-			await _send_airport_join_request_invite(
-				context.user_id,
-				request_plant_channel=1,
-			)
-		except Exception as exc:
-			print(
-				f"[AIRPORT_ACCESS] next-stage invite failed for user "
-				f"{context.user_id}: {exc}",
-				flush=True,
-			)
-			try:
-				await bot.send_message(
-					chat_id=context.request.user_chat_id,
-					text=(
-						"✅ 已通过审核并加入航站大厅。\n"
-						"暂时无法建立机场频道邀请，请稍后重新申请进入机场。"
-					),
-				)
-			except Exception:
-				pass
-		return
+		# TODO: 不再提供機場群連結
+		# try:
+		# 	await _send_airport_join_request_invite(
+		# 		context.user_id,
+		# 		request_plant_channel=1,
+		# 	)
+		# except Exception as exc:
+		# 	print(
+		# 		f"[AIRPORT_ACCESS] next-stage invite failed for user "
+		# 		f"{context.user_id}: {exc}",
+		# 		flush=True,
+		# 	)
+		# 	try:
+		# 		await bot.send_message(
+		# 			chat_id=context.request.user_chat_id,
+		# 			text=(
+		# 				"✅ 已通过审核并加入航站大厅。\n"
+		# 				"暂时无法建立机场频道邀请，请稍后重新申请进入机场。"
+		# 			),
+		# 		)
+		# 	except Exception:
+		# 		pass
+		# return
 
 	if context.chat_id == TERMINAL_CHANNEL_ID:
 		AIRPORT_QUIZ_PASSED_UNTIL.pop(context.user_id, None)
@@ -6608,6 +6607,9 @@ async def _process_join_request(context: AirportJoinContext) -> None:
 
 	try:
 		rejection = await _get_join_rejection_reason(context)
+	except BotKickedError as exc:
+		await _notify_join_retry(context, str(exc))
+		return
 	except Exception as exc:
 		print(
 			f"[AIRPORT_ACCESS] eligibility check failed for user "
@@ -6676,7 +6678,7 @@ async def _send_lobby_welcome(user: User) -> None:
 	tower_url = (
 		f"https://t.me/{bot_name}"
 		if bot_name
-		else "https://t.me/ztTowerRobot"
+		else "https://t.me/jczlpbot"
 	)
 	# first_row = [InlineKeyboardButton(text="🛫 飞机场", url=airport_url)]
 	first_row = []
@@ -7812,7 +7814,8 @@ async def on_takeoff_batch_id(callback: CallbackQuery) -> None:
 		await callback.answer("此飞行申请已失效", show_alert=True, cache_time=0)
 		return
 
-	tower_bot = f"{bot_name}" if bot_name else "ztTowerRobot"
+	# tower_bot = f"{bot_name}" if bot_name else "jczlpbot"
+	tower_bot = "jczlpbot"
 	text = f"""
 🎫 <code>{tower_bot}_{batch_id}</code>
 
@@ -8445,16 +8448,16 @@ async def on_encode_controls(callback: CallbackQuery) -> None:
 				# 	show_alert=True,
 				# )
 				# return
-			# todo 标签一定要选择,至少选3个标签
+			# 标签一定要选择,至少选3个标签
 			selected_tags = state.get("selected_tags", [])
 
 			is_admin = callback.from_user.id in ADMIN_USER_IDS
 
-			# TODO
+			
 				
-			# if len(selected_tags) < 3 and not is_admin:
-			# 	state["send_confirm_pending"] = False
-			# 	pending_reason_text += "\n❌ 必须选择至少三个标签。"
+			if len(selected_tags) < 3 and not is_admin:
+				state["send_confirm_pending"] = False
+				pending_reason_text += "\n❌ 必须选择至少三个标签。"
 
 			
 
@@ -8660,7 +8663,7 @@ def _extract_takeoff_batch_id(text: str) -> str | None:
 		return None
 	first_line = normalized_text.splitlines()[0]
 	match = re.fullmatch(
-		r"(?:zttower|afu|zttatai)\d+bot_([A-Za-z0-9_-]{16})",
+		r"(?:jczlp\d*|(?:afu|zttower|zttatai)\d+)bot_([A-Za-z0-9_-]{16})",
 		first_line.strip(),
 		flags=re.IGNORECASE,
 	)
@@ -8808,6 +8811,25 @@ def _report_backup_bot_exit(task: asyncio.Task) -> None:
 		)
 
 
+async def _check_bot_group_admin_permissions() -> str:
+	groups = (
+		("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
+		("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
+		("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),
+		*(
+			(f"APRON_CHANNEL_ID[{index}]", chat_id)
+			for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
+		),
+	)
+	return await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
+		bot=bot,
+		bot_name=bot_name,
+		groups=groups,
+		telegram_call=_telegram_call_with_retry,
+		ensure_admin=active_userbot.ensure_bot_admin if active_userbot and active_userbot.user_id else None,
+	)
+
+
 async def _update_lobby_description() -> None:
 	if AIRPORT_LOBBY_GROUP_ID == 0:
 		print("[AIRPORT_LOBBY] 群组未配置，无法更新群组介绍", flush=True)
@@ -8836,6 +8858,11 @@ async def _update_lobby_description() -> None:
 		)
 	except Exception as exc:
 		print(f"[AIRPORT_LOBBY] 更新群组介绍失败: {exc}", flush=True)
+
+
+async def _prepare_airport_groups() -> None:
+	await _check_bot_group_admin_permissions()
+	await _update_lobby_description()
 
 
 async def _on_userbot_message(event) -> None:
@@ -8898,9 +8925,18 @@ async def main() -> None:
 			from telethon_userbot import TelethonUserbot
 			userbot = TelethonUserbot.from_env(_on_userbot_message)
 			active_userbot = userbot
-			userbot_task = asyncio.create_task(
-				userbot.run_until_shutdown(notify_bot=f"@{bot_name}"), name="telethon_userbot"
-			)
+
+			async def run_userbot() -> None:
+				try:
+					await userbot.run_until_shutdown(
+						notify_bot=f"@{bot_name}", on_ready=_prepare_airport_groups,
+					)
+				except Exception:
+					if userbot.account_user_id is None:
+						await _prepare_airport_groups()
+					raise
+
+			userbot_task = asyncio.create_task(run_userbot(), name="telethon_userbot")
 			def report_userbot_result(task):
 				if not task.cancelled() and task.exception() is not None:
 					print(f"[USERBOT_ERROR] {task.exception()}", flush=True)
@@ -8966,24 +9002,6 @@ async def main() -> None:
 			backup_bot_task.add_done_callback(_report_backup_bot_exit)
 
 
-		groups = (
-			("AIRPORT_LOBBY_GROUP_ID", AIRPORT_LOBBY_GROUP_ID),
-			("TERMINAL_CHANNEL_ID", TERMINAL_CHANNEL_ID),
-			("AIRPORT_DUTY_FREE_GROUP_ID", AIRPORT_DUTY_FREE_GROUP_ID),			
-			*(
-				(f"APRON_CHANNEL_ID[{index}]", chat_id)
-				for index, chat_id in enumerate(APRON_CHANNEL_IDS, start=1)
-			),
-		)
-
-		await ControlPanel(SharedConfig.get_all()).check_bot_group_admin_permissions(
-			bot=bot,
-			bot_name=bot_name,
-			groups=groups,
-			telegram_call=_telegram_call_with_retry,
-		)	
-
-
 		await bot.set_my_commands(
 			[
 				# BotCommand(command="start", description="开始"),
@@ -8999,7 +9017,8 @@ async def main() -> None:
 			scope=BotCommandScopeAllPrivateChats(),
 		)
 
-		await _update_lobby_description()
+		if userbot_task is None:
+			await _prepare_airport_groups()
 
 		await reload_config()
 		await dp.start_polling(bot)

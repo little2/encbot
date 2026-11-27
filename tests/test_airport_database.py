@@ -16,9 +16,10 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from aiogram.methods import GetMe
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
+from aiogram.methods import GetChatMember, GetMe
 from utils.airport_async_stores import create_airport_stores
+from utils.chat_membership import BotKickedError, get_chat_member
 from utils.postgres_backup import get_backup_directory
 from utils.database_admin import DatabaseAdminCommands
 from utils.format_utils import FormatUtils
@@ -65,6 +66,7 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
                        received_media_store=self.stores.received_media,
                        shared_invite_link_store=self.stores.shared_invite_links,
                        bot=self.bot, bot_name="airport_test", ADMIN_USER_IDS={99},
+                       BotKickedError=BotKickedError, get_chat_member=get_chat_member,
                        active_userbot=None,
                        MESSAGE_REWARD_LOCKS={}, TAKEOFF_USER_LOCKS={},
                        MESSAGE_REWARD_MINUTES=60, MEDIA_VIEW_CONSUMPTION_MINUTES=60,
@@ -85,6 +87,50 @@ class AirportDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("\n@airport_test\n", description)
         self.assertNotIn("`", description)
         self.assertLessEqual(len(description), 255)
+
+    async def test_start_replies_when_lobby_membership_is_unavailable(self):
+        lobby_id = -100123
+        user_id = 123
+        message = SimpleNamespace(from_user=SimpleNamespace(id=user_id), reply=AsyncMock())
+        self.ns.update(AIRPORT_LOBBY_GROUP_ID=lobby_id, TelegramAPIError=TelegramAPIError)
+        load_functions({"cmd_start", "cmd_airport_access_request", "_is_member_of_chat"}, self.ns)
+        self.bot.get_chat_member_count = AsyncMock()
+        method = GetChatMember(chat_id=lobby_id, user_id=user_id)
+        for error, expected in (
+            (TelegramForbiddenError(method, "Forbidden: bot was kicked from the supergroup chat"), "機器人已被封鎖，需要更換機器人。"),
+            (TelegramBadRequest(method, "Bad Request: chat not found"), "暂时无法核实航站大厅成员身份，请稍后重试。"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.bot.get_chat_member = AsyncMock(side_effect=error)
+                message.reply.reset_mock()
+                await self.ns["cmd_start"](message, SimpleNamespace(args=""))
+                self.bot.get_chat_member.assert_awaited_once_with(chat_id=lobby_id, user_id=user_id)
+                message.reply.assert_awaited_once_with(expected)
+                self.bot.get_chat_member_count.assert_not_awaited()
+
+    async def test_join_request_stays_pending_when_lobby_chat_is_inaccessible(self):
+        lobby_id, terminal_id, user_id = -100123, -100124, 123
+        context = SimpleNamespace(user_id=user_id, chat_id=terminal_id, is_paid_invite=False)
+        await self.stores.users.update(user_id, NOW + 4 * 86400)
+        self.bot.get_chat_member = AsyncMock(side_effect=TelegramBadRequest(
+            GetChatMember(chat_id=lobby_id, user_id=user_id), "Bad Request: chat not found",
+        ))
+        self.ns.update(AIRPORT_LOBBY_GROUP_ID=lobby_id, TERMINAL_CHANNEL_ID=terminal_id,
+                       AIRPORT_QUIZ_PASSED_UNTIL={user_id: NOW + 60},
+                       _notify_join_retry=AsyncMock(), _approve_join_request=AsyncMock(),
+                       _reject_join_request=AsyncMock())
+        load_functions({"_process_join_request", "_get_join_rejection_reason", "_is_member_of_chat"}, self.ns)
+        await self.ns["_process_join_request"](context)
+        self.bot.get_chat_member.assert_awaited_once_with(chat_id=lobby_id, user_id=user_id)
+        self.ns["_notify_join_retry"].assert_awaited_once_with(context)
+        self.bot.get_chat_member.side_effect = TelegramForbiddenError(
+            GetChatMember(chat_id=lobby_id, user_id=user_id), "Forbidden: bot was kicked from the supergroup chat",
+        )
+        self.ns["_notify_join_retry"].reset_mock()
+        await self.ns["_process_join_request"](context)
+        self.ns["_notify_join_retry"].assert_awaited_once_with(context, "機器人已被封鎖，需要更換機器人。")
+        self.ns["_approve_join_request"].assert_not_awaited()
+        self.ns["_reject_join_request"].assert_not_awaited()
 
     async def test_update_lobby_description_logs_failure_and_unconfigured_group(self):
         self.bot.set_chat_description = AsyncMock(side_effect=RuntimeError("permission denied"))

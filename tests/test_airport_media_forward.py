@@ -697,6 +697,7 @@ class AirportMediaForwardTests(unittest.TestCase):
         )
         batch_id = "Ab3_kL9-xY2pQr7Z"
 
+        self.assertEqual(extract(f"ztTowerBot_{batch_id}"), batch_id)
         self.assertEqual(extract(f"zttower12bot_{batch_id}"), batch_id)
         self.assertEqual(extract(f"afu12bot_{batch_id}"), batch_id)
         self.assertEqual(extract(f"AFU12BOT_{batch_id}"), batch_id)

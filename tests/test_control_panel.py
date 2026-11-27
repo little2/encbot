@@ -1,6 +1,9 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
+
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.methods import GetChatMember
 
 from utils.control_panel import ControlPanel
 
@@ -64,3 +67,37 @@ class ControlPanelTests(unittest.IsolatedAsyncioTestCase):
 		)
 		telegram_call.assert_awaited_once()
 		send.assert_awaited_once_with(result)
+
+	async def test_group_repair_verifies_status_and_continues_after_failure(self):
+		admin = SimpleNamespace(status="administrator")
+		member = SimpleNamespace(status="member")
+		inaccessible = TelegramForbiddenError(GetChatMember(chat_id=-10, user_id=123), "bot is not a member")
+		bot = SimpleNamespace(id=123, get_chat_member=AsyncMock(side_effect=[
+			inaccessible, admin,  # Added to a private chat, then verified.
+			member,              # Promotion refused in this group.
+			member, member,      # A repair returned but the bot is still a member.
+			admin,               # Already an admin.
+		]))
+		repair = AsyncMock(side_effect=[None, PermissionError("cannot promote"), None])
+		result = await ControlPanel({}).check_bot_group_admin_permissions(
+			bot, "example_bot", [("A", -10), ("B", -20), ("C", -30), ("D", -40)], AsyncMock(), repair,
+		)
+		self.assertEqual(repair.await_args_list, [
+			call(-10, 123, "example_bot"), call(-20, 123, "example_bot"), call(-30, 123, "example_bot"),
+		])
+		self.assertEqual(result.count("群组检查成功"), 2)
+		self.assertIn("cannot promote", result)
+		self.assertIn("群组权限不足", result)
+
+	async def test_report_prompts_replacement_without_repairing_kicked_bot(self):
+		error = TelegramForbiddenError(GetChatMember(chat_id=-10, user_id=123), "bot was kicked from the supergroup chat")
+		bot = SimpleNamespace(id=123, get_chat_member=AsyncMock(side_effect=[error, SimpleNamespace(status="kicked")]))
+		repair = AsyncMock()
+		result = await ControlPanel({}).check_bot_group_admin_permissions(
+			bot, "example_bot", [("LOBBY", -10), ("TERMINAL", -20)], AsyncMock(), repair,
+		)
+		repair.assert_not_awaited()
+		self.assertEqual(result.splitlines()[1:], [
+			"LOBBY=-10：機器人已被封鎖，需要更換機器人。",
+			"TERMINAL=-20：機器人已被封鎖，需要更換機器人。",
+		])

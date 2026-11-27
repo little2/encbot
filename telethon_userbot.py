@@ -12,6 +12,7 @@ from typing import Awaitable, Callable
 from telethon import TelegramClient, errors, events, functions, types, utils
 from telethon.sessions import StringSession
 from tgfileid import TelegramFileId
+from utils.chat_membership import BotKickedError
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +198,62 @@ class TelethonUserbot:
         except errors.UserAlreadyParticipantError:
             return
 
-    async def run(self, notify_bot: str | None = None) -> None:
+    async def ensure_bot_admin(self, chat_id: int, bot_id: int, bot_name: str) -> None:
+        """Invite the application bot if needed and promote it in this chat."""
+        chat = await self._resolve_chat(chat_id)
+        if not isinstance(chat, (types.InputPeerChat, types.InputPeerChannel)):
+            raise ValueError(f"{chat_id} is not a group or channel")
+        bot_peer = await self._resolve_chat(bot_id, bot_name)
+        try:
+            await self._promote_bot(chat, bot_peer)
+        except errors.UserKickedError as exc:
+            raise BotKickedError() from exc
+
+    async def _promote_bot(self, chat, bot_peer) -> None:
+        try:
+            member = await self.client.get_permissions(chat, bot_peer)
+        except errors.UserNotParticipantError:
+            needs_invite = True
+        else:
+            if member.is_admin:
+                return
+            if (isinstance(member.participant, types.ChannelParticipantBanned)
+                    and member.participant.banned_rights.view_messages):
+                raise BotKickedError()
+            needs_invite = member.has_left or getattr(member.participant, "left", False)
+
+        if isinstance(chat, types.InputPeerChat):
+            if needs_invite:
+                try:
+                    await self.client(functions.messages.AddChatUserRequest(chat.chat_id, bot_peer, fwd_limit=0))
+                except errors.UserAlreadyParticipantError:
+                    pass
+            await self.client.edit_admin(chat, bot_peer, is_admin=True)
+            return
+
+        channel = await self.client.get_entity(chat)
+        granted = channel.admin_rights
+        if not channel.creator and not (granted and granted.add_admins):
+            raise PermissionError("userbot 没有添加管理员的权限")
+        # Broadcast channels accept bots directly as admins. Supergroups also allow a member invite.
+        if needs_invite and not channel.broadcast:
+            try:
+                await self.client(functions.channels.InviteToChannelRequest(chat, [bot_peer]))
+            except errors.UserAlreadyParticipantError:
+                pass
+
+        rights = types.ChatAdminRights(
+            other=True,
+            change_info=channel.creator or granted.change_info,
+            delete_messages=channel.creator or granted.delete_messages,
+            ban_users=channel.creator or granted.ban_users,
+            invite_users=channel.creator or granted.invite_users,
+            post_messages=channel.broadcast and (channel.creator or granted.post_messages),
+        )
+        await self.client(functions.channels.EditAdminRequest(chat, bot_peer, rights, rank=""))
+
+    async def run(self, notify_bot: str | None = None, *,
+                  on_ready: Callable[[], Awaitable[None]] | None = None) -> None:
         async def phone():
             return self.phone or await asyncio.to_thread(input, "Userbot phone: ")
 
@@ -215,6 +271,11 @@ class TelethonUserbot:
             self.user_id = me.id
             self.account_user_id = me.id
             print(f"👦 [USERBOT] Logged in: {me.id}", flush=True)
+            if on_ready is not None:
+                try:
+                    await on_ready()
+                except Exception:
+                    logger.exception("Userbot startup callback failed")
             if notify_bot:
                 try:
                     await self.client.send_message(
@@ -229,10 +290,11 @@ class TelethonUserbot:
             self._upload_peer = None
             await self.client.disconnect()
 
-    async def run_until_shutdown(self, notify_bot: str) -> None:
+    async def run_until_shutdown(self, notify_bot: str, *,
+                                 on_ready: Callable[[], Awaitable[None]] | None = None) -> None:
         while True:
             try:
-                await self.run(notify_bot)
+                await self.run(notify_bot, on_ready=on_ready)
             except OSError:
                 logger.exception("Userbot connection failed")
             await asyncio.sleep(5)

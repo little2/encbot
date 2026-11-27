@@ -1199,8 +1199,9 @@ Sleep for 4.896050 seconds and try again... (tryings = 44809, bot id = 879276690
 		alter = "菊畔风急花含泪，几声啼露诉春寒。"
 
 	mars_text = to_mars(html.escape(text, quote=True))
+	mars_url = f"https://bo.y/{mars_text}"
 
-	post_text = f'🌼 {alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a> <a href="https://bo.y/{mars_text}">ㅤ</a>'
+	post_text = f'🌼<a href="{html.escape(mars_url, quote=True)}">ㅤ</a>{alter}。<a href="{html.escape(url, quote=True)}">ㅤ</a>'
 	if tags_string2:	
 		post_text = f"{post_text}\n{html.escape(tags_string2)}"
 
@@ -2234,8 +2235,8 @@ async def on_preview_link(callback: CallbackQuery) -> None:
 		remaining_text, remaining_view_count = FormatUtils.minutes_to_day_hour(remaining_minutes)
 
 		cover_text = callback.message.text or callback.message.caption
-		# cover_text = f'{cover_text} <a href="{url}">ㅤ</a>'
-		cover_text = f'{from_mars(mars_text)} <a href="{url}">ㅤ</a>'
+		cover_text = f'{cover_text} <a href="{url}">ㅤ</a>'
+		# cover_text = f'{from_mars(mars_text)} <a href="{url}">ㅤ</a>'
 
 		
 

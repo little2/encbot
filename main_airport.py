@@ -5063,30 +5063,32 @@ async def _execute_inactive_cleanup(message: Message | None = None) -> bool:
 
 			if actually_removed:
 				await update_progress(candidate_index - 1, user_id, "发送航站大厅清理广播")
-				try:
-					await _telegram_call_with_retry(
-						f"broadcast inactive cleanup for {user_id}",
-						lambda: bot.send_message(
-							chat_id=AIRPORT_LOBBY_GROUP_ID,
-							text=(
-								"🧹 长期不活跃成员清理\n\n"
-								f'<a href="tg://user?id={user_id}">旅客 {user_id}</a> '
-								f"的飞行通行证已过期 {expired_days} 天，"
-								"现已从「镇泰飞机场」「航站大厅」与「免税店」移出。\n\n"
-								"本次属于不活跃成员整理，不是黑名单封禁，"
-								"之后仍可按照届时的入场规则重新申请加入。"
-								"https://t.me/jczlpbot"
-							),
-							parse_mode="HTML",
-						),
-					)
-				except Exception as exc:
-					broadcast_failed_results.append(f"{user_id}：{exc}")
-					print(
-						f"[INACTIVE_CLEANUP] lobby broadcast failed for "
-						f"user {user_id}: {exc}",
-						flush=True,
-					)
+
+				# TODO ： 不在群裡發送廣播，只有私聊通知
+				# try:
+				# 	await _telegram_call_with_retry(
+				# 		f"broadcast inactive cleanup for {user_id}",
+				# 		lambda: bot.send_message(
+				# 			chat_id=AIRPORT_LOBBY_GROUP_ID,
+				# 			text=(
+				# 				"🧹 长期不活跃成员清理\n\n"
+				# 				f'<a href="tg://user?id={user_id}">旅客 {user_id}</a> '
+				# 				f"的飞行通行证已过期 {expired_days} 天，"
+				# 				"现已从「镇泰飞机场」「航站大厅」与「免税店」移出。\n\n"
+				# 				"本次属于不活跃成员整理，不是黑名单封禁，"
+				# 				"之后仍可按照届时的入场规则重新申请加入。"
+				# 				"https://t.me/jczlpbot"
+				# 			),
+				# 			parse_mode="HTML",
+				# 		),
+				# 	)
+				# except Exception as exc:
+				# 	broadcast_failed_results.append(f"{user_id}：{exc}")
+				# 	print(
+				# 		f"[INACTIVE_CLEANUP] lobby broadcast failed for "
+				# 		f"user {user_id}: {exc}",
+				# 		flush=True,
+				# 	)
 
 			await update_progress(candidate_index - 1, user_id, "删除用户资料")
 			try:
@@ -5301,6 +5303,9 @@ def _next_daily_hot_time(now: datetime) -> datetime:
 
 
 async def _daily_hot_worker() -> None:
+	# 不啟用每日熱門列表功能
+	return
+
 	while True:
 		now = app_now()
 		next_run = _next_daily_hot_time(now)
@@ -6764,13 +6769,14 @@ async def on_airport_member_updated(update: ChatMemberUpdated) -> None:
 				)
 			return
 
-		try:
-			await _send_lobby_welcome(target_user)
-		except Exception as exc:
-			print(
-				f"[LOBBY_WELCOME] notice failed for user {target_user_id}: {exc}",
-				flush=True,
-			)
+		# TODO: 不發送歡迎信息
+		# try:
+		# 	await _send_lobby_welcome(target_user)
+		# except Exception as exc:
+		# 	print(
+		# 		f"[LOBBY_WELCOME] notice failed for user {target_user_id}: {exc}",
+		# 		flush=True,
+		# 	)
 		return
 
 	if target_user_id in ADMIN_USER_IDS:
@@ -8606,7 +8612,18 @@ async def extract_encode(
 				"SELECT bot_token FROM user_info WHERE user_id = $1",
 				reader_user_id,
 			)
-		user_bot_token = str(user_info["bot_token"] or "").strip() if user_info else RUNWAY_BOT_TOKEN
+
+		if user_info:
+			print(f"use user bot token for reader_user_id={reader_user_id}, user_bot_token={user_bot_token}")
+			user_bot_token = str(user_info["bot_token"] or "").strip()
+		else:
+			## reader_user_index 是用戶id的尾數，再補成三位數, 例如 10 -> 010 , 2->002
+			runway_bot_name = f"ztrunway{(reader_user_id%10):03d}bot"			
+			_runway = SharedConfig.get("runway")
+			user_bot_token = str(_runway.get(runway_bot_name, {}).get("bot_token") or "").strip()
+			print(f"use runway bot token for reader_user_id={reader_user_id}, runway_bot_name={runway_bot_name}, user_bot_token={user_bot_token}")
+			
+		
 		delivery_data["_request_id"] = secrets.token_urlsafe(18)
 		delivery_data["_deadline"] = 253402214400 if is_admin else int(valid_until_dt.timestamp())
 		
@@ -8952,6 +8969,7 @@ async def main() -> None:
 		workers = [asyncio.create_task(_media_worker(index)) for index in range(MEDIA_WORKER_COUNT)]
 		forward_worker = asyncio.create_task(_media_forward_worker())
 		maintenance_worker = asyncio.create_task(_daily_maintenance_worker())
+		
 		hot_worker = asyncio.create_task(_daily_hot_worker())
 
 		video_bot_enabled = str(

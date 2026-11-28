@@ -270,7 +270,7 @@ class TelethonUserbot:
                 raise ValueError("USERBOT_SESSION must belong to a user account")
             self.user_id = me.id
             self.account_user_id = me.id
-            print(f"👦 [USERBOT] Logged in: {me.id}", flush=True)
+            print(f"👦 [USERBOT] Logged in: id:{me.id} username:{me.username}", flush=True)
             if on_ready is not None:
                 try:
                     await on_ready()
